@@ -4,10 +4,11 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -593,6 +594,13 @@ func (s *ServerService) RestartXrayService() error {
 }
 
 func (s *ServerService) downloadXRay(version string) (string, error) {
+	// M4: only allow an official release tag (x.y.z, optionally with a
+	// leading "v"). An unchecked version string was interpolated directly
+	// into the download URL.
+	versionRe := regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+$`)
+	if !versionRe.MatchString(version) {
+		return "", errors.New("invalid xray version format")
+	}
 	osName := runtime.GOOS
 	arch := runtime.GOARCH
 
@@ -627,6 +635,9 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to download xray %s: %s", version, resp.Status)
+	}
 
 	os.Remove(fileName)
 	file, err := os.Create(fileName)
@@ -639,8 +650,61 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	file.Close()
+
+	// M4 (best effort): Xray-core publishes a .dgst file with the release
+	// hashes. If it is available, verify the SHA256 of the downloaded zip
+	// and refuse a mismatching file. If no .dgst is published for this
+	// release, log a warning and continue (there is no stable .sha256 file
+	// to enforce against).
+	if err := verifyXrayZipSHA256(url, fileName); err != nil {
+		os.Remove(fileName)
+		return "", err
+	}
 
 	return fileName, nil
+}
+
+// verifyXrayZipSHA256 fetches url+".dgst" (the hash file published with an
+// Xray-core release) and compares the SHA256 entry for the zip file with the
+// hash of the downloaded file. A missing .dgst or a missing entry is only a
+// warning; a present-but-mismatching hash is an error.
+func verifyXrayZipSHA256(url, zipPath string) error {
+	resp, err := http.Get(url + ".dgst")
+	if err != nil {
+		logger.Warning("failed to fetch xray .dgst, skipping sha256 verification:", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		logger.Warning("xray .dgst not available, skipping sha256 verification")
+		return nil
+	}
+	dgstBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Warning("failed to read xray .dgst:", err)
+		return nil
+	}
+	base := filepath.Base(zipPath)
+	re := regexp.MustCompile(`(?i)SHA256\s*\(` + regexp.QuoteMeta(base) + `\)\s*=\s*([0-9a-fA-F]{64})`)
+	matches := re.FindSubmatch(dgstBody)
+	if len(matches) < 2 {
+		logger.Warning("no SHA256 entry for", base, "in xray .dgst, skipping verification")
+		return nil
+	}
+	f, err := os.Open(zipPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	sum := sha256.New()
+	if _, err := io.Copy(sum, f); err != nil {
+		return err
+	}
+	if fmt.Sprintf("%x", sum.Sum(nil)) != strings.ToLower(string(matches[1])) {
+		return fmt.Errorf("xray zip sha256 mismatch for %s, refusing to use it", base)
+	}
+	return nil
 }
 
 func (s *ServerService) UpdateXray(version string) error {
@@ -680,7 +744,7 @@ func (s *ServerService) UpdateXray(version string) error {
 		defer zipFile.Close()
 		os.MkdirAll(filepath.Dir(fileName), 0755)
 		os.Remove(fileName)
-		file, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, fs.ModePerm)
+		file, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0755)
 		if err != nil {
 			return err
 		}
@@ -969,6 +1033,24 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 		return common.NewErrorf("Invalid or corrupt db file: %v", err)
 	}
 
+	// H-4: reject imported databases carrying triggers, views or unexpected
+	// tables BEFORE the file replaces the live database. A trigger on
+	// settings/inbounds could otherwise fire on a later admin write and
+	// silently re-open a hole the import validation just closed.
+	if err = database.ValidateImportedDBObjects(tempPath); err != nil {
+		return common.NewErrorf("Imported db has unexpected database objects: %v", err)
+	}
+
+	// H1 / H-3 / H-7: validate the xrayTemplateConfig stored in the
+	// imported database BEFORE it replaces the live database, reusing the
+	// full template check (log paths, api inbound listen, metrics, reverse,
+	// routing, freedom.redirect). A malicious log.access / log.error would
+	// otherwise make Xray write arbitrary files when the panel restarts
+	// Xray after the import.
+	if err = database.ValidateImportedXrayConfig(tempPath); err != nil {
+		return common.NewErrorf("Imported db has unsafe xray config: %v", err)
+	}
+
 	// Stop Xray (ignore error but log)
 	if errStop := s.StopXrayService(); errStop != nil {
 		logger.Warningf("Failed to stop Xray before DB import: %v", errStop)
@@ -1025,6 +1107,20 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 	// Start Xray
 	if err = s.RestartXrayService(); err != nil {
 		return common.NewErrorf("Imported DB but failed to start Xray: %v", err)
+	}
+
+	// H-4: the imported database may carry an attacker-known secret (which
+	// can be used to forge session cookies from the imported users table)
+	// and unknown administrator accounts. Rotate the secret now that the
+	// new database is live. This runs after InitDB succeeded, never during
+	// validation. Note the rotation only takes full effect after the next
+	// panel restart (the running process keeps the secret it loaded at
+	// startup, see SettingService.RotateSecret); the success message tells
+	// the operator to review the admin accounts.
+	// A rotation failure is reported loudly instead of silently skipped:
+	// the import itself already happened, so the message says so.
+	if err := (&SettingService{}).RotateSecret(); err != nil {
+		return common.NewErrorf("Imported DB but failed to rotate secret: %v", err)
 	}
 
 	return nil
@@ -1231,8 +1327,16 @@ func (s *ServerService) GetNewmldsa65() (any, error) {
 }
 
 func (s *ServerService) GetNewEchCert(sni string) (any, error) {
+	// M5: validate the SNI before it is passed to the xray CLI. It must be a
+	// plain hostname: no leading '-', no spaces, no shell metacharacters.
+	// exec.Command does not invoke a shell, but a leading '-' would be
+	// parsed as a flag by the xray binary.
+	sniRe := regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$`)
+	if !sniRe.MatchString(sni) {
+		return nil, errors.New("invalid sni hostname")
+	}
 	// Run the command
-	cmd := exec.Command(xray.GetBinaryPath(), "tls", "ech", "--serverName", sni)
+	cmd := exec.Command(xray.GetBinaryPath(), "tls", "ech", "--serverName="+sni)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err := cmd.Run()

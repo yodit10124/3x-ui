@@ -77,6 +77,8 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 		return nil, err
 	}
 
+	// L3: security headers on the subscription server too.
+	engine.Use(middleware.SecurityHeadersMiddleware())
 	if subDomain != "" {
 		engine.Use(middleware.DomainValidatorMiddleware(subDomain))
 	}
@@ -341,18 +343,17 @@ func (s *Server) Start() (err error) {
 	}
 
 	if certFile != "" || keyFile != "" {
+		// H4: same fail-closed rule as the panel server.
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-		if err == nil {
-			c := &tls.Config{
-				Certificates: []tls.Certificate{cert},
-			}
-			listener = network.NewAutoHttpsListener(listener)
-			listener = tls.NewListener(listener, c)
-			logger.Info("Sub server running HTTPS on", listener.Addr())
-		} else {
-			logger.Error("Error loading certificates:", err)
-			logger.Info("Sub server running HTTP on", listener.Addr())
+		if err != nil {
+			return common.NewErrorf("failed to load cert file: %v", err)
 		}
+		c := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		}
+		listener = network.NewAutoHttpsListener(listener)
+		listener = tls.NewListener(listener, c)
+		logger.Info("Sub server running HTTPS on", listener.Addr())
 	} else {
 		logger.Info("Sub server running HTTP on", listener.Addr())
 	}

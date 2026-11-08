@@ -188,6 +188,9 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 		return nil, err
 	}
 
+	// H3/L3: always on, independent of whether a web domain is configured.
+	engine.Use(middleware.SecurityHeadersMiddleware())
+	engine.Use(middleware.CSRFMiddleware())
 	if webDomain != "" {
 		engine.Use(middleware.DomainValidatorMiddleware(webDomain))
 	}
@@ -425,18 +428,19 @@ func (s *Server) Start() (err error) {
 		return err
 	}
 	if certFile != "" || keyFile != "" {
+		// H4: if the operator configured TLS, a certificate that cannot be
+		// loaded must fail the start instead of silently falling back to
+		// plain HTTP (which would expose the login session).
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-		if err == nil {
-			c := &tls.Config{
-				Certificates: []tls.Certificate{cert},
-			}
-			listener = network.NewAutoHttpsListener(listener)
-			listener = tls.NewListener(listener, c)
-			logger.Info("Web server running HTTPS on", listener.Addr())
-		} else {
-			logger.Error("Error loading certificates:", err)
-			logger.Info("Web server running HTTP on", listener.Addr())
+		if err != nil {
+			return common.NewErrorf("failed to load cert file: %v", err)
 		}
+		c := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		}
+		listener = network.NewAutoHttpsListener(listener)
+		listener = tls.NewListener(listener, c)
+		logger.Info("Web server running HTTPS on", listener.Addr())
 	} else {
 		logger.Info("Web server running HTTP on", listener.Addr())
 	}

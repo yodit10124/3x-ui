@@ -25,8 +25,11 @@ import (
 var xrayTemplateConfig string
 
 var defaultValueMap = map[string]string{
-	"xrayTemplateConfig":          xrayTemplateConfig,
-	"webListen":                   "",
+	"xrayTemplateConfig": xrayTemplateConfig,
+	// H4/M6: fresh installs bind the panel and the subscription server to
+	// loopback only by default. An operator can still change this in the
+	// settings; existing databases keep their stored value.
+	"webListen":                   "127.0.0.1",
 	"webDomain":                   "",
 	"webPort":                     "2053",
 	"webCertFile":                 "",
@@ -51,7 +54,11 @@ var defaultValueMap = map[string]string{
 	"tgLang":                      "en-US",
 	"twoFactorEnable":             "false",
 	"twoFactorToken":              "",
-	"subEnable":                   "true",
+	// Subscription is OFF by default on fresh installs (changed 2026-11-08):
+	// the subscription server is unauthenticated, so it must not start
+	// unless the operator explicitly enables it in the settings.
+	// Existing databases keep their stored value.
+	"subEnable":                   "false",
 	"subJsonEnable":               "false",
 	"subTitle":                    "",
 	"subSupportUrl":               "",
@@ -59,7 +66,7 @@ var defaultValueMap = map[string]string{
 	"subAnnounce":                 "",
 	"subEnableRouting":            "true",
 	"subRoutingRules":             "",
-	"subListen":                   "",
+	"subListen":                   "127.0.0.1",
 	"subPort":                     "2096",
 	"subPath":                     "/sub/",
 	"subDomain":                   "",
@@ -107,6 +114,15 @@ var defaultValueMap = map[string]string{
 	"ldapDefaultTotalGB":    "0",
 	"ldapDefaultExpiryDays": "0",
 	"ldapDefaultLimitIP":    "0",
+}
+
+// secretSettingKeys are never returned in clear text by GetAllSetting (M7):
+// a leaked Telegram bot token is equivalent to panel admin access, and the
+// 2FA token is a credential in its own right. The frontend only needs to
+// know whether they are set.
+var secretSettingKeys = map[string]bool{
+	"tgBotToken":     true,
+	"twoFactorToken": true,
 }
 
 // SettingService provides business logic for application settings management.
@@ -177,6 +193,13 @@ func (s *SettingService) GetAllSetting() (*entity.AllSetting, error) {
 
 	keyMap := map[string]bool{}
 	for _, setting := range settings {
+		// M7: do not send secret values to the frontend; only record that
+		// the setting exists so the UI can show "configured".
+		if secretSettingKeys[setting.Key] {
+			if setting.Value != "" {
+				setting.Value = "******"
+			}
+		}
 		err := setSetting(setting.Key, setting.Value)
 		if err != nil {
 			return nil, err
@@ -417,6 +440,15 @@ func (s *SettingService) GetSessionMaxAge() (int, error) {
 
 func (s *SettingService) GetRemarkModel() (string, error) {
 	return s.getString("remarkModel")
+}
+
+// RotateSecret generates a fresh cookie-signing secret. The running process
+// keeps using the secret it loaded at startup, so rotation takes full effect
+// on the next panel restart; combined with the session revalidation in
+// web/session/session.go, a password change invalidates old sessions
+// immediately even before a restart.
+func (s *SettingService) RotateSecret() error {
+	return s.saveSetting("secret", random.Seq(32))
 }
 
 func (s *SettingService) GetSecret() ([]byte, error) {
@@ -739,6 +771,11 @@ func (s *SettingService) UpdateAllSetting(allSetting *entity.AllSetting) error {
 		key := field.Tag.Get("json")
 		fieldV := v.FieldByName(field.Name)
 		value := fmt.Sprint(fieldV.Interface())
+		// M7: GetAllSetting returns "******" for secret settings; a
+		// round-tripped placeholder must not overwrite the stored secret.
+		if secretSettingKeys[key] && value == "******" {
+			continue
+		}
 		err := s.saveSetting(key, value)
 		if err != nil {
 			errs = append(errs, err)

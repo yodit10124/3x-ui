@@ -173,6 +173,7 @@
 "importDatabase" = "恢復"
 "importDatabaseDesc" = "點擊選擇並上傳設備中的 .db 文件以從備份恢復資料庫。"
 "importDatabaseSuccess" = "資料庫匯入成功"
+"importDatabaseCheckAccounts" = "提示：工作階段金鑰已輪換，請檢查管理員帳號，匯入的資料庫可能含有未知管理員帳號。"
 "importDatabaseError" = "匯入資料庫時發生錯誤"
 "readDatabaseError" = "讀取資料庫時發生錯誤"
 "getDatabaseError" = "檢索資料庫時發生錯誤"

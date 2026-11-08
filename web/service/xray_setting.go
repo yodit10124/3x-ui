@@ -4,8 +4,7 @@ import (
 	_ "embed"
 	"encoding/json"
 
-	"github.com/mhsanaei/3x-ui/v2/util/common"
-	"github.com/mhsanaei/3x-ui/v2/xray"
+	"github.com/mhsanaei/3x-ui/v2/config"
 )
 
 // XraySettingService provides business logic for Xray configuration management.
@@ -31,12 +30,13 @@ func (s *XraySettingService) SaveXraySetting(newXraySettings string) error {
 }
 
 func (s *XraySettingService) CheckXrayConfig(XrayTemplateConfig string) error {
-	xrayConfig := &xray.Config{}
-	err := json.Unmarshal([]byte(XrayTemplateConfig), xrayConfig)
-	if err != nil {
-		return common.NewError("xray template config invalid:", err)
-	}
-	return nil
+	// H1 / H-3 / H-7: the Xray config is attacker-controllable by a logged-in
+	// admin. The full check lives in config.ValidateXrayTemplateConfig so
+	// the database import path and xray.Process.Start() reuse the exact
+	// same rules; this method is just the save-path entry point to it.
+	// (It cannot live here: database and xray cannot import web/service
+	// without creating an import cycle.)
+	return config.ValidateXrayTemplateConfig(XrayTemplateConfig)
 }
 
 // UnwrapXrayTemplateConfig returns the raw xray config JSON from `raw`,

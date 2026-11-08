@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"net/http"
 
+	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 
@@ -51,7 +52,21 @@ func GetLoginUser(c *gin.Context) *model.User {
 		}
 		return nil
 	}
-	return &user
+	// M1: the session only proves who logged in, not that the credentials
+	// are still current. Re-validate against the database on every request:
+	// if the user was deleted or the password hash changed (password change),
+	// the old cookie stops working immediately.
+	if user.Id == 0 {
+		return nil
+	}
+	fresh := &model.User{}
+	if err := database.GetDB().Model(model.User{}).Where("id = ?", user.Id).First(fresh).Error; err != nil {
+		return nil
+	}
+	if fresh.Password != user.Password {
+		return nil
+	}
+	return fresh
 }
 
 // IsLogin checks if a user is currently authenticated in the session.

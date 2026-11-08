@@ -78,6 +78,18 @@
         },
         methods: {
             openLink(key) {
+                // L-3: logout is a state-changing POST now (GET /logout no
+                // longer logs out), so the sidebar logout entry posts
+                // instead of navigating; the CSRF middleware requires the
+                // X-Requested-With header on the POST.
+                if (key.endsWith('logout/')) {
+                    fetch(basePath + 'logout', {
+                        method: 'POST',
+                        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                        credentials: 'same-origin',
+                    }).finally(() => { location.href = basePath; });
+                    return;
+                }
                 return key.startsWith('http') ?
                     window.open(key) :
                     location.href = key

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"runtime"
@@ -70,23 +69,37 @@ func GetAccessPersistentPrevLogPath() string {
 
 // GetAccessLogPath reads the Xray config and returns the access log file path.
 func GetAccessLogPath() (string, error) {
-	config, err := os.ReadFile(GetConfigPath())
+	// NOTE: the local variable is named configData, not config, because the
+	// config package is used below (config.ValidateXrayLogPath).
+	configData, err := os.ReadFile(GetConfigPath())
 	if err != nil {
 		logger.Warningf("Failed to read configuration file: %s", err)
 		return "", err
 	}
 
 	jsonConfig := map[string]any{}
-	err = json.Unmarshal([]byte(config), &jsonConfig)
+	err = json.Unmarshal([]byte(configData), &jsonConfig)
 	if err != nil {
 		logger.Warningf("Failed to parse JSON configuration: %s", err)
 		return "", err
 	}
 
 	if jsonConfig["log"] != nil {
-		jsonLog := jsonConfig["log"].(map[string]any)
+		// H1 / L1: the type assertions here must be checked (an unchecked
+		// assertion panics), and the returned path must be inside the panel
+		// log folder.
+		jsonLog, ok := jsonConfig["log"].(map[string]any)
+		if !ok {
+			return "", errors.New("invalid xray log config type")
+		}
 		if jsonLog["access"] != nil {
-			accessLogPath := jsonLog["access"].(string)
+			accessLogPath, ok := jsonLog["access"].(string)
+			if !ok {
+				return "", errors.New("invalid xray log.access type")
+			}
+			if err := config.ValidateXrayLogPath(accessLogPath); err != nil {
+				return "", err
+			}
 			return accessLogPath, nil
 		}
 	}
@@ -244,9 +257,23 @@ func (p *process) Start() (err error) {
 		}
 	}()
 
+	if p.config == nil {
+		return errors.New("xray config is nil")
+	}
+
+	// H1 / H-3 / H-7: last line of defence - validate the exact bytes that
+	// are about to be written to disk and handed to Xray, reusing the same
+	// check as the template save and database import paths
+	// (config.ValidateXrayRuntimeConfig). Validating the marshalled merged
+	// config, instead of only unmarshalling the log section, also closes
+	// the old gap where a JSON unmarshal failure silently skipped all
+	// validation and the config was started unchecked.
 	data, err := json.MarshalIndent(p.config, "", "  ")
 	if err != nil {
 		return common.NewErrorf("Failed to generate XRAY configuration files: %v", err)
+	}
+	if err := config.ValidateXrayRuntimeConfig(string(data)); err != nil {
+		return err
 	}
 
 	err = os.MkdirAll(config.GetLogFolder(), 0o770)
@@ -258,7 +285,7 @@ func (p *process) Start() (err error) {
 	if p.configPath != "" {
 		configPath = p.configPath
 	}
-	err = os.WriteFile(configPath, data, fs.ModePerm)
+	err = os.WriteFile(configPath, data, 0644)
 	if err != nil {
 		return common.NewErrorf("Failed to write configuration file: %v", err)
 	}
@@ -318,5 +345,5 @@ func (p *process) Stop() error {
 // writeCrashReport writes a crash report to the binary folder with a timestamped filename.
 func writeCrashReport(m []byte) error {
 	crashReportPath := config.GetBinFolderPath() + "/core_crash_" + time.Now().Format("20060102_150405") + ".log"
-	return os.WriteFile(crashReportPath, m, os.ModePerm)
+	return os.WriteFile(crashReportPath, m, 0644)
 }

@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strings"
 
 	"github.com/mhsanaei/3x-ui/v2/config"
@@ -14,25 +15,82 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// getRemoteIp extracts the real IP address from the request headers or remote address.
+// getRemoteIp returns the IP to use for logging and login rate limiting.
+//
+// H-1: X-Real-IP / X-Forwarded-For are plain request headers that any
+// client can set to any value, so they must never be trusted blindly.
+// The only IP that cannot be forged in a completed TCP (HTTP) request is
+// the direct peer address in RemoteAddr. By default this function returns
+// exactly that and ignores both forwarding headers.
+//
+// The forwarding headers are honoured only when the direct peer is a
+// trusted reverse proxy, configured via the XUI_TRUSTED_PROXIES
+// environment variable (comma-separated IPs and/or CIDRs, e.g.
+// "127.0.0.1,10.0.0.0/8"; empty means trust no proxy). When the peer is
+// trusted, the X-Forwarded-For chain is walked from the rightmost entry
+// (closest to us) leftwards, skipping trusted proxies, and the first
+// untrusted entry is the real client. X-Real-IP is only used when there
+// is no X-Forwarded-For chain and the peer is trusted.
 func getRemoteIp(c *gin.Context) string {
+	remoteIP, ok := extractTrustedIP(c.Request.RemoteAddr)
+	if !ok {
+		return "unknown"
+	}
+	if !isTrustedProxy(remoteIP) {
+		return remoteIP
+	}
+	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
+		chain := make([]string, 0, 8)
+		for _, part := range strings.Split(xff, ",") {
+			if ip, ok := extractTrustedIP(part); ok {
+				chain = append(chain, ip)
+			}
+		}
+		chain = append(chain, remoteIP)
+		// Walk from the peer (rightmost) leftwards, skipping trusted
+		// proxies; the first untrusted entry is the real client.
+		for i := len(chain) - 1; i > 0; i-- {
+			if !isTrustedProxy(chain[i]) {
+				return chain[i]
+			}
+		}
+		return chain[0]
+	}
 	if ip, ok := extractTrustedIP(c.GetHeader("X-Real-IP")); ok {
 		return ip
 	}
+	return remoteIP
+}
 
-	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
-		for _, part := range strings.Split(xff, ",") {
-			if ip, ok := extractTrustedIP(part); ok {
-				return ip
+// isTrustedProxy reports whether ip belongs to the reverse proxies the
+// operator explicitly trusts via XUI_TRUSTED_PROXIES. An empty list trusts
+// nobody, which is the safe default for a directly exposed panel.
+func isTrustedProxy(ip string) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, entry := range strings.Split(os.Getenv("XUI_TRUSTED_PROXIES"), ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			prefix, err := netip.ParsePrefix(entry)
+			if err != nil {
+				continue
 			}
+			if prefix.Contains(addr) {
+				return true
+			}
+			continue
+		}
+		if trusted, err := netip.ParseAddr(entry); err == nil && trusted.Unmap() == addr {
+			return true
 		}
 	}
-
-	if ip, ok := extractTrustedIP(c.Request.RemoteAddr); ok {
-		return ip
-	}
-
-	return "unknown"
+	return false
 }
 
 func extractTrustedIP(value string) (string, bool) {

@@ -100,7 +100,53 @@ func GetDBPath() string {
 	return fmt.Sprintf("%s/%s.db", GetDBFolderPath(), GetName())
 }
 
-// GetLogFolder returns the path to the log folder based on environment variables or platform defaults.
+// ValidateXrayLogPath checks that an Xray log path is safe (H1 / CVE-2026-55477).
+// Allowed values: empty, "none" (logging disabled), or an absolute *.log path
+// inside the panel log folder (config.GetLogFolder(), /var/log/x-ui by default).
+// The path is cleaned first, ".." escapes are rejected, and any symlink in the
+// resolved path (or its parent directory, when the file does not exist yet)
+// is resolved with filepath.EvalSymlinks and re-checked against the folder.
+func ValidateXrayLogPath(path string) error {
+	if path == "" || path == "none" {
+		return nil
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("xray log path must be absolute: %q", path)
+	}
+	clean := filepath.Clean(path)
+	if filepath.Ext(clean) != ".log" {
+		return fmt.Errorf("xray log path must end with .log: %q", path)
+	}
+	logFolder := filepath.Clean(GetLogFolder())
+	prefix := logFolder + string(filepath.Separator)
+	if clean != logFolder && !strings.HasPrefix(clean, prefix) {
+		return fmt.Errorf("xray log path %q is outside the log folder %q", path, logFolder)
+	}
+	// Resolve symlinks: if the file exists, resolve it; otherwise resolve its
+	// parent directory (an attacker-controlled symlink on the parent would
+	// otherwise redirect the write elsewhere).
+	resolved := clean
+	if target, err := filepath.EvalSymlinks(clean); err == nil {
+		resolved = target
+	} else if parent, err := filepath.EvalSymlinks(filepath.Dir(clean)); err == nil {
+		resolved = filepath.Join(parent, filepath.Base(clean))
+	}
+	resolved = filepath.Clean(resolved)
+	if resolved != logFolder && !strings.HasPrefix(resolved, prefix) {
+		return fmt.Errorf("xray log path %q resolves outside the log folder %q", path, logFolder)
+	}
+	return nil
+}
+
+// ValidateXrayLogPaths validates both the access and error log paths.
+func ValidateXrayLogPaths(access, errorPath string) error {
+	if err := ValidateXrayLogPath(access); err != nil {
+		return err
+	}
+	return ValidateXrayLogPath(errorPath)
+}
+
+// GetLogFolder returns the log folder path based on the operating system and environment variables.
 func GetLogFolder() string {
 	logFolderPath := os.Getenv("XUI_LOG_FOLDER")
 	if logFolderPath != "" {

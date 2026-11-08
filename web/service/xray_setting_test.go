@@ -2,9 +2,33 @@ package service
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
+
+// H-3 / H-7: CheckXrayConfig delegates to the shared validator in the
+// config package; the shipped default template must pass it, and an api
+// inbound with an empty listen (i.e. 0.0.0.0) must be rejected.
+func TestCheckXrayConfig(t *testing.T) {
+	raw, err := os.ReadFile("config.json")
+	if err != nil {
+		t.Fatalf("read default template: %v", err)
+	}
+	s := &XraySettingService{}
+	if err := s.CheckXrayConfig(string(raw)); err != nil {
+		t.Fatalf("default template should pass CheckXrayConfig, got %v", err)
+	}
+	if err := s.CheckXrayConfig(`{"inbounds": [{"tag": "api", "port": 62789}]}`); err == nil {
+		t.Fatal("api inbound with empty listen should be rejected")
+	}
+	if err := s.CheckXrayConfig(`{"inbounds": [{"tag": "api", "listen": "0.0.0.0", "port": 62789}]}`); err == nil {
+		t.Fatal("api inbound on 0.0.0.0 should be rejected")
+	}
+	if err := s.CheckXrayConfig(`{"metrics": {"listen": "0.0.0.0:11111"}}`); err == nil {
+		t.Fatal("metrics on 0.0.0.0 should be rejected")
+	}
+}
 
 func TestUnwrapXrayTemplateConfig(t *testing.T) {
 	real := `{"log":{},"inbounds":[],"outbounds":[],"routing":{}}`

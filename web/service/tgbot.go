@@ -751,6 +751,21 @@ func (t *Tgbot) randomShadowSocksPassword() string {
 	return base64.StdEncoding.EncodeToString(array)
 }
 
+// checkClientOwnership verifies that the client identified by email belongs
+// to the Telegram user who triggered the callback. Admins bypass the check
+// and may fetch any client's links. A lookup failure, a missing client, or
+// a client whose TgID differs from the requester all deny access.
+func (t *Tgbot) checkClientOwnership(email string, tgUserID int64, isAdmin bool) bool {
+	if isAdmin {
+		return true
+	}
+	_, client, err := t.inboundService.GetClientByEmail(email)
+	if err != nil || client == nil {
+		return false
+	}
+	return client.TgID == tgUserID
+}
+
 // answerCallback processes callback queries from inline keyboards.
 func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool) {
 	chatId := callbackQuery.Message.GetChat().ID
@@ -1623,6 +1638,22 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 		}
 	}
 
+	// The management callbacks below are admin-only. Regular users keep
+	// only their own client callbacks (client_traffic, client_commands and
+	// the client_* link callbacks, with or without an email suffix).
+	if !isAdmin {
+		switch callbackQuery.Data {
+		case "client_traffic", "client_commands", "client_sub_links", "client_individual_links", "client_qr_links":
+		default:
+			if !strings.HasPrefix(callbackQuery.Data, "client_sub_links ") &&
+				!strings.HasPrefix(callbackQuery.Data, "client_individual_links ") &&
+				!strings.HasPrefix(callbackQuery.Data, "client_qr_links ") {
+				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.errorOperation"))
+				return
+			}
+		}
+	}
+
 	switch callbackQuery.Data {
 	case "get_usage":
 		t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.buttons.serverUsage"))
@@ -2021,18 +2052,27 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 		}
 	default:
 		if after, ok := strings.CutPrefix(callbackQuery.Data, "client_sub_links "); ok {
-			email := after
-			t.sendClientSubLinks(chatId, email)
+			if !t.checkClientOwnership(after, callbackQuery.From.ID, isAdmin) {
+				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.errorOperation"))
+				return
+			}
+			t.sendClientSubLinks(chatId, after)
 			return
 		}
 		if after, ok := strings.CutPrefix(callbackQuery.Data, "client_individual_links "); ok {
-			email := after
-			t.sendClientIndividualLinks(chatId, email)
+			if !t.checkClientOwnership(after, callbackQuery.From.ID, isAdmin) {
+				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.errorOperation"))
+				return
+			}
+			t.sendClientIndividualLinks(chatId, after)
 			return
 		}
 		if after, ok := strings.CutPrefix(callbackQuery.Data, "client_qr_links "); ok {
-			email := after
-			t.sendClientQRLinks(chatId, email)
+			if !t.checkClientOwnership(after, callbackQuery.From.ID, isAdmin) {
+				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.errorOperation"))
+				return
+			}
+			t.sendClientQRLinks(chatId, after)
 			return
 		}
 	}
@@ -2792,7 +2832,10 @@ func (t *Tgbot) UserLoginNotify(username string, password string, ip string, tim
 	case LoginFail:
 		msg += t.I18nBot("tgbot.messages.loginFailed")
 		msg += t.I18nBot("tgbot.messages.hostname", "Hostname=="+hostname)
-		msg += t.I18nBot("tgbot.messages.password", "Password=="+password)
+		// H5: the password argument is accepted for API compatibility but
+		// never included in the notification - it must not leave the panel.
+		_ = password
+		msg += t.I18nBot("tgbot.messages.password", "Password=<redacted>")
 	}
 	msg += t.I18nBot("tgbot.messages.username", "Username=="+username)
 	msg += t.I18nBot("tgbot.messages.ip", "IP=="+ip)
@@ -3636,6 +3679,14 @@ func (t *Tgbot) onlineClients(chatId int64, messageID ...int) {
 
 // sendBackup sends a backup of the database and configuration files.
 func (t *Tgbot) sendBackup(chatId int64) {
+	// The backup contains the full database and config: only send it to an
+	// admin chat. In a private chat the chat ID equals the admin user ID,
+	// so this also refuses to post a backup into a group chat.
+	if !checkAdmin(chatId) {
+		logger.Warning("sendBackup called for non-admin chat, refusing: ", chatId)
+		return
+	}
+
 	output := t.I18nBot("tgbot.messages.backupTime", "Time=="+time.Now().Format("2006-01-02 15:04:05"))
 	t.SendMsgToTgbot(chatId, output)
 

@@ -120,10 +120,16 @@ func (s *UserService) UpdateUser(id int, username string, password string) error
 		s.settingService.SetTwoFactorToken("")
 	}
 
-	return db.Model(model.User{}).
+	if err := db.Model(model.User{}).
 		Where("id = ?", id).
 		Updates(map[string]any{"username": username, "password": hashedPassword}).
-		Error
+		Error; err != nil {
+		return err
+	}
+	// M1: rotate the cookie-signing secret so old session cookies stop
+	// validating after the next restart (session revalidation in
+	// web/session/session.go invalidates them immediately).
+	return s.settingService.RotateSecret()
 }
 
 func (s *UserService) UpdateFirstUser(username string, password string) error {
@@ -150,5 +156,8 @@ func (s *UserService) UpdateFirstUser(username string, password string) error {
 	}
 	user.Username = username
 	user.Password = hashedPassword
-	return db.Save(user).Error
+	if err := db.Save(user).Error; err != nil {
+		return err
+	}
+	return s.settingService.RotateSecret()
 }

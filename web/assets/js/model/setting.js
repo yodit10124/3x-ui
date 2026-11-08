@@ -26,7 +26,7 @@ class AllSetting {
         this.twoFactorEnable = false;
         this.twoFactorToken = "";
         this.xrayTemplateConfig = "";
-        this.subEnable = true;
+        this.subEnable = false;
         this.subJsonEnable = false;
         this.subTitle = "";
         this.subSupportUrl = "";

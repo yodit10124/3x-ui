@@ -340,7 +340,14 @@
           this.loading(false);
           if (msg.success) {
             this.user = {};
-            window.location.replace(basePath + "logout");
+            // L-3: logout is POST-only now (GET /logout no longer logs
+            // out); post with the CSRF header, then go to the login page.
+            await fetch(basePath + "logout", {
+              method: "POST",
+              headers: { "X-Requested-With": "XMLHttpRequest" },
+              credentials: "same-origin",
+            }).catch(() => {});
+            window.location.replace(basePath);
           }
         }
 

@@ -1520,8 +1520,29 @@
       openBackup() {
         backupModal.show();
       },
-      exportDatabase() {
-        window.location = basePath + 'panel/api/server/getDb';
+      async exportDatabase() {
+        // H3: database export is a sensitive operation, so it is a POST
+        // (with the X-Requested-With header the CSRF middleware requires)
+        // instead of a plain GET navigation, which any site could trigger.
+        try {
+          const resp = await fetch(basePath + 'panel/api/server/getDb', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+          });
+          if (!resp.ok) {
+            return;
+          }
+          const blob = await resp.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'x-ui.db';
+          a.click();
+          URL.revokeObjectURL(url);
+        } catch (e) {
+          console.error('export database failed', e);
+        }
       },
       importDatabase() {
         const fileInput = document.createElement('input');

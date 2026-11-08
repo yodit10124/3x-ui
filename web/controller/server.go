@@ -46,7 +46,7 @@ func (a *ServerController) initRouter(g *gin.RouterGroup) {
 	g.GET("/getXrayVersion", a.getXrayVersion)
 	g.GET("/getPanelUpdateInfo", a.getPanelUpdateInfo)
 	g.GET("/getConfigJson", a.getConfigJson)
-	g.GET("/getDb", a.getDb)
+	g.POST("/getDb", a.getDb)
 	g.GET("/getNewUUID", a.getNewUUID)
 	g.GET("/getNewX25519Cert", a.getNewX25519Cert)
 	g.GET("/getNewmldsa65", a.getNewmldsa65)
@@ -316,7 +316,15 @@ func (a *ServerController) importDB(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.index.importDatabaseError"), err)
 		return
 	}
-	jsonObj(c, I18nWeb(c, "pages.index.importDatabaseSuccess"), nil)
+	// H-4: ImportDB has rotated the session secret; the imported database
+	// may also contain unknown administrator accounts. Tell the operator
+	// to review them. The hint key is only translated in some locales;
+	// where it is missing the base message is shown on its own.
+	msg := I18nWeb(c, "pages.index.importDatabaseSuccess")
+	if hint := I18nWeb(c, "pages.index.importDatabaseCheckAccounts"); hint != "" {
+		msg += " " + hint
+	}
+	jsonObj(c, msg, nil)
 }
 
 // getNewX25519Cert generates a new X25519 certificate.

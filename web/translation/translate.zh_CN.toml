@@ -173,6 +173,7 @@
 "importDatabase" = "恢复"
 "importDatabaseDesc" = "点击选择并上传设备中的 .db 文件以从备份恢复数据库。"
 "importDatabaseSuccess" = "数据库导入成功"
+"importDatabaseCheckAccounts" = "提示：会话密钥已轮换，请检查管理员账号，导入的数据库可能含有未知的管理员账号。"
 "importDatabaseError" = "导入数据库时出错"
 "readDatabaseError" = "读取数据库时出错"
 "getDatabaseError" = "检索数据库时出错"

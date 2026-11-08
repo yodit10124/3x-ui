@@ -166,11 +166,15 @@ legacy_version() {
         echo "Panel version cannot be empty. Exiting."
         exit 1
     fi
-    # Use the entered panel version in the download link
-    install_command="bash <(curl -Ls "https://raw.githubusercontent.com/mhsanaei/3x-ui/v$tag_version/install.sh") v$tag_version"
+    # H6: only a plain x.y.z version is accepted; an unchecked version was
+    # interpolated into a command string and executed with eval.
+    if ! [[ "$tag_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "Invalid panel version format (expected x.y.z). Exiting."
+        exit 1
+    fi
 
     echo "Downloading and installing panel version $tag_version..."
-    eval $install_command
+    bash <(curl -Ls "https://raw.githubusercontent.com/mhsanaei/3x-ui/v$tag_version/install.sh") v$tag_version
 }
 
 # Function to handle the deletion of the script file

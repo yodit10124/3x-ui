@@ -1,8 +1,12 @@
 package service
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -58,6 +62,14 @@ func (s *PanelService) GetUpdateInfo() (*PanelUpdateInfo, error) {
 }
 
 // StartUpdate starts the official updater outside of the current web request.
+//
+// H-6: the updater script is never executed straight from the network. It is
+// downloaded with the Go HTTP client, SHA256-verified against the
+// operator-supplied XUI_UPDATE_SHA256, and only then executed from a local
+// temp file. There is no official checksum file for update.sh (it is a
+// rolling script fetched from the main branch, not a release asset), so the
+// expected hash must come from the operator; when it is missing or does not
+// match, the update is refused instead of warning and continuing.
 func (s *PanelService) StartUpdate() error {
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("panel web update is supported only on Linux installations")
@@ -67,13 +79,28 @@ func (s *PanelService) StartUpdate() error {
 	if err != nil {
 		return fmt.Errorf("bash is required to run the panel updater: %w", err)
 	}
-	curl, err := exec.LookPath("curl")
+
+	// Download and verify first; refuse on any failure. No curl|bash pipe.
+	scriptPath, err := downloadVerifiedUpdateScript()
 	if err != nil {
-		return fmt.Errorf("curl is required to download the panel updater: %w", err)
+		return err
 	}
+	// The updater runs detached (a systemd unit or a background process) and
+	// restarts the panel itself, so the parent cannot delete the temp file
+	// on return: the child shell removes it after the updater exits. Only
+	// delete it here if the update job could not be started at all.
+	started := false
+	defer func() {
+		if !started {
+			os.Remove(scriptPath)
+		}
+	}()
 
 	mainFolder, serviceFolder := resolveUpdateFolders()
-	updateScript := fmt.Sprintf("set -o pipefail; %s -fLs https://raw.githubusercontent.com/MHSanaei/3x-ui/main/update.sh | %s", shellQuote(curl), shellQuote(bash))
+	// Execute the verified local file, never a network pipe. The path is
+	// shell-quoted (CreateTemp names are safe, but quote anyway), and the
+	// temp file is removed by this same shell once the updater exits.
+	updateScript := fmt.Sprintf("%s %s; rm -f %s", shellQuote(bash), shellQuote(scriptPath), shellQuote(scriptPath))
 
 	if systemdRun, err := exec.LookPath("systemd-run"); err == nil {
 		unitName := fmt.Sprintf("x-ui-web-update-%d", time.Now().Unix())
@@ -92,6 +119,7 @@ func (s *PanelService) StartUpdate() error {
 			}
 			logger.Warning("systemd-run is unavailable, falling back to detached update process:", output)
 		} else {
+			started = true
 			logger.Infof("started panel update job via systemd-run unit %s", unitName)
 			return nil
 		}
@@ -106,11 +134,84 @@ func (s *PanelService) StartUpdate() error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start panel update job: %w", err)
 	}
+	started = true
 	if err := cmd.Process.Release(); err != nil {
 		logger.Warning("failed to release panel update process:", err)
 	}
 	logger.Infof("started panel update job with pid %d", cmd.Process.Pid)
 	return nil
+}
+
+// updateScriptURL is the only source of the updater script.
+const updateScriptURL = "https://raw.githubusercontent.com/MHSanaei/3x-ui/main/update.sh"
+
+// updateScriptMaxBytes caps the downloaded updater script. update.sh is a
+// small shell script; anything larger is rejected instead of written to disk.
+const updateScriptMaxBytes = 1 << 20 // 1 MiB
+
+// updateDownloadTimeout bounds the updater download.
+const updateDownloadTimeout = 30 * time.Second
+
+// downloadVerifiedUpdateScript downloads update.sh, verifies its SHA256
+// against the operator-supplied XUI_UPDATE_SHA256 environment variable, and
+// writes the verified script to a 0600 temp file (os.CreateTemp, random
+// name, in os.TempDir()). The caller owns the returned path and must remove
+// it once the updater has run; on any error the file is removed here and no
+// path is returned, so unverified content is never executed.
+func downloadVerifiedUpdateScript() (string, error) {
+	expectedHex := strings.TrimSpace(os.Getenv("XUI_UPDATE_SHA256"))
+	if expectedHex == "" {
+		return "", fmt.Errorf("panel update refused: XUI_UPDATE_SHA256 is not set; set it to the SHA256 of %s before updating (compute it with: curl -fsSL %s | sha256sum)", updateScriptURL, updateScriptURL)
+	}
+	expected, err := hex.DecodeString(expectedHex)
+	if err != nil || len(expected) != sha256.Size {
+		return "", fmt.Errorf("panel update refused: XUI_UPDATE_SHA256 must be a 64-character hex SHA256 digest")
+	}
+
+	client := &http.Client{Timeout: updateDownloadTimeout}
+	resp, err := client.Get(updateScriptURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to download panel updater: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to download panel updater: unexpected HTTP status %s", resp.Status)
+	}
+	if resp.ContentLength > updateScriptMaxBytes {
+		return "", fmt.Errorf("panel update refused: updater script exceeds the %d byte limit", updateScriptMaxBytes)
+	}
+	// LimitReader caps the body at max+1 bytes so an oversized response is
+	// detected instead of buffering unbounded data.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, updateScriptMaxBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("failed to download panel updater: %w", err)
+	}
+	if int64(len(body)) > updateScriptMaxBytes {
+		return "", fmt.Errorf("panel update refused: updater script exceeds the %d byte limit", updateScriptMaxBytes)
+	}
+
+	sum := sha256.Sum256(body)
+	if subtle.ConstantTimeCompare(sum[:], expected) != 1 {
+		return "", fmt.Errorf("panel update refused: SHA256 mismatch for the downloaded updater script")
+	}
+
+	// os.CreateTemp creates the file with 0600 and a random, unpredictable
+	// name. The script is written only after the hash has been verified.
+	tmp, err := os.CreateTemp("", "x-ui-update-*.sh")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file for panel updater: %w", err)
+	}
+	if _, err := tmp.Write(body); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("failed to write panel updater to temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("failed to write panel updater to temp file: %w", err)
+	}
+	logger.Infof("downloaded and SHA256-verified panel updater %s", tmp.Name())
+	return tmp.Name(), nil
 }
 
 func fetchLatestPanelVersion() (string, error) {

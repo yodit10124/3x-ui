@@ -27,6 +27,22 @@ else
 fi
 echo "The OS release is: $release"
 
+# H6: verify a downloaded release tarball against a checksum supplied by the
+# operator (XUI_TARBALL_SHA256). The upstream release publishes no .sha256
+# file, so without this variable there is nothing trustworthy to check
+# against - the script warns and continues instead of inventing a hash.
+verify_tarball_sha256() {
+    local file="$1"
+    if [ -n "${XUI_TARBALL_SHA256:-}" ]; then
+        echo "${XUI_TARBALL_SHA256}  ${file}" | sha256sum -c - || {
+            echo "SHA256 verification failed for ${file}, aborting."
+            exit 1
+        }
+    else
+        echo "Warning: no XUI_TARBALL_SHA256 provided and upstream publishes no checksum file; skipping tarball verification."
+    fi
+}
+
 arch() {
     case "$(uname -m)" in
         x86_64 | x64 | amd64) echo 'amd64' ;;
@@ -802,6 +818,7 @@ install_x-ui() {
             echo -e "${red}Downloading x-ui failed, please be sure that your server can access GitHub ${plain}"
             exit 1
         fi
+        verify_tarball_sha256 ${xui_folder}-linux-$(arch).tar.gz
     else
         tag_version=$1
         tag_version_numeric=${tag_version#v}
@@ -819,6 +836,7 @@ install_x-ui() {
             echo -e "${red}Download x-ui $1 failed, please check if the version exists ${plain}"
             exit 1
         fi
+        verify_tarball_sha256 ${xui_folder}-linux-$(arch).tar.gz
     fi
     curl -4fLRo /usr/bin/x-ui-temp https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh
     if [[ $? -ne 0 ]]; then

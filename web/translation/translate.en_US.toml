@@ -214,6 +214,7 @@
 "importDatabase" = "Restore"
 "importDatabaseDesc" = "Click to select and upload a .db file from your device to restore your database from a backup."
 "importDatabaseSuccess" = "The database has been successfully imported."
+"importDatabaseCheckAccounts" = "Note: the session secret has been rotated. Please check the administrator accounts — the imported database may contain unknown admin accounts."
 "importDatabaseError" = "An error occurred while importing the database."
 "readDatabaseError" = "An error occurred while reading the database."
 "getDatabaseError" = "An error occurred while retrieving the database."

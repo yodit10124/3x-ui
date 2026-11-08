@@ -20,6 +20,22 @@ cur_dir="$(cd -P "$(dirname "$b_source")" > /dev/null 2>&1 && pwd || pwd -P)"
 script_name=$(basename "$0")
 
 # Check command exist function
+# H6: verify a downloaded release tarball against a checksum supplied by the
+# operator (XUI_TARBALL_SHA256). The upstream release publishes no .sha256
+# file, so without this variable there is nothing trustworthy to check
+# against - the script warns and continues instead of inventing a hash.
+verify_tarball_sha256() {
+    local file="$1"
+    if [ -n "${XUI_TARBALL_SHA256:-}" ]; then
+        echo "${XUI_TARBALL_SHA256}  ${file}" | sha256sum -c - || {
+            echo "SHA256 verification failed for ${file}, aborting."
+            exit 1
+        }
+    else
+        echo "Warning: no XUI_TARBALL_SHA256 provided and upstream publishes no checksum file; skipping tarball verification."
+    fi
+}
+
 _command_exists() {
     type "$1" &> /dev/null
 }
@@ -795,6 +811,7 @@ update_x-ui() {
             _fail "ERROR: Failed to download x-ui, please be sure that your server can access GitHub"
         fi
     fi
+    verify_tarball_sha256 ${xui_folder}-linux-$(arch).tar.gz
 
     if [[ -e ${xui_folder}/ ]]; then
         echo -e "${green}Stopping x-ui...${plain}"
