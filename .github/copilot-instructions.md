@@ -127,11 +127,6 @@ Both `install.sh` and `x-ui.sh` follow these patterns:
 - Port detection with `is_port_in_use()` using ss/netstat/lsof
 - Systemd service management with distro-specific unit files (`.service.debian`, `.service.arch`, `.service.rhel`)
 
-### Docker Build
-Multi-stage Dockerfile:
-1. **Builder**: CGO-enabled build, runs `DockerInit.sh` to download Xray binary
-2. **Final**: Alpine-based with fail2ban pre-configured
-
 ### Key File Locations (Production)
 - Binary: `/usr/local/x-ui/`
 - Database: `/etc/x-ui/x-ui.db`
