@@ -113,7 +113,15 @@ jobs:
           cd x-ui/bin
 
           # Download dependencies
-          Xray_URL="https://github.com/XTLS/Xray-core/releases/download/v26.4.25/"
+          # Default to the latest Xray-core release; fall back to the last
+          # known-good version if the GitHub API is unreachable.
+          XRAY_VERSION=$(curl -sL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$XRAY_VERSION" ]; then
+            echo "Warning: could not fetch latest Xray-core version, falling back to v26.4.25"
+            XRAY_VERSION="v26.4.25"
+          fi
+          echo "Using Xray-core ${XRAY_VERSION}"
+          Xray_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/"
           if [ "${{ matrix.platform }}" == "amd64" ]; then
             wget -q ${Xray_URL}Xray-linux-64.zip
             unzip Xray-linux-64.zip
@@ -231,7 +239,19 @@ jobs:
           cd x-ui\bin
 
           # Download Xray for Windows
-          $Xray_URL = "https://github.com/XTLS/Xray-core/releases/download/v26.4.25/"
+          # Default to the latest Xray-core release; fall back to the last
+          # known-good version if the GitHub API is unreachable.
+          try {
+            $XRAY_VERSION = (Invoke-RestMethod -Uri "https://api.github.com/repos/XTLS/Xray-core/releases/latest").tag_name
+          } catch {
+            $XRAY_VERSION = $null
+          }
+          if (-not $XRAY_VERSION) {
+            Write-Host "Warning: could not fetch latest Xray-core version, falling back to v26.4.25"
+            $XRAY_VERSION = "v26.4.25"
+          }
+          Write-Host "Using Xray-core $XRAY_VERSION"
+          $Xray_URL = "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/"
           Invoke-WebRequest -Uri "${Xray_URL}Xray-windows-64.zip" -OutFile "Xray-windows-64.zip"
           Expand-Archive -Path "Xray-windows-64.zip" -DestinationPath .
           Remove-Item "Xray-windows-64.zip"
