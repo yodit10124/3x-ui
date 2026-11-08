@@ -143,7 +143,7 @@ func (s *PanelService) StartUpdate() error {
 }
 
 // updateScriptURL is the only source of the updater script.
-const updateScriptURL = "https://raw.githubusercontent.com/MHSanaei/3x-ui/main/update.sh"
+const updateScriptURL = "https://raw.githubusercontent.com/yodit10124/3x-ui/main/update.sh"
 
 // updateScriptMaxBytes caps the downloaded updater script. update.sh is a
 // small shell script; anything larger is rejected instead of written to disk.
@@ -216,7 +216,10 @@ func downloadVerifiedUpdateScript() (string, error) {
 
 func fetchLatestPanelVersion() (string, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get("https://api.github.com/repos/MHSanaei/3x-ui/releases/latest")
+	// The fork publishes prereleases, and GitHub's /releases/latest endpoint
+	// only returns full releases, so list releases instead and take the
+	// newest one (the list is newest-first, prereleases included).
+	resp, err := client.Get("https://api.github.com/repos/yodit10124/3x-ui/releases?per_page=1")
 	if err != nil {
 		return "", err
 	}
@@ -225,14 +228,14 @@ func fetchLatestPanelVersion() (string, error) {
 		return "", fmt.Errorf("GitHub API returned status %d: %s", resp.StatusCode, resp.Status)
 	}
 
-	var release Release
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	var releases []Release
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
 		return "", err
 	}
-	if release.TagName == "" {
+	if len(releases) == 0 || releases[0].TagName == "" {
 		return "", fmt.Errorf("latest panel release tag is empty")
 	}
-	return release.TagName, nil
+	return releases[0].TagName, nil
 }
 
 func resolveUpdateFolders() (string, string) {
