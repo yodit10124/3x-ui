@@ -1,9 +1,6 @@
 name: "CodeQL Advanced"
 
 on:
-  push:
-    tags-ignore:
-      - "v*"
   pull_request:
   schedule:
     - cron: "18 2 * * 2"
