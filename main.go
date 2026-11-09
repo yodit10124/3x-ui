@@ -14,7 +14,6 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/config"
 	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/logger"
-	"github.com/mhsanaei/3x-ui/v2/sub"
 	"github.com/mhsanaei/3x-ui/v2/util/crypto"
 	"github.com/mhsanaei/3x-ui/v2/util/sys"
 	"github.com/mhsanaei/3x-ui/v2/web"
@@ -60,15 +59,6 @@ func runWebServer() {
 		return
 	}
 
-	var subServer *sub.Server
-	subServer = sub.NewServer()
-	global.SetSubServer(subServer)
-	err = subServer.Start()
-	if err != nil {
-		log.Fatalf("Error starting sub server: %v", err)
-		return
-	}
-
 	sigCh := make(chan os.Signal, 1)
 	// Trap shutdown signals
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGTERM, sys.SIGUSR1)
@@ -87,10 +77,6 @@ func runWebServer() {
 			if err != nil {
 				logger.Debug("Error stopping web server:", err)
 			}
-			err = subServer.Stop()
-			if err != nil {
-				logger.Debug("Error stopping sub server:", err)
-			}
 
 			server = web.NewServer()
 			global.SetWebServer(server)
@@ -100,15 +86,6 @@ func runWebServer() {
 				return
 			}
 			log.Println("Web server restarted successfully.")
-
-			subServer = sub.NewServer()
-			global.SetSubServer(subServer)
-			err = subServer.Start()
-			if err != nil {
-				log.Fatalf("Error restarting sub server: %v", err)
-				return
-			}
-			log.Println("Sub server restarted successfully.")
 		case sys.SIGUSR1:
 			logger.Info("Received USR1 signal, restarting xray-core...")
 			err := server.RestartXray()
@@ -122,7 +99,6 @@ func runWebServer() {
 			// ------------------------------------------------------------
 
 			server.Stop()
-			subServer.Stop()
 			log.Println("Shutting down servers.")
 			return
 		}
@@ -339,20 +315,6 @@ func updateCert(publicKey string, privateKey string) {
 			fmt.Println("set certificate private key failed:", err)
 		} else {
 			fmt.Println("set certificate private key success")
-		}
-
-		err = settingService.SetSubCertFile(publicKey)
-		if err != nil {
-			fmt.Println("set certificate for subscription public key failed:", err)
-		} else {
-			fmt.Println("set certificate for subscription public key success")
-		}
-
-		err = settingService.SetSubKeyFile(privateKey)
-		if err != nil {
-			fmt.Println("set certificate for subscription private key failed:", err)
-		} else {
-			fmt.Println("set certificate for subscription private key success")
 		}
 	} else {
 		fmt.Println("both public and private key should be entered.")

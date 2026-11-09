@@ -42,7 +42,7 @@ func (s *InboundService) GetInbounds(userId int) ([]*model.Inbound, error) {
 	if err != nil && err != gorm.ErrRecordNotFound {
 		return nil, err
 	}
-	// Enrich client stats with UUID/SubId from inbound settings
+	// Enrich client stats with UUID from inbound settings
 	for _, inbound := range inbounds {
 		clients, _ := s.GetClients(inbound)
 		if len(clients) == 0 || len(inbound.ClientStats) == 0 {
@@ -57,7 +57,6 @@ func (s *InboundService) GetInbounds(userId int) ([]*model.Inbound, error) {
 			email := strings.ToLower(inbound.ClientStats[i].Email)
 			if c, ok := cMap[email]; ok {
 				inbound.ClientStats[i].UUID = c.ID
-				inbound.ClientStats[i].SubId = c.SubID
 			}
 		}
 	}
@@ -73,7 +72,7 @@ func (s *InboundService) GetAllInbounds() ([]*model.Inbound, error) {
 	if err != nil && err != gorm.ErrRecordNotFound {
 		return nil, err
 	}
-	// Enrich client stats with UUID/SubId from inbound settings
+	// Enrich client stats with UUID from inbound settings
 	for _, inbound := range inbounds {
 		clients, _ := s.GetClients(inbound)
 		if len(clients) == 0 || len(inbound.ClientStats) == 0 {
@@ -87,7 +86,6 @@ func (s *InboundService) GetAllInbounds() ([]*model.Inbound, error) {
 			email := strings.ToLower(inbound.ClientStats[i].Email)
 			if c, ok := cMap[email]; ok {
 				inbound.ClientStats[i].UUID = c.ID
-				inbound.ClientStats[i].SubId = c.SubID
 			}
 		}
 	}
@@ -859,28 +857,6 @@ func (s *InboundService) getClientPrimaryKey(protocol model.Protocol, client mod
 	}
 }
 
-func (s *InboundService) writeBackClientSubID(sourceInboundID int, sourceProtocol model.Protocol, client model.Client, subID string) (bool, error) {
-	client.SubID = subID
-	client.UpdatedAt = time.Now().UnixMilli()
-	clientID := s.getClientPrimaryKey(sourceProtocol, client)
-	if clientID == "" {
-		return false, common.NewError("empty client ID")
-	}
-
-	settingsBytes, err := json.Marshal(map[string][]model.Client{
-		"clients": {client},
-	})
-	if err != nil {
-		return false, err
-	}
-
-	updatePayload := &model.Inbound{
-		Id:       sourceInboundID,
-		Settings: string(settingsBytes),
-	}
-	return s.UpdateInboundClient(updatePayload, clientID)
-}
-
 func (s *InboundService) generateRandomCredential(targetProtocol model.Protocol) string {
 	switch targetProtocol {
 	case model.VMESS, model.VLESS:
@@ -992,19 +968,6 @@ func (s *InboundService) CopyInboundClients(targetInboundID int, sourceInboundID
 			if _, ok := allowedEmails[strings.ToLower(originalEmail)]; !ok {
 				continue
 			}
-		}
-
-		if sourceClient.SubID == "" {
-			newSubID := uuid.NewString()
-			subNeedRestart, subErr := s.writeBackClientSubID(sourceInbound.Id, sourceInbound.Protocol, sourceClient, newSubID)
-			if subErr != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("%s: failed to write source subId: %v", originalEmail, subErr))
-				continue
-			}
-			if subNeedRestart {
-				needRestart = true
-			}
-			sourceClient.SubID = newSubID
 		}
 
 		targetEmail := s.nextAvailableCopiedEmail(originalEmail, targetInboundID, occupiedEmails)
@@ -2509,7 +2472,6 @@ func (s *InboundService) GetClientTrafficTgBot(tgId int64) ([]*xray.ClientTraffi
 		if ct, client, e := s.GetClientByEmail(traffics[i].Email); e == nil && ct != nil && client != nil {
 			traffics[i].Enable = client.Enable
 			traffics[i].UUID = client.ID
-			traffics[i].SubId = client.SubID
 		}
 	}
 
@@ -2652,7 +2614,6 @@ func (s *InboundService) GetClientTrafficByEmail(email string) (traffic *xray.Cl
 	}
 	if t != nil && client != nil {
 		t.UUID = client.ID
-		t.SubId = client.SubID
 		return t, nil
 	}
 	return nil, nil
@@ -2702,7 +2663,6 @@ func (s *InboundService) GetClientTrafficByID(id string) ([]xray.ClientTraffic, 
 		if ct, client, e := s.GetClientByEmail(traffics[i].Email); e == nil && ct != nil && client != nil {
 			traffics[i].Enable = client.Enable
 			traffics[i].UUID = client.ID
-			traffics[i].SubId = client.SubID
 		}
 	}
 	return traffics, err

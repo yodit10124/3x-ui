@@ -26,36 +26,9 @@ class AllSetting {
         this.twoFactorEnable = false;
         this.twoFactorToken = "";
         this.xrayTemplateConfig = "";
-        this.subEnable = false;
-        this.subJsonEnable = false;
-        this.subTitle = "";
-        this.subSupportUrl = "";
-        this.subProfileUrl = "";
-        this.subAnnounce = "";
-        this.subEnableRouting = true;
-        this.subRoutingRules = "";
-        this.subListen = "";
-        this.subPort = 2096;
-        this.subPath = "/sub/";
-        this.subJsonPath = "/json/";
-        this.subClashEnable = true;
-        this.subClashPath = "/clash/";
-        this.subDomain = "";
         this.externalTrafficInformEnable = false;
         this.externalTrafficInformURI = "";
         this.restartXrayOnClientDisable = true;
-        this.subCertFile = "";
-        this.subKeyFile = "";
-        this.subUpdates = 12;
-        this.subEncrypt = true;
-        this.subShowInfo = true;
-        this.subURI = "";
-        this.subJsonURI = "";
-        this.subClashURI = "";
-        this.subJsonFragment = "";
-        this.subJsonNoises = "";
-        this.subJsonMux = "";
-        this.subJsonRules = "";
 
         this.timeLocation = "Local";
 

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"reflect"
 	"strconv"
 	"strings"
@@ -26,65 +25,34 @@ var xrayTemplateConfig string
 
 var defaultValueMap = map[string]string{
 	"xrayTemplateConfig": xrayTemplateConfig,
-	// H4/M6: fresh installs bind the panel and the subscription server to
-	// loopback only by default. An operator can still change this in the
-	// settings; existing databases keep their stored value.
-	"webListen":        "127.0.0.1",
-	"webDomain":        "",
-	"webPort":          "2053",
-	"webCertFile":      "",
-	"webKeyFile":       "",
-	"secret":           random.Seq(32),
-	"webBasePath":      "/",
-	"sessionMaxAge":    "360",
-	"pageSize":         "25",
-	"expireDiff":       "0",
-	"trafficDiff":      "0",
-	"remarkModel":      "-ieo",
-	"timeLocation":     "Local",
-	"tgBotEnable":      "false",
-	"tgBotToken":       "",
-	"tgBotProxy":       "",
-	"tgBotAPIServer":   "",
-	"tgBotChatId":      "",
-	"tgRunTime":        "@daily",
-	"tgBotBackup":      "false",
-	"tgBotLoginNotify": "true",
-	"tgCpu":            "80",
-	"tgLang":           "en-US",
-	"twoFactorEnable":  "false",
-	"twoFactorToken":   "",
-	// Subscription is OFF by default on fresh installs (changed 2026-11-08):
-	// the subscription server is unauthenticated, so it must not start
-	// unless the operator explicitly enables it in the settings.
-	// Existing databases keep their stored value.
-	"subEnable":                   "false",
-	"subJsonEnable":               "false",
-	"subTitle":                    "",
-	"subSupportUrl":               "",
-	"subProfileUrl":               "",
-	"subAnnounce":                 "",
-	"subEnableRouting":            "true",
-	"subRoutingRules":             "",
-	"subListen":                   "127.0.0.1",
-	"subPort":                     "2096",
-	"subPath":                     "/sub/",
-	"subDomain":                   "",
-	"subCertFile":                 "",
-	"subKeyFile":                  "",
-	"subUpdates":                  "12",
-	"subEncrypt":                  "true",
-	"subShowInfo":                 "true",
-	"subURI":                      "",
-	"subJsonPath":                 "/json/",
-	"subJsonURI":                  "",
-	"subClashEnable":              "true",
-	"subClashPath":                "/clash/",
-	"subClashURI":                 "",
-	"subJsonFragment":             "",
-	"subJsonNoises":               "",
-	"subJsonMux":                  "",
-	"subJsonRules":                "",
+	// H4/M6: fresh installs bind the panel to loopback only by default.
+	// An operator can still change this in the settings; existing
+	// databases keep their stored value.
+	"webListen":                   "127.0.0.1",
+	"webDomain":                   "",
+	"webPort":                     "2053",
+	"webCertFile":                 "",
+	"webKeyFile":                  "",
+	"secret":                      random.Seq(32),
+	"webBasePath":                 "/",
+	"sessionMaxAge":               "360",
+	"pageSize":                    "25",
+	"expireDiff":                  "0",
+	"trafficDiff":                 "0",
+	"remarkModel":                 "-ieo",
+	"timeLocation":                "Local",
+	"tgBotEnable":                 "false",
+	"tgBotToken":                  "",
+	"tgBotProxy":                  "",
+	"tgBotAPIServer":              "",
+	"tgBotChatId":                 "",
+	"tgRunTime":                   "@daily",
+	"tgBotBackup":                 "false",
+	"tgBotLoginNotify":            "true",
+	"tgCpu":                       "80",
+	"tgLang":                      "en-US",
+	"twoFactorEnable":             "false",
+	"twoFactorToken":              "",
 	"datepicker":                  "gregorian",
 	"warp":                        "",
 	"nord":                        "",
@@ -505,124 +473,8 @@ func (s *SettingService) GetTimeLocation() (*time.Location, error) {
 	return location, nil
 }
 
-func (s *SettingService) GetSubEnable() (bool, error) {
-	return s.getBool("subEnable")
-}
-
-func (s *SettingService) GetSubJsonEnable() (bool, error) {
-	return s.getBool("subJsonEnable")
-}
-
-func (s *SettingService) GetSubTitle() (string, error) {
-	return s.getString("subTitle")
-}
-
-func (s *SettingService) GetSubSupportUrl() (string, error) {
-	return s.getString("subSupportUrl")
-}
-
-func (s *SettingService) GetSubProfileUrl() (string, error) {
-	return s.getString("subProfileUrl")
-}
-
-func (s *SettingService) GetSubAnnounce() (string, error) {
-	return s.getString("subAnnounce")
-}
-
-func (s *SettingService) GetSubEnableRouting() (bool, error) {
-	return s.getBool("subEnableRouting")
-}
-
-func (s *SettingService) GetSubRoutingRules() (string, error) {
-	return s.getString("subRoutingRules")
-}
-
-func (s *SettingService) GetSubListen() (string, error) {
-	return s.getString("subListen")
-}
-
-func (s *SettingService) GetSubPort() (int, error) {
-	return s.getInt("subPort")
-}
-
-func (s *SettingService) GetSubPath() (string, error) {
-	return s.getString("subPath")
-}
-
-func (s *SettingService) GetSubJsonPath() (string, error) {
-	return s.getString("subJsonPath")
-}
-
-func (s *SettingService) GetSubDomain() (string, error) {
-	return s.getString("subDomain")
-}
-
-func (s *SettingService) SetSubCertFile(subCertFile string) error {
-	return s.setString("subCertFile", subCertFile)
-}
-
-func (s *SettingService) GetSubCertFile() (string, error) {
-	return s.getString("subCertFile")
-}
-
-func (s *SettingService) SetSubKeyFile(subKeyFile string) error {
-	return s.setString("subKeyFile", subKeyFile)
-}
-
-func (s *SettingService) GetSubKeyFile() (string, error) {
-	return s.getString("subKeyFile")
-}
-
-func (s *SettingService) GetSubUpdates() (string, error) {
-	return s.getString("subUpdates")
-}
-
-func (s *SettingService) GetSubEncrypt() (bool, error) {
-	return s.getBool("subEncrypt")
-}
-
-func (s *SettingService) GetSubShowInfo() (bool, error) {
-	return s.getBool("subShowInfo")
-}
-
 func (s *SettingService) GetPageSize() (int, error) {
 	return s.getInt("pageSize")
-}
-
-func (s *SettingService) GetSubURI() (string, error) {
-	return s.getString("subURI")
-}
-
-func (s *SettingService) GetSubJsonURI() (string, error) {
-	return s.getString("subJsonURI")
-}
-
-func (s *SettingService) GetSubClashEnable() (bool, error) {
-	return s.getBool("subClashEnable")
-}
-
-func (s *SettingService) GetSubClashPath() (string, error) {
-	return s.getString("subClashPath")
-}
-
-func (s *SettingService) GetSubClashURI() (string, error) {
-	return s.getString("subClashURI")
-}
-
-func (s *SettingService) GetSubJsonFragment() (string, error) {
-	return s.getString("subJsonFragment")
-}
-
-func (s *SettingService) GetSubJsonNoises() (string, error) {
-	return s.getString("subJsonNoises")
-}
-
-func (s *SettingService) GetSubJsonMux() (string, error) {
-	return s.getString("subJsonMux")
-}
-
-func (s *SettingService) GetSubJsonRules() (string, error) {
-	return s.getString("subJsonRules")
 }
 
 func (s *SettingService) GetDatepicker() (string, error) {
@@ -793,47 +645,18 @@ func (s *SettingService) GetDefaultXrayConfig() (any, error) {
 	return jsonData, nil
 }
 
-func extractHostname(host string) string {
-	h, _, err := net.SplitHostPort(host)
-	// Err is not nil means host does not contain port
-	if err != nil {
-		h = host
-	}
-
-	ip := net.ParseIP(h)
-	// If it's not an IP, return as is
-	if ip == nil {
-		return h
-	}
-
-	// If it's an IPv4, return as is
-	if ip.To4() != nil {
-		return h
-	}
-
-	// IPv6 needs bracketing
-	return "[" + h + "]"
-}
-
 func (s *SettingService) GetDefaultSettings(host string) (any, error) {
 	type settingFunc func() (any, error)
 	settings := map[string]settingFunc{
-		"expireDiff":     func() (any, error) { return s.GetExpireDiff() },
-		"trafficDiff":    func() (any, error) { return s.GetTrafficDiff() },
-		"pageSize":       func() (any, error) { return s.GetPageSize() },
-		"defaultCert":    func() (any, error) { return s.GetCertFile() },
-		"defaultKey":     func() (any, error) { return s.GetKeyFile() },
-		"tgBotEnable":    func() (any, error) { return s.GetTgbotEnabled() },
-		"subEnable":      func() (any, error) { return s.GetSubEnable() },
-		"subJsonEnable":  func() (any, error) { return s.GetSubJsonEnable() },
-		"subClashEnable": func() (any, error) { return s.GetSubClashEnable() },
-		"subTitle":       func() (any, error) { return s.GetSubTitle() },
-		"subURI":         func() (any, error) { return s.GetSubURI() },
-		"subJsonURI":     func() (any, error) { return s.GetSubJsonURI() },
-		"subClashURI":    func() (any, error) { return s.GetSubClashURI() },
-		"remarkModel":    func() (any, error) { return s.GetRemarkModel() },
-		"datepicker":     func() (any, error) { return s.GetDatepicker() },
-		"ipLimitEnable":  func() (any, error) { return s.GetIpLimitEnable() },
+		"expireDiff":    func() (any, error) { return s.GetExpireDiff() },
+		"trafficDiff":   func() (any, error) { return s.GetTrafficDiff() },
+		"pageSize":      func() (any, error) { return s.GetPageSize() },
+		"defaultCert":   func() (any, error) { return s.GetCertFile() },
+		"defaultKey":    func() (any, error) { return s.GetKeyFile() },
+		"tgBotEnable":   func() (any, error) { return s.GetTgbotEnabled() },
+		"remarkModel":   func() (any, error) { return s.GetRemarkModel() },
+		"datepicker":    func() (any, error) { return s.GetDatepicker() },
+		"ipLimitEnable": func() (any, error) { return s.GetIpLimitEnable() },
 	}
 
 	result := make(map[string]any)
@@ -844,60 +667,6 @@ func (s *SettingService) GetDefaultSettings(host string) (any, error) {
 			return "", err
 		}
 		result[key] = value
-	}
-
-	subEnable := result["subEnable"].(bool)
-	subJsonEnable := false
-	if v, ok := result["subJsonEnable"]; ok {
-		if b, ok2 := v.(bool); ok2 {
-			subJsonEnable = b
-		}
-	}
-	subClashEnable := false
-	if v, ok := result["subClashEnable"]; ok {
-		if b, ok2 := v.(bool); ok2 {
-			subClashEnable = b
-		}
-	}
-	if (subEnable && result["subURI"].(string) == "") || (subJsonEnable && result["subJsonURI"].(string) == "") || (subClashEnable && result["subClashURI"].(string) == "") {
-		subURI := ""
-		subTitle, _ := s.GetSubTitle()
-		subPort, _ := s.GetSubPort()
-		subPath, _ := s.GetSubPath()
-		subJsonPath, _ := s.GetSubJsonPath()
-		subClashPath, _ := s.GetSubClashPath()
-		subDomain, _ := s.GetSubDomain()
-		subKeyFile, _ := s.GetSubKeyFile()
-		subCertFile, _ := s.GetSubCertFile()
-		subTLS := false
-		if subKeyFile != "" && subCertFile != "" {
-			subTLS = true
-		}
-		if subDomain == "" {
-			subDomain = extractHostname(host)
-		}
-		if subTLS {
-			subURI = "https://"
-		} else {
-			subURI = "http://"
-		}
-		if (subPort == 443 && subTLS) || (subPort == 80 && !subTLS) {
-			subURI += subDomain
-		} else {
-			subURI += fmt.Sprintf("%s:%d", subDomain, subPort)
-		}
-		if subEnable && result["subURI"].(string) == "" {
-			result["subURI"] = subURI + subPath
-		}
-		if result["subTitle"].(string) == "" {
-			result["subTitle"] = subTitle
-		}
-		if subJsonEnable && result["subJsonURI"].(string) == "" {
-			result["subJsonURI"] = subURI + subJsonPath
-		}
-		if subClashEnable && result["subClashURI"].(string) == "" {
-			result["subClashURI"] = subURI + subClashPath
-		}
 	}
 
 	return result, nil
