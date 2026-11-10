@@ -1097,6 +1097,14 @@ update_x-ui() {
 
     config_after_update
 
+    # config_after_update runs the panel binary (x-ui setting/migrate/cert),
+    # which creates /etc/x-ui/x-ui.db when it does not exist yet. When the
+    # updater runs as root that database is created root-owned, and the
+    # panel (which runs as x-ui) then cannot write to it ("attempt to write
+    # a readonly database"), so fix the ownership and restart the panel.
+    sudo chown -R "${XUI_USER}:${XUI_USER}" "${xui_folder}" /etc/x-ui /var/log/x-ui
+    sudo systemctl restart x-ui > /dev/null 2>&1 || sudo rc-service x-ui restart > /dev/null 2>&1
+
     echo -e "${green}x-ui ${tag_version}${plain} updating finished, it is running now..."
     echo -e ""
     echo -e "┌───────────────────────────────────────────────────────┐

@@ -980,6 +980,14 @@ install_x-ui() {
     sudo chmod +x /usr/bin/x-ui
     config_after_install
 
+    # config_after_install runs the panel binary (x-ui setting/cert), which
+    # creates /etc/x-ui/x-ui.db when it does not exist yet. When the
+    # installer runs as root that database is created root-owned, and the
+    # panel (which runs as x-ui) then cannot write to it -- it fails with
+    # "attempt to write a readonly database" and Xray cannot start. Fix
+    # the ownership again here, before the service starts.
+    sudo chown -R "${XUI_USER}:${XUI_USER}" "${xui_folder}" /etc/x-ui /var/log/x-ui
+
     # Etckeeper compatibility
     if [ -d "/etc/.git" ]; then
         if [ -f "/etc/.gitignore" ]; then
