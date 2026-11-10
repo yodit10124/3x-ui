@@ -553,20 +553,25 @@ prompt_and_setup_ssl() {
     echo -e "${green}1.${plain} Let's Encrypt for Domain (90-day validity, auto-renews)"
     echo -e "${green}2.${plain} Let's Encrypt for IP Address (6-day validity, auto-renews)"
     echo -e "${green}3.${plain} Custom SSL Certificate (Path to existing files)"
+    echo -e "${green}4.${plain} Skip SSL setup (use HTTP, no certificate)"
     echo -e "${blue}Note:${plain} Options 1 & 2 require port 80 open. Option 3 requires manual paths."
-    read -rp "Choose an option (default 2 for IP): " ssl_choice
+    read -rp "Choose an option (default 4 to skip): " ssl_choice
     ssl_choice="${ssl_choice// /}" # Trim whitespace
 
-    # Default to 2 (IP cert) if input is empty or invalid (not 1 or 3)
-    if [[ "$ssl_choice" != "1" && "$ssl_choice" != "3" ]]; then
-        ssl_choice="2"
+    # Default to 4 (skip) if input is empty or invalid; SSL is optional, never forced
+    if [[ "$ssl_choice" != "1" && "$ssl_choice" != "2" && "$ssl_choice" != "3" ]]; then
+        ssl_choice="4"
     fi
+
+    # 1 = certificate configured, 0 = skipped or failed; callers use it for the access URL
+    SSL_CONFIGURED=0
 
     case "$ssl_choice" in
         1)
             # User chose Let's Encrypt domain option
             echo -e "${green}Using Let's Encrypt for domain certificate...${plain}"
             if ssl_cert_issue; then
+                SSL_CONFIGURED=1
                 local cert_domain="${SSL_ISSUED_DOMAIN}"
                 if [[ -z "${cert_domain}" ]]; then
                     cert_domain=$(~/.acme.sh/acme.sh --list 2> /dev/null | tail -1 | awk '{print $1}')
@@ -602,6 +607,7 @@ prompt_and_setup_ssl() {
 
             setup_ip_certificate "${server_ip}" "${ipv6_addr}"
             if [ $? -eq 0 ]; then
+                SSL_CONFIGURED=1
                 SSL_HOST="${server_ip}"
                 echo -e "${green}✓ Let's Encrypt IP certificate configured successfully${plain}"
             else
@@ -656,6 +662,7 @@ prompt_and_setup_ssl() {
 
             # 3.4 Apply Settings via x-ui binary
             ${xui_folder}/x-ui cert -webCert "$custom_cert" -webCertKey "$custom_key" > /dev/null 2>&1
+            SSL_CONFIGURED=1
 
             # Set SSL_HOST for composing Panel URL
             if [[ -n "$custom_domain" ]]; then
@@ -668,6 +675,10 @@ prompt_and_setup_ssl() {
             echo -e "${yellow}Note: You are responsible for renewing these files externally.${plain}"
 
             systemctl restart x-ui > /dev/null 2>&1 || rc-service x-ui restart > /dev/null 2>&1
+            ;;
+        4)
+            echo -e "${yellow}Skipping SSL setup. Panel will use HTTP.${plain}"
+            SSL_HOST="${server_ip}"
             ;;
         *)
             echo -e "${red}Invalid option. Skipping SSL setup.${plain}"
@@ -748,7 +759,12 @@ config_after_install() {
                 echo -e "${yellow}Let's Encrypt now supports both domains and IP addresses!${plain}"
                 echo ""
                 prompt_and_setup_ssl "${existing_port}" "${config_webBasePath}" "${server_ip}"
-                echo -e "${green}Access URL:  https://${SSL_HOST}:${existing_port}/${config_webBasePath}${plain}"
+                if [[ "${SSL_CONFIGURED}" == "1" ]]; then
+                    echo -e "${green}Access URL:  https://${SSL_HOST}:${existing_port}/${config_webBasePath}${plain}"
+                else
+                    echo -e "${green}Access URL:  http://${server_ip}:${existing_port}/${config_webBasePath}${plain}"
+                    echo -e "${yellow}⚠ SSL Certificate: Not configured (panel uses HTTP)${plain}"
+                fi
             else
                 # If a cert already exists, just show the access URL
                 echo -e "${green}Access URL: https://${server_ip}:${existing_port}/${config_webBasePath}${plain}"
@@ -781,7 +797,12 @@ config_after_install() {
             echo -e "${yellow}Let's Encrypt now supports both domains and IP addresses!${plain}"
             echo ""
             prompt_and_setup_ssl "${existing_port}" "${existing_webBasePath}" "${server_ip}"
-            echo -e "${green}Access URL:  https://${SSL_HOST}:${existing_port}/${existing_webBasePath}${plain}"
+            if [[ "${SSL_CONFIGURED}" == "1" ]]; then
+                echo -e "${green}Access URL:  https://${SSL_HOST}:${existing_port}/${existing_webBasePath}${plain}"
+            else
+                echo -e "${green}Access URL:  http://${server_ip}:${existing_port}/${existing_webBasePath}${plain}"
+                echo -e "${yellow}⚠ SSL Certificate: Not configured (panel uses HTTP)${plain}"
+            fi
         else
             echo -e "${green}SSL certificate already configured. No action needed.${plain}"
         fi
