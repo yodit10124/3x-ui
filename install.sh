@@ -540,6 +540,88 @@ ssl_cert_issue() {
     return 0
 }
 
+# Detect local IP addresses (no external service needed, uses `ip a`)
+# Prints one IP per line.
+get_local_ipv4() {
+    if command -v ip &> /dev/null; then
+        ip -4 addr show scope global 2>/dev/null | awk '/inet / {split($2, a, "/"); print a[1]}' | grep -v '^127\.' | sort -u
+    else
+        hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -v '^127\.' | sort -u
+    fi
+}
+
+get_local_ipv6() {
+    if command -v ip &> /dev/null; then
+        ip -6 addr show scope global 2>/dev/null | awk '/inet6 / {split($2, a, "/"); print a[1]}' | sort -u
+    else
+        hostname -I 2>/dev/null | tr ' ' '\n' | grep ':' | grep -v '^fe80' | grep -v '^::1$' | sort -u
+    fi
+}
+
+# Generate a self-signed certificate (CN=8620) covering local IPs and configure the panel.
+# $1 = which IPs to include: "4" (IPv4 only), "6" (IPv6 only), "both"
+# $2 = server IP (fallback for SSL_HOST)
+# Sets SSL_CONFIGURED=1 on success, 0 on failure. Sets SSL_HOST to the first IP signed.
+setup_self_signed_certificate() {
+    local sign_mode="$1"
+    local server_ip="$2"
+
+    if ! command -v openssl &> /dev/null; then
+        echo -e "${red}openssl not found, cannot generate a self-signed certificate.${plain}"
+        SSL_CONFIGURED=0
+        SSL_HOST="${server_ip}"
+        return 1
+    fi
+
+    local ipv4_list=""
+    local ipv6_list=""
+    if [[ "$sign_mode" == "4" || "$sign_mode" == "both" ]]; then
+        ipv4_list=$(get_local_ipv4)
+    fi
+    if [[ "$sign_mode" == "6" || "$sign_mode" == "both" ]]; then
+        ipv6_list=$(get_local_ipv6)
+    fi
+
+    if [[ -z "$ipv4_list" && -z "$ipv6_list" ]]; then
+        echo -e "${red}No local IP address found to sign. Skipping self-signed certificate.${plain}"
+        SSL_CONFIGURED=0
+        SSL_HOST="${server_ip}"
+        return 1
+    fi
+
+    local san_list=""
+    local first_ip=""
+    local ip
+    for ip in $ipv4_list $ipv6_list; do
+        san_list="${san_list}IP:${ip},"
+        [[ -z "$first_ip" ]] && first_ip="$ip"
+    done
+    san_list="${san_list%,}"
+
+    local cert_dir="/root/cert"
+    mkdir -p "$cert_dir"
+    echo -e "${green}Generating self-signed certificate (CN=8620, SAN: ${san_list})...${plain}"
+    if ! openssl req -x509 -newkey rsa:2048 \
+        -keyout "$cert_dir/privkey.pem" \
+        -out "$cert_dir/fullchain.pem" \
+        -days 3650 -nodes -subj "/CN=8620" \
+        -addext "subjectAltName=${san_list}" > /dev/null 2>&1; then
+        echo -e "${red}Failed to generate self-signed certificate.${plain}"
+        SSL_CONFIGURED=0
+        SSL_HOST="${server_ip}"
+        return 1
+    fi
+    chmod 600 "$cert_dir/privkey.pem" 2> /dev/null
+    chmod 644 "$cert_dir/fullchain.pem" 2> /dev/null
+
+    ${xui_folder}/x-ui cert -webCert "$cert_dir/fullchain.pem" -webCertKey "$cert_dir/privkey.pem" > /dev/null 2>&1
+    SSL_CONFIGURED=1
+    SSL_HOST="${first_ip:-$server_ip}"
+    echo -e "${green}✓ Self-signed certificate configured (CN=8620, valid 10 years).${plain}"
+    echo -e "${yellow}Note: browsers will show a warning because the certificate is self-signed; proceed anyway.${plain}"
+    return 0
+}
+
 # Reusable interactive SSL setup (domain or IP)
 # Sets global `SSL_HOST` to the chosen domain/IP for Access URL usage
 prompt_and_setup_ssl() {
@@ -550,17 +632,18 @@ prompt_and_setup_ssl() {
     local ssl_choice=""
 
     echo -e "${yellow}Choose SSL certificate setup method:${plain}"
-    echo -e "${green}1.${plain} Let's Encrypt for Domain (90-day validity, auto-renews)"
-    echo -e "${green}2.${plain} Let's Encrypt for IP Address (6-day validity, auto-renews)"
-    echo -e "${green}3.${plain} Custom SSL Certificate (Path to existing files)"
-    echo -e "${green}4.${plain} Skip SSL setup (use HTTP, no certificate)"
-    echo -e "${blue}Note:${plain} Options 1 & 2 require port 80 open. Option 3 requires manual paths."
-    read -rp "Choose an option (default 4 to skip): " ssl_choice
+    echo -e "${green}1.${plain} Self-signed certificate (CN=8620, default)"
+    echo -e "${green}2.${plain} Let's Encrypt for Domain (90-day validity, auto-renews)"
+    echo -e "${green}3.${plain} Let's Encrypt for IP Address (6-day validity, auto-renews)"
+    echo -e "${green}4.${plain} Custom SSL Certificate (Path to existing files)"
+    echo -e "${green}5.${plain} Skip SSL setup (use HTTP, no certificate)"
+    echo -e "${blue}Note:${plain} Options 2 & 3 require port 80 open. Option 4 requires manual paths."
+    read -rp "Choose an option (default 1 for self-signed): " ssl_choice
     ssl_choice="${ssl_choice// /}" # Trim whitespace
 
-    # Default to 4 (skip) if input is empty or invalid; SSL is optional, never forced
-    if [[ "$ssl_choice" != "1" && "$ssl_choice" != "2" && "$ssl_choice" != "3" ]]; then
-        ssl_choice="4"
+    # Default to 1 (self-signed) if input is empty or invalid
+    if [[ "$ssl_choice" != "2" && "$ssl_choice" != "3" && "$ssl_choice" != "4" && "$ssl_choice" != "5" ]]; then
+        ssl_choice="1"
     fi
 
     # 1 = certificate configured, 0 = skipped or failed; callers use it for the access URL
@@ -568,6 +651,26 @@ prompt_and_setup_ssl() {
 
     case "$ssl_choice" in
         1)
+            # Self-signed certificate (default): CN=8620, sign local IPs
+            echo -e "${green}Using self-signed certificate (CN=8620)...${plain}"
+            local ipv4_list=$(get_local_ipv4)
+            local ipv6_list=$(get_local_ipv6)
+            echo -e "${yellow}Detected local IPs — IPv4: ${ipv4_list:-none}, IPv6: ${ipv6_list:-none}${plain}"
+            echo -e "${green}1.${plain} Sign IPv4 only"
+            echo -e "${green}2.${plain} Sign IPv6 only"
+            echo -e "${green}3.${plain} Sign both IPv4 and IPv6"
+            local ip_choice=""
+            read -rp "Choose an option (default 3 for both): " ip_choice
+            ip_choice="${ip_choice// /}"
+            local sign_mode="both"
+            case "$ip_choice" in
+                1) sign_mode="4" ;;
+                2) sign_mode="6" ;;
+                *) sign_mode="both" ;;
+            esac
+            setup_self_signed_certificate "$sign_mode" "${server_ip}"
+            ;;
+        2)
             # User chose Let's Encrypt domain option
             echo -e "${green}Using Let's Encrypt for domain certificate...${plain}"
             if ssl_cert_issue; then
@@ -589,7 +692,7 @@ prompt_and_setup_ssl() {
                 SSL_HOST="${server_ip}"
             fi
             ;;
-        2)
+        3)
             # User chose Let's Encrypt IP certificate option
             echo -e "${green}Using Let's Encrypt for IP certificate (shortlived profile)...${plain}"
 
@@ -615,7 +718,7 @@ prompt_and_setup_ssl() {
                 SSL_HOST="${server_ip}"
             fi
             ;;
-        3)
+        4)
             # User chose Custom Paths (User Provided) option
             echo -e "${green}Using custom existing certificate...${plain}"
             local custom_cert=""
@@ -676,7 +779,7 @@ prompt_and_setup_ssl() {
 
             systemctl restart x-ui > /dev/null 2>&1 || rc-service x-ui restart > /dev/null 2>&1
             ;;
-        4)
+        5)
             echo -e "${yellow}Skipping SSL setup. Panel will use HTTP.${plain}"
             SSL_HOST="${server_ip}"
             ;;
@@ -693,24 +796,40 @@ config_after_install() {
     local existing_port=$(${xui_folder}/x-ui setting -show true | grep -Eo 'port: .+' | awk '{print $2}')
     # Properly detect empty cert by checking if cert: line exists and has content after it
     local existing_cert=$(${xui_folder}/x-ui setting -getCert true | grep 'cert:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
-    local URL_lists=(
-        "https://api4.ipify.org"
-        "https://ipv4.icanhazip.com"
-        "https://v4.api.ipinfo.io/ip"
-        "https://ipv4.myexternalip.com/raw"
-        "https://4.ident.me"
-        "https://check-host.net/ip"
-    )
+    # Prefer local detection (`ip a`); fall back to external services.
+    # Use a public IPv4 when one is attached; otherwise take the first local IPv4.
     local server_ip=""
-    for ip_address in "${URL_lists[@]}"; do
-        local response=$(curl -s -w "\n%{http_code}" --max-time 3 "${ip_address}" 2> /dev/null)
-        local http_code=$(echo "$response" | tail -n1)
-        local ip_result=$(echo "$response" | head -n-1 | tr -d '[:space:]')
-        if [[ "${http_code}" == "200" && -n "${ip_result}" ]]; then
-            server_ip="${ip_result}"
-            break
-        fi
+    local local_ipv4_list=$(get_local_ipv4 2>/dev/null)
+    local candidate_ip=""
+    for candidate_ip in $local_ipv4_list; do
+        case "$candidate_ip" in
+            10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|192.168.*|127.*|169.254.*) ;;
+            *) server_ip="$candidate_ip"; break ;;
+        esac
     done
+    if [[ -z "$server_ip" ]]; then
+        local URL_lists=(
+            "https://api4.ipify.org"
+            "https://ipv4.icanhazip.com"
+            "https://v4.api.ipinfo.io/ip"
+            "https://ipv4.myexternalip.com/raw"
+            "https://4.ident.me"
+            "https://check-host.net/ip"
+        )
+        for ip_address in "${URL_lists[@]}"; do
+            local response=$(curl -s -w "\n%{http_code}" --max-time 3 "${ip_address}" 2> /dev/null)
+            local http_code=$(echo "$response" | tail -n1)
+            local ip_result=$(echo "$response" | head -n-1 | tr -d '[:space:]')
+            if [[ "${http_code}" == "200" && -n "${ip_result}" ]]; then
+                server_ip="${ip_result}"
+                break
+            fi
+        done
+    fi
+    if [[ -z "$server_ip" ]]; then
+        # Last resort: first local IPv4 even if private
+        server_ip=$(echo "$local_ipv4_list" | head -n1)
+    fi
 
     if [[ ${#existing_webBasePath} -lt 4 ]]; then
         if [[ "$existing_hasDefaultCredential" == "true" ]]; then
