@@ -367,7 +367,7 @@ func (s *CustomGeoService) downloadToPathOnce(resourceURL, destPath string, last
 	}
 
 	client := &http.Client{Timeout: 10 * time.Minute, Transport: ssrfSafeTransport()}
-	// lgtm[go/request-forgery]
+	// codeql[go/request-forgery]
 	resp, err := client.Do(req)
 	if err != nil {
 		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
