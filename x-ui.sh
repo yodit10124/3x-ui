@@ -174,7 +174,7 @@ legacy_version() {
     fi
 
     echo "Downloading and installing panel version $tag_version..."
-    bash <(curl -Ls "https://raw.githubusercontent.com/mhsanaei/3x-ui/v$tag_version/install.sh") v$tag_version
+    bash <(curl -Ls "https://raw.githubusercontent.com/yodit10124/3x-ui/v$tag_version/install.sh") v$tag_version
 }
 
 # Function to handle the deletion of the script file
@@ -210,7 +210,7 @@ uninstall() {
     echo ""
     echo -e "Uninstalled Successfully.\n"
     echo "If you need to install this panel again, you can use below command:"
-    echo -e "${green}bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)${plain}"
+    echo -e "${green}bash <(curl -Ls https://raw.githubusercontent.com/yodit10124/3x-ui/main/install.sh)${plain}"
     echo ""
     # Trap the SIGTERM signal
     trap delete_script SIGTERM
