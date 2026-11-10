@@ -25,10 +25,10 @@ var xrayTemplateConfig string
 
 var defaultValueMap = map[string]string{
 	"xrayTemplateConfig": xrayTemplateConfig,
-	// H4/M6: fresh installs bind the panel to loopback only by default.
+	// Fresh installs bind the panel to all interfaces by default.
 	// An operator can still change this in the settings; existing
 	// databases keep their stored value.
-	"webListen":                   "127.0.0.1",
+	"webListen":                   "0.0.0.0",
 	"webDomain":                   "",
 	"webPort":                     "2053",
 	"webCertFile":                 "",
