@@ -844,19 +844,6 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 	return needRestart, tx.Save(oldInbound).Error
 }
 
-func (s *InboundService) getClientPrimaryKey(protocol model.Protocol, client model.Client) string {
-	switch protocol {
-	case model.Trojan:
-		return client.Password
-	case model.Shadowsocks:
-		return client.Email
-	case model.Hysteria:
-		return client.Auth
-	default:
-		return client.ID
-	}
-}
-
 func (s *InboundService) generateRandomCredential(targetProtocol model.Protocol) string {
 	switch targetProtocol {
 	case model.VMESS, model.VLESS:
