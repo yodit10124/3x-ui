@@ -51,28 +51,56 @@ is_domain() {
 }
 
 
-# The x-ui CLI runs as the dedicated unprivileged user "x-ui", never as
-# root: the panel and Xray run as x-ui, and root is only used through sudo
-# for the privileged steps (service control, package install, /etc, /usr/bin).
+# The x-ui CLI manages a panel that runs as the dedicated unprivileged
+# user "x-ui", and running the CLI as that user is recommended. Running
+# it as root is also allowed, but only with the warning below; any other
+# user is refused. Root is used only through sudo for the privileged
+# steps (service control, package install, /etc, /usr/bin) -- as root the
+# sudo calls are no-ops, as x-ui they escalate.
 XUI_USER="x-ui"
 if [[ $EUID -eq 0 ]]; then
-    LOGE "Refusing to run as root. Use the dedicated user instead:"
-    LOGE "  sudo useradd -m -s /bin/bash ${XUI_USER}"
-    LOGE "  sudo usermod -aG sudo ${XUI_USER}   # ${XUI_USER} needs sudo for apt/systemctl"
-    LOGE "  sudo -u ${XUI_USER} x-ui"
-    exit 1
-fi
-if [[ "$(id -un)" != "${XUI_USER}" ]]; then
-    LOGE "This script must be run as user '${XUI_USER}', not '$(id -un)'."
-    LOGE "Create the user first (as root): sudo useradd -m -s /bin/bash ${XUI_USER}; sudo usermod -aG sudo ${XUI_USER}"
+    echo -e "${red}WARNING: You are running x-ui as root. It is recommended to run it as the dedicated unprivileged user '${XUI_USER}' instead:${plain}"
+    echo -e "  sudo useradd -m -s /bin/bash ${XUI_USER}"
+    echo -e "  sudo usermod -aG sudo ${XUI_USER}   # ${XUI_USER} needs sudo for apt/systemctl"
+    echo -e "  sudo -u ${XUI_USER} x-ui"
+    echo -e ""
+elif [[ "$(id -un)" != "${XUI_USER}" ]]; then
+    LOGE "This script must be run as root or as user '${XUI_USER}', not '$(id -un)'."
+    LOGE "Either run it as root, or create the user first (as root): sudo useradd -m -s /bin/bash ${XUI_USER}; sudo usermod -aG sudo ${XUI_USER}"
     LOGE "Then run: sudo -u ${XUI_USER} x-ui"
     exit 1
 fi
-if ! command -v sudo >/dev/null 2>&1; then
-    LOGE "sudo is required to run x-ui as user '${XUI_USER}'. Install sudo first."
-    exit 1
+# sudo is required for the privileged steps when running as x-ui; root
+# does not need it. Prefer a non-interactive check so a passwordless
+# setup never prompts; fall back to sudo -v, which may ask for a password
+# once and cache it, for the interactive setup. Both fail when x-ui is in
+# the sudo group AND has a NOPASSWD drop-in (sudo -v then needs a password
+# but has no terminal), so do not combine the two in a non-interactive run.
+if [[ $EUID -ne 0 ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+        LOGE "sudo is required to run x-ui as user '${XUI_USER}'. Install sudo first."
+        exit 1
+    fi
+    if ! sudo -n true 2>/dev/null && ! sudo -v; then
+        LOGE "sudo is not usable for user '${XUI_USER}' in this session."
+        LOGE "If '${XUI_USER}' is in the sudo group and also has a NOPASSWD sudoers file, remove it from the sudo group; or run x-ui interactively and enter the password when asked."
+        exit 1
+    fi
 fi
-sudo -v || exit 1
+
+# Certificates must live where the panel (running as x-ui) can read them,
+# no matter whether the CLI runs as root or as x-ui.
+if [[ $EUID -eq 0 ]]; then
+    if ! id "${XUI_USER}" &>/dev/null; then
+        useradd -m -s /bin/bash "${XUI_USER}" || {
+            LOGE "Failed to create user '${XUI_USER}'."
+            exit 1
+        }
+    fi
+    XUI_HOME="$(getent passwd "${XUI_USER}" | cut -d: -f6)"
+else
+    XUI_HOME="${HOME}"
+fi
 
 # Check OS and set release variable
 if [[ -f /etc/os-release ]]; then
@@ -216,7 +244,7 @@ uninstall() {
 
     if [[ $release == "alpine" ]]; then
         sudo rc-service x-ui stop
-        rc-update del x-ui
+        sudo rc-update del x-ui
         rm /etc/init.d/x-ui -f
     else
         sudo systemctl stop x-ui
@@ -458,7 +486,7 @@ status() {
 
 enable() {
     if [[ $release == "alpine" ]]; then
-        rc-update add x-ui default
+        sudo rc-update add x-ui default
     else
         sudo systemctl enable x-ui
     fi
@@ -475,7 +503,7 @@ enable() {
 
 disable() {
     if [[ $release == "alpine" ]]; then
-        rc-update del x-ui
+        sudo rc-update del x-ui
     else
         sudo systemctl disable x-ui
     fi
@@ -669,7 +697,7 @@ check_status() {
 
 check_enabled() {
     if [[ $release == "alpine" ]]; then
-        if [[ $(rc-update show | grep -F 'x-ui' | grep default -c) == 1 ]]; then
+        if [[ $(sudo rc-update show | grep -F 'x-ui' | grep default -c) == 1 ]]; then
             return 0
         else
             return 1
@@ -1058,7 +1086,7 @@ ssl_cert_issue_main() {
             ssl_cert_issue_main
             ;;
         2)
-            local domains=$(find ${HOME}/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+            local domains=$(find ${XUI_HOME}/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
             if [ -z "$domains" ]; then
                 echo "No certificates found to revoke."
             else
@@ -1075,7 +1103,7 @@ ssl_cert_issue_main() {
             ssl_cert_issue_main
             ;;
         3)
-            local domains=$(find ${HOME}/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+            local domains=$(find ${XUI_HOME}/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
             if [ -z "$domains" ]; then
                 echo "No certificates found to renew."
             else
@@ -1092,14 +1120,14 @@ ssl_cert_issue_main() {
             ssl_cert_issue_main
             ;;
         4)
-            local domains=$(find ${HOME}/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+            local domains=$(find ${XUI_HOME}/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
             if [ -z "$domains" ]; then
                 echo "No certificates found."
             else
                 echo "Existing domains and their paths:"
                 for domain in $domains; do
-                    local cert_path="${HOME}/cert/${domain}/fullchain.pem"
-                    local key_path="${HOME}/cert/${domain}/privkey.pem"
+                    local cert_path="${XUI_HOME}/cert/${domain}/fullchain.pem"
+                    local key_path="${XUI_HOME}/cert/${domain}/privkey.pem"
                     if [[ -f "${cert_path}" && -f "${key_path}" ]]; then
                         echo -e "Domain: ${domain}"
                         echo -e "\tCertificate Path: ${cert_path}"
@@ -1112,7 +1140,7 @@ ssl_cert_issue_main() {
             ssl_cert_issue_main
             ;;
         5)
-            local domains=$(find ${HOME}/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+            local domains=$(find ${XUI_HOME}/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
             if [ -z "$domains" ]; then
                 echo "No certificates found."
             else
@@ -1121,8 +1149,8 @@ ssl_cert_issue_main() {
                 read -rp "Please choose a domain to set the panel paths: " domain
 
                 if echo "$domains" | grep -qw "$domain"; then
-                    local webCertFile="${HOME}/cert/${domain}/fullchain.pem"
-                    local webKeyFile="${HOME}/cert/${domain}/privkey.pem"
+                    local webCertFile="${XUI_HOME}/cert/${domain}/fullchain.pem"
+                    local webKeyFile="${XUI_HOME}/cert/${domain}/privkey.pem"
 
                     if [[ -f "${webCertFile}" && -f "${webKeyFile}" ]]; then
                         ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile"
@@ -1223,7 +1251,7 @@ ssl_cert_issue_for_ip() {
     esac
 
     # Create certificate directory
-    certPath="${HOME}/cert/ip"
+    certPath="${XUI_HOME}/cert/ip"
     mkdir -p "$certPath"
 
     # Build domain arguments
@@ -1319,6 +1347,11 @@ ssl_cert_issue_for_ip() {
     ~/.acme.sh/acme.sh --upgrade --auto-upgrade > /dev/null 2>&1
     chmod 600 $certPath/privkey.pem 2> /dev/null
     chmod 644 $certPath/fullchain.pem 2> /dev/null
+    # The panel runs as x-ui, so it must own the certificate files when the
+    # CLI runs as root (acme.sh then writes them as root).
+    if [[ $EUID -eq 0 ]]; then
+        chown -R "${XUI_USER}:${XUI_USER}" "$certPath"
+    fi
 
     # Set certificate paths for the panel
     local webCertFile="${certPath}/fullchain.pem"
@@ -1421,7 +1454,7 @@ ssl_cert_issue() {
     fi
 
     # create a directory for the certificate
-    certPath="${HOME}/cert/${domain}"
+    certPath="${XUI_HOME}/cert/${domain}"
     if [ ! -d "$certPath" ]; then
         mkdir -p "$certPath"
     else
@@ -1482,8 +1515,8 @@ ssl_cert_issue() {
     # install the certificate
     local installOutput=""
     installOutput=$(~/.acme.sh/acme.sh --installcert -d ${domain} \
-        --key-file ${HOME}/cert/${domain}/privkey.pem \
-        --fullchain-file ${HOME}/cert/${domain}/fullchain.pem --reloadcmd "${reloadCmd}" 2>&1)
+        --key-file ${XUI_HOME}/cert/${domain}/privkey.pem \
+        --fullchain-file ${XUI_HOME}/cert/${domain}/fullchain.pem --reloadcmd "${reloadCmd}" 2>&1)
     local installRc=$?
     echo "${installOutput}"
 
@@ -1492,7 +1525,7 @@ ssl_cert_issue() {
         installWroteFiles=1
     fi
 
-    if [[ -f "${HOME}/cert/${domain}/privkey.pem" && -f "${HOME}/cert/${domain}/fullchain.pem" && (${installRc} -eq 0 || ${installWroteFiles} -eq 1) ]]; then
+    if [[ -f "${XUI_HOME}/cert/${domain}/privkey.pem" && -f "${XUI_HOME}/cert/${domain}/fullchain.pem" && (${installRc} -eq 0 || ${installWroteFiles} -eq 1) ]]; then
         LOGI "Installing certificate succeeded, enabling auto renew..."
     else
         LOGE "Installing certificate failed, exiting."
@@ -1516,12 +1549,17 @@ ssl_cert_issue() {
         chmod 600 $certPath/privkey.pem
         chmod 644 $certPath/fullchain.pem
     fi
+    # The panel runs as x-ui, so it must own the certificate files when the
+    # CLI runs as root (acme.sh then writes them as root).
+    if [[ $EUID -eq 0 ]]; then
+        chown -R "${XUI_USER}:${XUI_USER}" "$certPath"
+    fi
 
     # Prompt user to set panel paths after successful certificate installation
     read -rp "Would you like to set this certificate for the panel? (y/n): " setPanel
     if [[ "$setPanel" == "y" || "$setPanel" == "Y" ]]; then
-        local webCertFile="${HOME}/cert/${domain}/fullchain.pem"
-        local webKeyFile="${HOME}/cert/${domain}/privkey.pem"
+        local webCertFile="${XUI_HOME}/cert/${domain}/fullchain.pem"
+        local webKeyFile="${XUI_HOME}/cert/${domain}/privkey.pem"
 
         if [[ -f "$webCertFile" && -f "$webKeyFile" ]]; then
             ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile"
@@ -1599,7 +1637,7 @@ ssl_cert_issue_CF() {
         fi
 
         # Install the certificate
-        certPath="${HOME}/cert/${CF_Domain}"
+        certPath="${XUI_HOME}/cert/${CF_Domain}"
         if [ -d "$certPath" ]; then
             rm -rf ${certPath}
         fi
@@ -1656,6 +1694,11 @@ ssl_cert_issue_CF() {
             ls -lah ${certPath}/*
             chmod 600 ${certPath}/privkey.pem
             chmod 644 ${certPath}/fullchain.pem
+        fi
+        # The panel runs as x-ui, so it must own the certificate files when the
+        # CLI runs as root (acme.sh then writes them as root).
+        if [[ $EUID -eq 0 ]]; then
+            chown -R "${XUI_USER}:${XUI_USER}" "${certPath}"
         fi
 
         # Prompt user to set panel paths after successful certificate installation
@@ -1922,7 +1965,7 @@ install_iplimit() {
         else
             sudo rc-service fail2ban restart
         fi
-        rc-update add fail2ban
+        sudo rc-update add fail2ban
     else
         if ! sudo systemctl is-active --quiet fail2ban; then
             sudo systemctl start fail2ban

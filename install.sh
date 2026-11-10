@@ -12,35 +12,59 @@ xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
 xui_service="${XUI_SERVICE:=/etc/systemd/system}"
 
 
-# x-ui must be installed as the dedicated unprivileged user "x-ui", never as
-# root: the panel and Xray run as x-ui, and root is only used through sudo
-# for the privileged steps (package install, systemd, /usr/local, /etc).
+# The panel and Xray run as the dedicated unprivileged user "x-ui", and
+# installing as that user is recommended. Installing as root is also
+# allowed, but only with the warning below; any other user is refused.
+# Root is used only through sudo for the privileged steps (package
+# install, systemd, /usr/local, /etc) -- as root the sudo calls are
+# no-ops, as x-ui they escalate.
 XUI_USER="x-ui"
 if [[ $EUID -eq 0 ]]; then
-    echo -e "${red}Refusing to install as root.${plain}"
-    echo -e "Create the dedicated user and run the installer as that user:"
+    echo -e "${red}WARNING: You are installing as root. It is recommended to install as the dedicated unprivileged user '${XUI_USER}' instead:${plain}"
     echo -e "  sudo useradd -m -s /bin/bash ${XUI_USER}"
     echo -e "  sudo usermod -aG sudo ${XUI_USER}   # ${XUI_USER} needs sudo for apt/systemctl"
     echo -e "  sudo -u ${XUI_USER} bash install.sh"
     echo -e ""
-    exit 1
-fi
-if [[ "$(id -un)" != "${XUI_USER}" ]]; then
-    echo -e "${red}This installer must be run as user '${XUI_USER}', not '$(id -un)'.${plain}"
-    echo -e "Create the user first (as root):"
+elif [[ "$(id -un)" != "${XUI_USER}" ]]; then
+    echo -e "${red}This installer must be run as root or as user '${XUI_USER}', not '$(id -un)'.${plain}"
+    echo -e "Either run it as root, or create the user first (as root):"
     echo -e "  sudo useradd -m -s /bin/bash ${XUI_USER}"
     echo -e "  sudo usermod -aG sudo ${XUI_USER}"
     echo -e "Then run: sudo -u ${XUI_USER} bash install.sh"
     echo -e ""
     exit 1
 fi
-# sudo is required for the privileged steps; cache credentials once so the
-# install does not prompt for a password at every step.
-if ! command -v sudo >/dev/null 2>&1; then
-    echo -e "${red}sudo is required to install x-ui as user '${XUI_USER}'. Install sudo first.${plain}"
-    exit 1
+# sudo is required for the privileged steps when running as x-ui; root
+# does not need it. Prefer a non-interactive check so a passwordless
+# setup never prompts; fall back to sudo -v, which may ask for a password
+# once and cache it, for the interactive setup. Both fail when x-ui is in
+# the sudo group AND has a NOPASSWD drop-in (sudo -v then needs a password
+# but has no terminal), so do not combine the two in a non-interactive install.
+if [[ $EUID -ne 0 ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo -e "${red}sudo is required to install x-ui as user '${XUI_USER}'. Install sudo first.${plain}"
+        exit 1
+    fi
+    if ! sudo -n true 2>/dev/null && ! sudo -v; then
+        echo -e "${red}sudo is not usable for user '${XUI_USER}' in this session.${plain}"
+        echo -e "If '${XUI_USER}' is in the sudo group and also has a NOPASSWD sudoers file, remove it from the sudo group; or run the installer interactively and enter the password when asked."
+        exit 1
+    fi
 fi
-sudo -v || exit 1
+
+# Certificates must live where the panel (running as x-ui) can read them,
+# no matter whether the installer runs as root or as x-ui.
+if [[ $EUID -eq 0 ]]; then
+    if ! id "${XUI_USER}" &>/dev/null; then
+        useradd -m -s /bin/bash "${XUI_USER}" || {
+            echo -e "${red}Failed to create user '${XUI_USER}'.${plain}"
+            exit 1
+        }
+    fi
+    XUI_HOME="$(getent passwd "${XUI_USER}" | cut -d: -f6)"
+else
+    XUI_HOME="${HOME}"
+fi
 
 # Check OS and set release variable
 if [[ -f /etc/os-release ]]; then
@@ -120,21 +144,35 @@ is_port_in_use() {
 # Give the x-ui user passwordless sudo for exactly the service-management
 # commands the x-ui CLI and acme.sh auto-renew need (restart/stop/status of
 # the x-ui unit, fail2ban, and journal rotation). Nothing else is allowed
-# without a password. Validated with visudo before it is left in place.
+# without a password.
+#
+# The content is validated with visudo in a temp file BEFORE the drop-in
+# is installed: once the narrow rules are in place, chmod/visudo/rm are
+# no longer permitted through sudo, so validating or cleaning up after
+# the write would fail. Installing with `install -m 440` sets the mode
+# atomically, so no separate chmod is needed.
 setup_sudoers() {
     local sudoers_file="/etc/sudoers.d/x-ui"
-    local sudoers_content="x-ui ALL=(ALL) NOPASSWD: /usr/bin/systemctl start x-ui, /usr/bin/systemctl stop x-ui, /usr/bin/systemctl restart x-ui, /usr/bin/systemctl reload x-ui, /usr/bin/systemctl status x-ui, /usr/bin/systemctl enable x-ui, /usr/bin/systemctl disable x-ui, /usr/bin/systemctl is-active x-ui, /usr/bin/systemctl is-enabled x-ui, /usr/bin/systemctl daemon-reload, /usr/bin/systemctl reset-failed, /usr/bin/systemctl start fail2ban, /usr/bin/systemctl stop fail2ban, /usr/bin/systemctl restart fail2ban, /usr/bin/systemctl status fail2ban, /usr/bin/systemctl is-active fail2ban, /usr/bin/journalctl -u x-ui *, /usr/bin/journalctl --rotate, /usr/bin/journalctl --vacuum-time=1s, /sbin/rc-service x-ui *, /sbin/rc-service fail2ban *"
-    echo "$sudoers_content" | sudo tee "$sudoers_file" > /dev/null
-    sudo chmod 440 "$sudoers_file"
+    local sudoers_content="x-ui ALL=(ALL) NOPASSWD: /usr/bin/systemctl start x-ui, /usr/bin/systemctl stop x-ui, /usr/bin/systemctl restart x-ui, /usr/bin/systemctl reload x-ui, /usr/bin/systemctl status x-ui, /usr/bin/systemctl status x-ui *, /usr/bin/systemctl enable x-ui, /usr/bin/systemctl disable x-ui, /usr/bin/systemctl is-active x-ui, /usr/bin/systemctl is-enabled x-ui, /usr/bin/systemctl daemon-reload, /usr/bin/systemctl reset-failed, /usr/bin/systemctl start fail2ban, /usr/bin/systemctl stop fail2ban, /usr/bin/systemctl restart fail2ban, /usr/bin/systemctl status fail2ban, /usr/bin/systemctl is-active fail2ban, /usr/bin/systemctl is-active --quiet fail2ban, /usr/bin/journalctl -u x-ui *, /usr/bin/journalctl --rotate, /usr/bin/journalctl --vacuum-time=1s, /sbin/rc-service x-ui *, /sbin/rc-service fail2ban *, /sbin/rc-update add x-ui, /sbin/rc-update add x-ui *, /sbin/rc-update del x-ui, /sbin/rc-update show, /sbin/rc-update add fail2ban"
+    local tmp_file
+    tmp_file="$(mktemp)"
+    echo "$sudoers_content" > "$tmp_file"
+    chmod 440 "$tmp_file"
     if command -v visudo >/dev/null 2>&1; then
-        if ! sudo visudo -cf "$sudoers_file" > /dev/null 2>&1; then
-            echo -e "${red}Invalid sudoers file generated, removing it.${plain}"
-            sudo rm -f "$sudoers_file"
+        if ! sudo visudo -cf "$tmp_file" > /dev/null 2>&1; then
+            echo -e "${red}Invalid sudoers content generated, not installing it.${plain}"
+            rm -f "$tmp_file"
             return 1
         fi
     else
         echo -e "${yellow}visudo not found, sudoers file was not validated.${plain}"
     fi
+    sudo install -m 440 "$tmp_file" "$sudoers_file" || {
+        echo -e "${red}Failed to install ${sudoers_file}.${plain}"
+        rm -f "$tmp_file"
+        return 1
+    }
+    rm -f "$tmp_file"
     echo -e "${green}Passwordless sudo for x-ui service management configured (${sudoers_file}).${plain}"
     return 0
 }
@@ -207,7 +245,7 @@ setup_ssl_certificate() {
     fi
 
     # Create certificate directory
-    local certPath="${HOME}/cert/${domain}"
+    local certPath="${XUI_HOME}/cert/${domain}"
     mkdir -p "$certPath"
 
     # Issue certificate
@@ -227,8 +265,8 @@ setup_ssl_certificate() {
 
     # Install certificate
     ~/.acme.sh/acme.sh --installcert -d ${domain} \
-        --key-file ${HOME}/cert/${domain}/privkey.pem \
-        --fullchain-file ${HOME}/cert/${domain}/fullchain.pem \
+        --key-file ${XUI_HOME}/cert/${domain}/privkey.pem \
+        --fullchain-file ${XUI_HOME}/cert/${domain}/fullchain.pem \
         --reloadcmd "sudo systemctl restart x-ui" > /dev/null 2>&1
 
     if [ $? -ne 0 ]; then
@@ -241,10 +279,15 @@ setup_ssl_certificate() {
     # Secure permissions: private key readable only by owner
     chmod 600 $certPath/privkey.pem 2> /dev/null
     chmod 644 $certPath/fullchain.pem 2> /dev/null
+    # The panel runs as x-ui, so it must own the certificate files when the
+    # installer runs as root (acme.sh then writes them as root).
+    if [[ $EUID -eq 0 ]]; then
+        chown -R "${XUI_USER}:${XUI_USER}" "$certPath"
+    fi
 
     # Set certificate for panel
-    local webCertFile="${HOME}/cert/${domain}/fullchain.pem"
-    local webKeyFile="${HOME}/cert/${domain}/privkey.pem"
+    local webCertFile="${XUI_HOME}/cert/${domain}/fullchain.pem"
+    local webKeyFile="${XUI_HOME}/cert/${domain}/privkey.pem"
 
     if [[ -f "$webCertFile" && -f "$webKeyFile" ]]; then
         ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile" > /dev/null 2>&1
@@ -287,7 +330,7 @@ setup_ip_certificate() {
     fi
 
     # Create certificate directory
-    local certDir="${HOME}/cert/ip"
+    local certDir="${XUI_HOME}/cert/ip"
     mkdir -p "$certDir"
 
     # Build domain arguments
@@ -388,6 +431,11 @@ setup_ip_certificate() {
     # Secure permissions: private key readable only by owner
     chmod 600 ${certDir}/privkey.pem 2> /dev/null
     chmod 644 ${certDir}/fullchain.pem 2> /dev/null
+    # The panel runs as x-ui, so it must own the certificate files when the
+    # installer runs as root (acme.sh then writes them as root).
+    if [[ $EUID -eq 0 ]]; then
+        chown -R "${XUI_USER}:${XUI_USER}" "${certDir}"
+    fi
 
     # Configure panel to use the certificate
     echo -e "${green}Setting certificate paths for the panel...${plain}"
@@ -459,7 +507,7 @@ ssl_cert_issue() {
     fi
 
     # create a directory for the certificate
-    certPath="${HOME}/cert/${domain}"
+    certPath="${XUI_HOME}/cert/${domain}"
     if [ ! -d "$certPath" ]; then
         mkdir -p "$certPath"
     else
@@ -525,8 +573,8 @@ ssl_cert_issue() {
     # install the certificate
     local installOutput=""
     installOutput=$(~/.acme.sh/acme.sh --installcert -d ${domain} \
-        --key-file ${HOME}/cert/${domain}/privkey.pem \
-        --fullchain-file ${HOME}/cert/${domain}/fullchain.pem --reloadcmd "${reloadCmd}" 2>&1)
+        --key-file ${XUI_HOME}/cert/${domain}/privkey.pem \
+        --fullchain-file ${XUI_HOME}/cert/${domain}/fullchain.pem --reloadcmd "${reloadCmd}" 2>&1)
     local installRc=$?
     echo "${installOutput}"
 
@@ -535,7 +583,7 @@ ssl_cert_issue() {
         installWroteFiles=1
     fi
 
-    if [[ -f "${HOME}/cert/${domain}/privkey.pem" && -f "${HOME}/cert/${domain}/fullchain.pem" && (${installRc} -eq 0 || ${installWroteFiles} -eq 1) ]]; then
+    if [[ -f "${XUI_HOME}/cert/${domain}/privkey.pem" && -f "${XUI_HOME}/cert/${domain}/fullchain.pem" && (${installRc} -eq 0 || ${installWroteFiles} -eq 1) ]]; then
         echo -e "${green}Installing certificate succeeded, enabling auto renew...${plain}"
     else
         echo -e "${red}Installing certificate failed, exiting.${plain}"
@@ -550,16 +598,21 @@ ssl_cert_issue() {
     ~/.acme.sh/acme.sh --upgrade --auto-upgrade
     if [ $? -ne 0 ]; then
         echo -e "${yellow}Auto renew setup had issues, certificate details:${plain}"
-        ls -lah ${HOME}/cert/${domain}/
+        ls -lah ${XUI_HOME}/cert/${domain}/
         # Secure permissions: private key readable only by owner
         chmod 600 $certPath/privkey.pem 2> /dev/null
         chmod 644 $certPath/fullchain.pem 2> /dev/null
     else
         echo -e "${green}Auto renew succeeded, certificate details:${plain}"
-        ls -lah ${HOME}/cert/${domain}/
+        ls -lah ${XUI_HOME}/cert/${domain}/
         # Secure permissions: private key readable only by owner
         chmod 600 $certPath/privkey.pem 2> /dev/null
         chmod 644 $certPath/fullchain.pem 2> /dev/null
+    fi
+    # The panel runs as x-ui, so it must own the certificate files when the
+    # installer runs as root (acme.sh then writes them as root).
+    if [[ $EUID -eq 0 ]]; then
+        chown -R "${XUI_USER}:${XUI_USER}" "$certPath"
     fi
 
     # start panel
@@ -568,8 +621,8 @@ ssl_cert_issue() {
     # Prompt user to set panel paths after successful certificate installation
     read -rp "Would you like to set this certificate for the panel? (y/n): " setPanel
     if [[ "$setPanel" == "y" || "$setPanel" == "Y" ]]; then
-        local webCertFile="${HOME}/cert/${domain}/fullchain.pem"
-        local webKeyFile="${HOME}/cert/${domain}/privkey.pem"
+        local webCertFile="${XUI_HOME}/cert/${domain}/fullchain.pem"
+        local webKeyFile="${XUI_HOME}/cert/${domain}/privkey.pem"
 
         if [[ -f "$webCertFile" && -f "$webKeyFile" ]]; then
             ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile"
@@ -892,10 +945,6 @@ install_x-ui() {
         exit 1
     fi
 
-    # Passwordless sudo for the x-ui service (used by the x-ui CLI and acme
-    # auto-renew); must exist before the service is (re)started.
-    setup_sudoers || exit 1
-
     # Stop x-ui service and remove old resources
     if [[ -e ${xui_folder}/ ]]; then
         if [[ $release == "alpine" ]]; then
@@ -954,6 +1003,10 @@ install_x-ui() {
         sudo cp -f x-ui.rc /etc/init.d/x-ui
         sudo chmod +x /etc/init.d/x-ui
         sudo rc-update add x-ui
+        # Passwordless sudo for the x-ui service (see the systemd branch
+        # below): installed after the privileged file operations, so the
+        # narrow rules do not block them. rc-service x-ui is in that list.
+        setup_sudoers || exit 1
         sudo rc-service x-ui start
     else
         # Install systemd service file
@@ -1026,6 +1079,13 @@ install_x-ui() {
             echo -e "${green}Setting up systemd unit...${plain}"
             sudo chown root:root ${xui_service}/x-ui.service > /dev/null 2>&1
             sudo chmod 644 ${xui_service}/x-ui.service > /dev/null 2>&1
+            # Passwordless sudo for the x-ui service (used by the x-ui CLI
+            # and acme auto-renew). It runs here, after all privileged
+            # file operations: once the narrow rules are in place, only
+            # the service-management commands below are still allowed
+            # through sudo, and daemon-reload/enable/start are all in
+            # that list.
+            setup_sudoers || exit 1
             sudo systemctl daemon-reload
             sudo systemctl enable x-ui
             sudo systemctl start x-ui
