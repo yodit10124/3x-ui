@@ -11,60 +11,8 @@ cur_dir=$(pwd)
 xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
 xui_service="${XUI_SERVICE:=/etc/systemd/system}"
 
-
-# The panel and Xray run as the dedicated unprivileged user "x-ui", and
-# installing as that user is recommended. Installing as root is also
-# allowed, but only with the warning below; any other user is refused.
-# Root is used only through sudo for the privileged steps (package
-# install, systemd, /usr/local, /etc) -- as root the sudo calls are
-# no-ops, as x-ui they escalate.
-XUI_USER="x-ui"
-if [[ $EUID -eq 0 ]]; then
-    echo -e "${red}WARNING: You are installing as root. It is recommended to install as the dedicated unprivileged user '${XUI_USER}' instead:${plain}"
-    echo -e "  sudo useradd -m -s /bin/bash ${XUI_USER}"
-    echo -e "  sudo usermod -aG sudo ${XUI_USER}   # ${XUI_USER} needs sudo for apt/systemctl"
-    echo -e "  sudo -u ${XUI_USER} bash install.sh"
-    echo -e ""
-elif [[ "$(id -un)" != "${XUI_USER}" ]]; then
-    echo -e "${red}This installer must be run as root or as user '${XUI_USER}', not '$(id -un)'.${plain}"
-    echo -e "Either run it as root, or create the user first (as root):"
-    echo -e "  sudo useradd -m -s /bin/bash ${XUI_USER}"
-    echo -e "  sudo usermod -aG sudo ${XUI_USER}"
-    echo -e "Then run: sudo -u ${XUI_USER} bash install.sh"
-    echo -e ""
-    exit 1
-fi
-# sudo is required for the privileged steps when running as x-ui; root
-# does not need it. Prefer a non-interactive check so a passwordless
-# setup never prompts; fall back to sudo -v, which may ask for a password
-# once and cache it, for the interactive setup. Both fail when x-ui is in
-# the sudo group AND has a NOPASSWD drop-in (sudo -v then needs a password
-# but has no terminal), so do not combine the two in a non-interactive install.
-if [[ $EUID -ne 0 ]]; then
-    if ! command -v sudo >/dev/null 2>&1; then
-        echo -e "${red}sudo is required to install x-ui as user '${XUI_USER}'. Install sudo first.${plain}"
-        exit 1
-    fi
-    if ! sudo -n true 2>/dev/null && ! sudo -v; then
-        echo -e "${red}sudo is not usable for user '${XUI_USER}' in this session.${plain}"
-        echo -e "If '${XUI_USER}' is in the sudo group and also has a NOPASSWD sudoers file, remove it from the sudo group; or run the installer interactively and enter the password when asked."
-        exit 1
-    fi
-fi
-
-# Certificates must live where the panel (running as x-ui) can read them,
-# no matter whether the installer runs as root or as x-ui.
-if [[ $EUID -eq 0 ]]; then
-    if ! id "${XUI_USER}" &>/dev/null; then
-        useradd -m -s /bin/bash "${XUI_USER}" || {
-            echo -e "${red}Failed to create user '${XUI_USER}'.${plain}"
-            exit 1
-        }
-    fi
-    XUI_HOME="$(getent passwd "${XUI_USER}" | cut -d: -f6)"
-else
-    XUI_HOME="${HOME}"
-fi
+# check root
+[[ $EUID -ne 0 ]] && echo -e "${red}Fatal error: ${plain} Please run this script with root privilege \n " && exit 1
 
 # Check OS and set release variable
 if [[ -f /etc/os-release ]]; then
@@ -141,68 +89,32 @@ is_port_in_use() {
     return 1
 }
 
-# Give the x-ui user passwordless sudo for exactly the service-management
-# commands the x-ui CLI and acme.sh auto-renew need (restart/stop/status of
-# the x-ui unit, fail2ban, and journal rotation). Nothing else is allowed
-# without a password.
-#
-# The content is validated with visudo in a temp file BEFORE the drop-in
-# is installed: once the narrow rules are in place, chmod/visudo/rm are
-# no longer permitted through sudo, so validating or cleaning up after
-# the write would fail. Installing with `install -m 440` sets the mode
-# atomically, so no separate chmod is needed.
-setup_sudoers() {
-    local sudoers_file="/etc/sudoers.d/x-ui"
-    local sudoers_content="x-ui ALL=(ALL) NOPASSWD: /usr/bin/systemctl start x-ui, /usr/bin/systemctl stop x-ui, /usr/bin/systemctl restart x-ui, /usr/bin/systemctl reload x-ui, /usr/bin/systemctl status x-ui, /usr/bin/systemctl status x-ui *, /usr/bin/systemctl enable x-ui, /usr/bin/systemctl disable x-ui, /usr/bin/systemctl is-active x-ui, /usr/bin/systemctl is-enabled x-ui, /usr/bin/systemctl daemon-reload, /usr/bin/systemctl reset-failed, /usr/bin/systemctl start fail2ban, /usr/bin/systemctl stop fail2ban, /usr/bin/systemctl restart fail2ban, /usr/bin/systemctl status fail2ban, /usr/bin/systemctl is-active fail2ban, /usr/bin/systemctl is-active --quiet fail2ban, /usr/bin/journalctl -u x-ui *, /usr/bin/journalctl --rotate, /usr/bin/journalctl --vacuum-time=1s, /sbin/rc-service x-ui *, /sbin/rc-service fail2ban *, /sbin/rc-update add x-ui, /sbin/rc-update add x-ui *, /sbin/rc-update del x-ui, /sbin/rc-update show, /sbin/rc-update add fail2ban"
-    local tmp_file
-    tmp_file="$(mktemp)"
-    echo "$sudoers_content" > "$tmp_file"
-    chmod 440 "$tmp_file"
-    if command -v visudo >/dev/null 2>&1; then
-        if ! sudo visudo -cf "$tmp_file" > /dev/null 2>&1; then
-            echo -e "${red}Invalid sudoers content generated, not installing it.${plain}"
-            rm -f "$tmp_file"
-            return 1
-        fi
-    else
-        echo -e "${yellow}visudo not found, sudoers file was not validated.${plain}"
-    fi
-    sudo install -m 440 "$tmp_file" "$sudoers_file" || {
-        echo -e "${red}Failed to install ${sudoers_file}.${plain}"
-        rm -f "$tmp_file"
-        return 1
-    }
-    rm -f "$tmp_file"
-    echo -e "${green}Passwordless sudo for x-ui service management configured (${sudoers_file}).${plain}"
-    return 0
-}
-
 install_base() {
     case "${release}" in
         ubuntu | debian | armbian)
-            sudo apt-get update && sudo apt-get install -y -q cron curl tar tzdata socat ca-certificates openssl
+            apt-get update && apt-get install -y -q cron curl tar tzdata socat ca-certificates openssl
             ;;
         fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
-            sudo dnf -y update && sudo dnf install -y -q cronie curl tar tzdata socat ca-certificates openssl
+            dnf -y update && dnf install -y -q cronie curl tar tzdata socat ca-certificates openssl
             ;;
         centos)
             if [[ "${VERSION_ID}" =~ ^7 ]]; then
-                sudo yum -y update && sudo yum install -y cronie curl tar tzdata socat ca-certificates openssl
+                yum -y update && yum install -y cronie curl tar tzdata socat ca-certificates openssl
             else
-                sudo dnf -y update && sudo dnf install -y -q cronie curl tar tzdata socat ca-certificates openssl
+                dnf -y update && dnf install -y -q cronie curl tar tzdata socat ca-certificates openssl
             fi
             ;;
         arch | manjaro | parch)
-            sudo pacman -Syu && sudo pacman -Syu --noconfirm cronie curl tar tzdata socat ca-certificates openssl
+            pacman -Syu && pacman -Syu --noconfirm cronie curl tar tzdata socat ca-certificates openssl
             ;;
         opensuse-tumbleweed | opensuse-leap)
-            sudo zypper refresh && sudo zypper -q install -y cron curl tar timezone socat ca-certificates openssl
+            zypper refresh && zypper -q install -y cron curl tar timezone socat ca-certificates openssl
             ;;
         alpine)
-            sudo apk update && sudo apk add dcron curl tar tzdata socat ca-certificates openssl
+            apk update && apk add dcron curl tar tzdata socat ca-certificates openssl
             ;;
         *)
-            sudo apt-get update && sudo apt-get install -y -q cron curl tar tzdata socat ca-certificates openssl
+            apt-get update && apt-get install -y -q cron curl tar tzdata socat ca-certificates openssl
             ;;
     esac
 }
@@ -245,7 +157,7 @@ setup_ssl_certificate() {
     fi
 
     # Create certificate directory
-    local certPath="${XUI_HOME}/cert/${domain}"
+    local certPath="/root/cert/${domain}"
     mkdir -p "$certPath"
 
     # Issue certificate
@@ -265,9 +177,9 @@ setup_ssl_certificate() {
 
     # Install certificate
     ~/.acme.sh/acme.sh --installcert -d ${domain} \
-        --key-file ${XUI_HOME}/cert/${domain}/privkey.pem \
-        --fullchain-file ${XUI_HOME}/cert/${domain}/fullchain.pem \
-        --reloadcmd "sudo systemctl restart x-ui" > /dev/null 2>&1
+        --key-file /root/cert/${domain}/privkey.pem \
+        --fullchain-file /root/cert/${domain}/fullchain.pem \
+        --reloadcmd "systemctl restart x-ui" > /dev/null 2>&1
 
     if [ $? -ne 0 ]; then
         echo -e "${yellow}Failed to install certificate${plain}"
@@ -279,15 +191,10 @@ setup_ssl_certificate() {
     # Secure permissions: private key readable only by owner
     chmod 600 $certPath/privkey.pem 2> /dev/null
     chmod 644 $certPath/fullchain.pem 2> /dev/null
-    # The panel runs as x-ui, so it must own the certificate files when the
-    # installer runs as root (acme.sh then writes them as root).
-    if [[ $EUID -eq 0 ]]; then
-        chown -R "${XUI_USER}:${XUI_USER}" "$certPath"
-    fi
 
     # Set certificate for panel
-    local webCertFile="${XUI_HOME}/cert/${domain}/fullchain.pem"
-    local webKeyFile="${XUI_HOME}/cert/${domain}/privkey.pem"
+    local webCertFile="/root/cert/${domain}/fullchain.pem"
+    local webKeyFile="/root/cert/${domain}/privkey.pem"
 
     if [[ -f "$webCertFile" && -f "$webKeyFile" ]]; then
         ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile" > /dev/null 2>&1
@@ -330,7 +237,7 @@ setup_ip_certificate() {
     fi
 
     # Create certificate directory
-    local certDir="${XUI_HOME}/cert/ip"
+    local certDir="/root/cert/ip"
     mkdir -p "$certDir"
 
     # Build domain arguments
@@ -341,7 +248,7 @@ setup_ip_certificate() {
     fi
 
     # Set reload command for auto-renewal (add || true so it doesn't fail during first install)
-    local reloadCmd="sudo systemctl restart x-ui 2>/dev/null || sudo rc-service x-ui restart 2>/dev/null || true"
+    local reloadCmd="systemctl restart x-ui 2>/dev/null || rc-service x-ui restart 2>/dev/null || true"
 
     # Choose port for HTTP-01 listener (default 80, prompt override)
     local WebPort=""
@@ -431,11 +338,6 @@ setup_ip_certificate() {
     # Secure permissions: private key readable only by owner
     chmod 600 ${certDir}/privkey.pem 2> /dev/null
     chmod 644 ${certDir}/fullchain.pem 2> /dev/null
-    # The panel runs as x-ui, so it must own the certificate files when the
-    # installer runs as root (acme.sh then writes them as root).
-    if [[ $EUID -eq 0 ]]; then
-        chown -R "${XUI_USER}:${XUI_USER}" "${certDir}"
-    fi
 
     # Configure panel to use the certificate
     echo -e "${green}Setting certificate paths for the panel...${plain}"
@@ -507,7 +409,7 @@ ssl_cert_issue() {
     fi
 
     # create a directory for the certificate
-    certPath="${XUI_HOME}/cert/${domain}"
+    certPath="/root/cert/${domain}"
     if [ ! -d "$certPath" ]; then
         mkdir -p "$certPath"
     else
@@ -526,7 +428,7 @@ ssl_cert_issue() {
 
     # Stop panel temporarily
     echo -e "${yellow}Stopping panel temporarily...${plain}"
-    sudo systemctl stop x-ui 2> /dev/null || sudo rc-service x-ui stop 2> /dev/null
+    systemctl stop x-ui 2> /dev/null || rc-service x-ui stop 2> /dev/null
 
     if [[ ${cert_exists} -eq 0 ]]; then
         # issue the certificate
@@ -535,7 +437,7 @@ ssl_cert_issue() {
         if [ $? -ne 0 ]; then
             echo -e "${red}Issuing certificate failed, please check logs.${plain}"
             rm -rf ~/.acme.sh/${domain}
-            sudo systemctl start x-ui 2> /dev/null || sudo rc-service x-ui start 2> /dev/null
+            systemctl start x-ui 2> /dev/null || rc-service x-ui start 2> /dev/null
             return 1
         else
             echo -e "${green}Issuing certificate succeeded, installing certificates...${plain}"
@@ -545,19 +447,19 @@ ssl_cert_issue() {
     fi
 
     # Setup reload command
-    reloadCmd="sudo systemctl restart x-ui || sudo rc-service x-ui restart"
-    echo -e "${green}Default --reloadcmd for ACME is: ${yellow}sudo systemctl restart x-ui || sudo rc-service x-ui restart${plain}"
+    reloadCmd="systemctl restart x-ui || rc-service x-ui restart"
+    echo -e "${green}Default --reloadcmd for ACME is: ${yellow}systemctl restart x-ui || rc-service x-ui restart${plain}"
     echo -e "${green}This command will run on every certificate issue and renew.${plain}"
     read -rp "Would you like to modify --reloadcmd for ACME? (y/n): " setReloadcmd
     if [[ "$setReloadcmd" == "y" || "$setReloadcmd" == "Y" ]]; then
-        echo -e "\n${green}\t1.${plain} Preset: sudo systemctl reload nginx ; sudo systemctl restart x-ui"
+        echo -e "\n${green}\t1.${plain} Preset: systemctl reload nginx ; systemctl restart x-ui"
         echo -e "${green}\t2.${plain} Input your own command"
         echo -e "${green}\t0.${plain} Keep default reloadcmd"
         read -rp "Choose an option: " choice
         case "$choice" in
             1)
-                echo -e "${green}Reloadcmd is: sudo systemctl reload nginx ; sudo systemctl restart x-ui${plain}"
-                reloadCmd="sudo systemctl reload nginx ; sudo systemctl restart x-ui"
+                echo -e "${green}Reloadcmd is: systemctl reload nginx ; systemctl restart x-ui${plain}"
+                reloadCmd="systemctl reload nginx ; systemctl restart x-ui"
                 ;;
             2)
                 echo -e "${yellow}It's recommended to put x-ui restart at the end${plain}"
@@ -573,8 +475,8 @@ ssl_cert_issue() {
     # install the certificate
     local installOutput=""
     installOutput=$(~/.acme.sh/acme.sh --installcert -d ${domain} \
-        --key-file ${XUI_HOME}/cert/${domain}/privkey.pem \
-        --fullchain-file ${XUI_HOME}/cert/${domain}/fullchain.pem --reloadcmd "${reloadCmd}" 2>&1)
+        --key-file /root/cert/${domain}/privkey.pem \
+        --fullchain-file /root/cert/${domain}/fullchain.pem --reloadcmd "${reloadCmd}" 2>&1)
     local installRc=$?
     echo "${installOutput}"
 
@@ -583,14 +485,14 @@ ssl_cert_issue() {
         installWroteFiles=1
     fi
 
-    if [[ -f "${XUI_HOME}/cert/${domain}/privkey.pem" && -f "${XUI_HOME}/cert/${domain}/fullchain.pem" && (${installRc} -eq 0 || ${installWroteFiles} -eq 1) ]]; then
+    if [[ -f "/root/cert/${domain}/privkey.pem" && -f "/root/cert/${domain}/fullchain.pem" && (${installRc} -eq 0 || ${installWroteFiles} -eq 1) ]]; then
         echo -e "${green}Installing certificate succeeded, enabling auto renew...${plain}"
     else
         echo -e "${red}Installing certificate failed, exiting.${plain}"
         if [[ ${cert_exists} -eq 0 ]]; then
             rm -rf ~/.acme.sh/${domain}
         fi
-        sudo systemctl start x-ui 2> /dev/null || sudo rc-service x-ui start 2> /dev/null
+        systemctl start x-ui 2> /dev/null || rc-service x-ui start 2> /dev/null
         return 1
     fi
 
@@ -598,31 +500,26 @@ ssl_cert_issue() {
     ~/.acme.sh/acme.sh --upgrade --auto-upgrade
     if [ $? -ne 0 ]; then
         echo -e "${yellow}Auto renew setup had issues, certificate details:${plain}"
-        ls -lah ${XUI_HOME}/cert/${domain}/
+        ls -lah /root/cert/${domain}/
         # Secure permissions: private key readable only by owner
         chmod 600 $certPath/privkey.pem 2> /dev/null
         chmod 644 $certPath/fullchain.pem 2> /dev/null
     else
         echo -e "${green}Auto renew succeeded, certificate details:${plain}"
-        ls -lah ${XUI_HOME}/cert/${domain}/
+        ls -lah /root/cert/${domain}/
         # Secure permissions: private key readable only by owner
         chmod 600 $certPath/privkey.pem 2> /dev/null
         chmod 644 $certPath/fullchain.pem 2> /dev/null
     fi
-    # The panel runs as x-ui, so it must own the certificate files when the
-    # installer runs as root (acme.sh then writes them as root).
-    if [[ $EUID -eq 0 ]]; then
-        chown -R "${XUI_USER}:${XUI_USER}" "$certPath"
-    fi
 
     # start panel
-    sudo systemctl start x-ui 2> /dev/null || sudo rc-service x-ui start 2> /dev/null
+    systemctl start x-ui 2> /dev/null || rc-service x-ui start 2> /dev/null
 
     # Prompt user to set panel paths after successful certificate installation
     read -rp "Would you like to set this certificate for the panel? (y/n): " setPanel
     if [[ "$setPanel" == "y" || "$setPanel" == "Y" ]]; then
-        local webCertFile="${XUI_HOME}/cert/${domain}/fullchain.pem"
-        local webKeyFile="${XUI_HOME}/cert/${domain}/privkey.pem"
+        local webCertFile="/root/cert/${domain}/fullchain.pem"
+        local webKeyFile="/root/cert/${domain}/privkey.pem"
 
         if [[ -f "$webCertFile" && -f "$webKeyFile" ]]; then
             ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile"
@@ -632,7 +529,7 @@ ssl_cert_issue() {
             echo ""
             echo -e "${green}Access URL: https://${domain}:${existing_port}/${existing_webBasePath}${plain}"
             echo -e "${yellow}Panel will restart to apply SSL certificate...${plain}"
-            sudo systemctl restart x-ui 2> /dev/null || sudo rc-service x-ui restart 2> /dev/null
+            systemctl restart x-ui 2> /dev/null || rc-service x-ui restart 2> /dev/null
         else
             echo -e "${red}Error: Certificate or private key file not found for domain: $domain.${plain}"
         fi
@@ -698,9 +595,9 @@ prompt_and_setup_ssl() {
 
             # Stop panel if running (port 80 needed)
             if [[ $release == "alpine" ]]; then
-                sudo rc-service x-ui stop > /dev/null 2>&1
+                rc-service x-ui stop > /dev/null 2>&1
             else
-                sudo systemctl stop x-ui > /dev/null 2>&1
+                systemctl stop x-ui > /dev/null 2>&1
             fi
 
             setup_ip_certificate "${server_ip}" "${ipv6_addr}"
@@ -770,7 +667,7 @@ prompt_and_setup_ssl() {
             echo -e "${green}✓ Custom certificate paths applied.${plain}"
             echo -e "${yellow}Note: You are responsible for renewing these files externally.${plain}"
 
-            sudo systemctl restart x-ui > /dev/null 2>&1 || sudo rc-service x-ui restart > /dev/null 2>&1
+            systemctl restart x-ui > /dev/null 2>&1 || rc-service x-ui restart > /dev/null 2>&1
             ;;
         *)
             echo -e "${red}Invalid option. Skipping SSL setup.${plain}"
@@ -894,13 +791,7 @@ config_after_install() {
 }
 
 install_x-ui() {
-    # Download and extract in a scratch dir owned by x-ui; privileged paths
-    # (/usr/local, /etc, /usr/bin) are only touched through sudo, and the
-    # installed tree is chowned to x-ui so the panel can run as x-ui.
-    local work_dir
-    work_dir=$(mktemp -d)
-    trap "rm -rf ${work_dir}" EXIT
-    cd "$work_dir" || exit 1
+    cd ${xui_folder%/x-ui}/
 
     # Download resources
     if [ $# == 0 ]; then
@@ -914,12 +805,12 @@ install_x-ui() {
             fi
         fi
         echo -e "Got x-ui latest version: ${tag_version}, beginning the installation..."
-        curl -4fLRo x-ui-linux-$(arch).tar.gz https://github.com/yodit10124/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz
+        curl -4fLRo ${xui_folder}-linux-$(arch).tar.gz https://github.com/yodit10124/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz
         if [[ $? -ne 0 ]]; then
             echo -e "${red}Downloading x-ui failed, please be sure that your server can access GitHub ${plain}"
             exit 1
         fi
-        verify_tarball_sha256 x-ui-linux-$(arch).tar.gz
+        verify_tarball_sha256 ${xui_folder}-linux-$(arch).tar.gz
     else
         tag_version=$1
         tag_version_numeric=${tag_version#v}
@@ -932,14 +823,14 @@ install_x-ui() {
 
         url="https://github.com/yodit10124/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz"
         echo -e "Beginning to install x-ui $1"
-        curl -4fLRo x-ui-linux-$(arch).tar.gz ${url}
+        curl -4fLRo ${xui_folder}-linux-$(arch).tar.gz ${url}
         if [[ $? -ne 0 ]]; then
             echo -e "${red}Download x-ui $1 failed, please check if the version exists ${plain}"
             exit 1
         fi
-        verify_tarball_sha256 x-ui-linux-$(arch).tar.gz
+        verify_tarball_sha256 ${xui_folder}-linux-$(arch).tar.gz
     fi
-    curl -4fLRo x-ui-temp https://raw.githubusercontent.com/yodit10124/3x-ui/main/x-ui.sh
+    curl -4fLRo /usr/bin/x-ui-temp https://raw.githubusercontent.com/yodit10124/3x-ui/main/x-ui.sh
     if [[ $? -ne 0 ]]; then
         echo -e "${red}Failed to download x-ui.sh${plain}"
         exit 1
@@ -948,11 +839,11 @@ install_x-ui() {
     # Stop x-ui service and remove old resources
     if [[ -e ${xui_folder}/ ]]; then
         if [[ $release == "alpine" ]]; then
-            sudo rc-service x-ui stop
+            rc-service x-ui stop
         else
-            sudo systemctl stop x-ui
+            systemctl stop x-ui
         fi
-        sudo rm -rf "${xui_folder}"
+        rm ${xui_folder}/ -rf
     fi
 
     # Extract resources and set permissions
@@ -970,59 +861,42 @@ install_x-ui() {
     fi
     chmod +x x-ui bin/xray-linux-$(arch)
 
-    # Install the tree into place, owned by x-ui
-    sudo mkdir -p "${xui_folder}" /etc/x-ui /var/log/x-ui
-    sudo cp -a . "${xui_folder}/"
-    sudo chown -R "${XUI_USER}:${XUI_USER}" "${xui_folder}" /etc/x-ui /var/log/x-ui
-
-    # Update x-ui cli and set permission
-    sudo mv -f "${work_dir}/x-ui-temp" /usr/bin/x-ui
-    sudo chmod +x /usr/bin/x-ui
+    # Update x-ui cli and se set permission
+    mv -f /usr/bin/x-ui-temp /usr/bin/x-ui
+    chmod +x /usr/bin/x-ui
+    mkdir -p /var/log/x-ui
     config_after_install
-
-    # config_after_install runs the panel binary (x-ui setting/cert), which
-    # creates /etc/x-ui/x-ui.db when it does not exist yet. When the
-    # installer runs as root that database is created root-owned, and the
-    # panel (which runs as x-ui) then cannot write to it -- it fails with
-    # "attempt to write a readonly database" and Xray cannot start. Fix
-    # the ownership again here, before the service starts.
-    sudo chown -R "${XUI_USER}:${XUI_USER}" "${xui_folder}" /etc/x-ui /var/log/x-ui
 
     # Etckeeper compatibility
     if [ -d "/etc/.git" ]; then
         if [ -f "/etc/.gitignore" ]; then
             if ! grep -q "x-ui/x-ui.db" "/etc/.gitignore"; then
-                echo "" | sudo tee -a "/etc/.gitignore" > /dev/null
-                echo "x-ui/x-ui.db" | sudo tee -a "/etc/.gitignore" > /dev/null
+                echo "" >> "/etc/.gitignore"
+                echo "x-ui/x-ui.db" >> "/etc/.gitignore"
                 echo -e "${green}Added x-ui.db to /etc/.gitignore for etckeeper${plain}"
             fi
         else
-            echo "x-ui/x-ui.db" | sudo tee "/etc/.gitignore" > /dev/null
+            echo "x-ui/x-ui.db" > "/etc/.gitignore"
             echo -e "${green}Created /etc/.gitignore and added x-ui.db for etckeeper${plain}"
         fi
     fi
 
     if [[ $release == "alpine" ]]; then
-        curl -4fLRo x-ui.rc https://raw.githubusercontent.com/yodit10124/3x-ui/main/x-ui.rc
+        curl -4fLRo /etc/init.d/x-ui https://raw.githubusercontent.com/yodit10124/3x-ui/main/x-ui.rc
         if [[ $? -ne 0 ]]; then
             echo -e "${red}Failed to download x-ui.rc${plain}"
             exit 1
         fi
-        sudo cp -f x-ui.rc /etc/init.d/x-ui
-        sudo chmod +x /etc/init.d/x-ui
-        sudo rc-update add x-ui
-        # Passwordless sudo for the x-ui service (see the systemd branch
-        # below): installed after the privileged file operations, so the
-        # narrow rules do not block them. rc-service x-ui is in that list.
-        setup_sudoers || exit 1
-        sudo rc-service x-ui start
+        chmod +x /etc/init.d/x-ui
+        rc-update add x-ui
+        rc-service x-ui start
     else
         # Install systemd service file
         service_installed=false
 
         if [ -f "x-ui.service" ]; then
             echo -e "${green}Found x-ui.service in extracted files, installing...${plain}"
-            sudo cp -f x-ui.service ${xui_service}/ > /dev/null 2>&1
+            cp -f x-ui.service ${xui_service}/ > /dev/null 2>&1
             if [[ $? -eq 0 ]]; then
                 service_installed=true
             fi
@@ -1033,7 +907,7 @@ install_x-ui() {
                 ubuntu | debian | armbian)
                     if [ -f "x-ui.service.debian" ]; then
                         echo -e "${green}Found x-ui.service.debian in extracted files, installing...${plain}"
-                        sudo cp -f x-ui.service.debian ${xui_service}/x-ui.service > /dev/null 2>&1
+                        cp -f x-ui.service.debian ${xui_service}/x-ui.service > /dev/null 2>&1
                         if [[ $? -eq 0 ]]; then
                             service_installed=true
                         fi
@@ -1042,7 +916,7 @@ install_x-ui() {
                 arch | manjaro | parch)
                     if [ -f "x-ui.service.arch" ]; then
                         echo -e "${green}Found x-ui.service.arch in extracted files, installing...${plain}"
-                        sudo cp -f x-ui.service.arch ${xui_service}/x-ui.service > /dev/null 2>&1
+                        cp -f x-ui.service.arch ${xui_service}/x-ui.service > /dev/null 2>&1
                         if [[ $? -eq 0 ]]; then
                             service_installed=true
                         fi
@@ -1051,7 +925,7 @@ install_x-ui() {
                 *)
                     if [ -f "x-ui.service.rhel" ]; then
                         echo -e "${green}Found x-ui.service.rhel in extracted files, installing...${plain}"
-                        sudo cp -f x-ui.service.rhel ${xui_service}/x-ui.service > /dev/null 2>&1
+                        cp -f x-ui.service.rhel ${xui_service}/x-ui.service > /dev/null 2>&1
                         if [[ $? -eq 0 ]]; then
                             service_installed=true
                         fi
@@ -1065,13 +939,13 @@ install_x-ui() {
             echo -e "${yellow}Service files not found in tar.gz, downloading from GitHub...${plain}"
             case "${release}" in
                 ubuntu | debian | armbian)
-                    curl -4fLRo x-ui.service.dl https://raw.githubusercontent.com/yodit10124/3x-ui/main/x-ui.service.debian > /dev/null 2>&1
+                    curl -4fLRo ${xui_service}/x-ui.service https://raw.githubusercontent.com/yodit10124/3x-ui/main/x-ui.service.debian > /dev/null 2>&1
                     ;;
                 arch | manjaro | parch)
-                    curl -4fLRo x-ui.service.dl https://raw.githubusercontent.com/yodit10124/3x-ui/main/x-ui.service.arch > /dev/null 2>&1
+                    curl -4fLRo ${xui_service}/x-ui.service https://raw.githubusercontent.com/yodit10124/3x-ui/main/x-ui.service.arch > /dev/null 2>&1
                     ;;
                 *)
-                    curl -4fLRo x-ui.service.dl https://raw.githubusercontent.com/yodit10124/3x-ui/main/x-ui.service.rhel > /dev/null 2>&1
+                    curl -4fLRo ${xui_service}/x-ui.service https://raw.githubusercontent.com/yodit10124/3x-ui/main/x-ui.service.rhel > /dev/null 2>&1
                     ;;
             esac
 
@@ -1079,24 +953,16 @@ install_x-ui() {
                 echo -e "${red}Failed to install x-ui.service from GitHub${plain}"
                 exit 1
             fi
-            sudo cp -f x-ui.service.dl ${xui_service}/x-ui.service > /dev/null 2>&1
             service_installed=true
         fi
 
         if [ "$service_installed" = true ]; then
             echo -e "${green}Setting up systemd unit...${plain}"
-            sudo chown root:root ${xui_service}/x-ui.service > /dev/null 2>&1
-            sudo chmod 644 ${xui_service}/x-ui.service > /dev/null 2>&1
-            # Passwordless sudo for the x-ui service (used by the x-ui CLI
-            # and acme auto-renew). It runs here, after all privileged
-            # file operations: once the narrow rules are in place, only
-            # the service-management commands below are still allowed
-            # through sudo, and daemon-reload/enable/start are all in
-            # that list.
-            setup_sudoers || exit 1
-            sudo systemctl daemon-reload
-            sudo systemctl enable x-ui
-            sudo systemctl start x-ui
+            chown root:root ${xui_service}/x-ui.service > /dev/null 2>&1
+            chmod 644 ${xui_service}/x-ui.service > /dev/null 2>&1
+            systemctl daemon-reload
+            systemctl enable x-ui
+            systemctl start x-ui
         else
             echo -e "${red}Failed to install x-ui.service file${plain}"
             exit 1

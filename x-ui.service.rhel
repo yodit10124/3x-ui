@@ -7,12 +7,6 @@ Wants=network.target
 EnvironmentFile=-/etc/sysconfig/x-ui
 Environment="XRAY_VMESS_AEAD_FORCED=false"
 Type=simple
-# The panel and Xray run as the dedicated unprivileged user "x-ui" (see
-# install.sh, which refuses to install as root). CAP_NET_BIND_SERVICE lets
-# inbounds listen on privileged ports (<1024, e.g. 443) without root.
-User=x-ui
-Group=x-ui
-AmbientCapabilities=CAP_NET_BIND_SERVICE
 WorkingDirectory=/usr/local/x-ui/
 ExecStart=/usr/local/x-ui/x-ui
 ExecReload=kill -USR1 $MAINPID

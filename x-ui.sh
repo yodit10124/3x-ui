@@ -50,57 +50,8 @@ is_domain() {
     [[ "$1" =~ ^([A-Za-z0-9](-*[A-Za-z0-9])*\.)+(xn--[a-z0-9]{2,}|[A-Za-z]{2,})$ ]] && return 0 || return 1
 }
 
-
-# The x-ui CLI manages a panel that runs as the dedicated unprivileged
-# user "x-ui", and running the CLI as that user is recommended. Running
-# it as root is also allowed, but only with the warning below; any other
-# user is refused. Root is used only through sudo for the privileged
-# steps (service control, package install, /etc, /usr/bin) -- as root the
-# sudo calls are no-ops, as x-ui they escalate.
-XUI_USER="x-ui"
-if [[ $EUID -eq 0 ]]; then
-    echo -e "${red}WARNING: You are running x-ui as root. It is recommended to run it as the dedicated unprivileged user '${XUI_USER}' instead:${plain}"
-    echo -e "  sudo useradd -m -s /bin/bash ${XUI_USER}"
-    echo -e "  sudo usermod -aG sudo ${XUI_USER}   # ${XUI_USER} needs sudo for apt/systemctl"
-    echo -e "  sudo -u ${XUI_USER} x-ui"
-    echo -e ""
-elif [[ "$(id -un)" != "${XUI_USER}" ]]; then
-    LOGE "This script must be run as root or as user '${XUI_USER}', not '$(id -un)'."
-    LOGE "Either run it as root, or create the user first (as root): sudo useradd -m -s /bin/bash ${XUI_USER}; sudo usermod -aG sudo ${XUI_USER}"
-    LOGE "Then run: sudo -u ${XUI_USER} x-ui"
-    exit 1
-fi
-# sudo is required for the privileged steps when running as x-ui; root
-# does not need it. Prefer a non-interactive check so a passwordless
-# setup never prompts; fall back to sudo -v, which may ask for a password
-# once and cache it, for the interactive setup. Both fail when x-ui is in
-# the sudo group AND has a NOPASSWD drop-in (sudo -v then needs a password
-# but has no terminal), so do not combine the two in a non-interactive run.
-if [[ $EUID -ne 0 ]]; then
-    if ! command -v sudo >/dev/null 2>&1; then
-        LOGE "sudo is required to run x-ui as user '${XUI_USER}'. Install sudo first."
-        exit 1
-    fi
-    if ! sudo -n true 2>/dev/null && ! sudo -v; then
-        LOGE "sudo is not usable for user '${XUI_USER}' in this session."
-        LOGE "If '${XUI_USER}' is in the sudo group and also has a NOPASSWD sudoers file, remove it from the sudo group; or run x-ui interactively and enter the password when asked."
-        exit 1
-    fi
-fi
-
-# Certificates must live where the panel (running as x-ui) can read them,
-# no matter whether the CLI runs as root or as x-ui.
-if [[ $EUID -eq 0 ]]; then
-    if ! id "${XUI_USER}" &>/dev/null; then
-        useradd -m -s /bin/bash "${XUI_USER}" || {
-            LOGE "Failed to create user '${XUI_USER}'."
-            exit 1
-        }
-    fi
-    XUI_HOME="$(getent passwd "${XUI_USER}" | cut -d: -f6)"
-else
-    XUI_HOME="${HOME}"
-fi
+# check root
+[[ $EUID -ne 0 ]] && LOGE "ERROR: You must be root to run this script! \n" && exit 1
 
 # Check OS and set release variable
 if [[ -f /etc/os-release ]]; then
@@ -194,10 +145,9 @@ update_menu() {
         return 0
     fi
 
-    curl -fLRo /tmp/x-ui-new https://raw.githubusercontent.com/yodit10124/3x-ui/main/x-ui.sh
-    sudo mv -f /tmp/x-ui-new /usr/bin/x-ui
+    curl -fLRo /usr/bin/x-ui https://raw.githubusercontent.com/yodit10124/3x-ui/main/x-ui.sh
     chmod +x ${xui_folder}/x-ui.sh
-    sudo chmod +x /usr/bin/x-ui
+    chmod +x /usr/bin/x-ui
 
     if [[ $? == 0 ]]; then
         echo -e "${green}Update successful. The panel has automatically restarted.${plain}"
@@ -243,19 +193,19 @@ uninstall() {
     fi
 
     if [[ $release == "alpine" ]]; then
-        sudo rc-service x-ui stop
-        sudo rc-update del x-ui
+        rc-service x-ui stop
+        rc-update del x-ui
         rm /etc/init.d/x-ui -f
     else
-        sudo systemctl stop x-ui
-        sudo systemctl disable x-ui
-        sudo rm -f ${xui_service}/x-ui.service
-        sudo systemctl daemon-reload
-        sudo systemctl reset-failed
+        systemctl stop x-ui
+        systemctl disable x-ui
+        rm ${xui_service}/x-ui.service -f
+        systemctl daemon-reload
+        systemctl reset-failed
     fi
 
-    sudo rm -rf /etc/x-ui/
-    sudo rm -rf "${xui_folder}/"
+    rm /etc/x-ui/ -rf
+    rm ${xui_folder}/ -rf
 
     echo ""
     echo -e "Uninstalled Successfully.\n"
@@ -402,9 +352,9 @@ start() {
         LOGI "Panel is running, No need to start again, If you need to restart, please select restart"
     else
         if [[ $release == "alpine" ]]; then
-            sudo rc-service x-ui start
+            rc-service x-ui start
         else
-            sudo systemctl start x-ui
+            systemctl start x-ui
         fi
         sleep 2
         check_status
@@ -427,9 +377,9 @@ stop() {
         LOGI "Panel stopped, No need to stop again!"
     else
         if [[ $release == "alpine" ]]; then
-            sudo rc-service x-ui stop
+            rc-service x-ui stop
         else
-            sudo systemctl stop x-ui
+            systemctl stop x-ui
         fi
         sleep 2
         check_status
@@ -447,9 +397,9 @@ stop() {
 
 restart() {
     if [[ $release == "alpine" ]]; then
-        sudo rc-service x-ui restart
+        rc-service x-ui restart
     else
-        sudo systemctl restart x-ui
+        systemctl restart x-ui
     fi
     sleep 2
     check_status
@@ -464,7 +414,7 @@ restart() {
 }
 
 restart_xray() {
-    sudo systemctl reload x-ui
+    systemctl reload x-ui
     LOGI "xray-core Restart signal sent successfully, Please check the log information to confirm whether xray restarted successfully"
     sleep 2
     show_xray_status
@@ -475,9 +425,9 @@ restart_xray() {
 
 status() {
     if [[ $release == "alpine" ]]; then
-        sudo rc-service x-ui status
+        rc-service x-ui status
     else
-        sudo systemctl status x-ui -l
+        systemctl status x-ui -l
     fi
     if [[ $# == 0 ]]; then
         before_show_menu
@@ -486,9 +436,9 @@ status() {
 
 enable() {
     if [[ $release == "alpine" ]]; then
-        sudo rc-update add x-ui default
+        rc-update add x-ui default
     else
-        sudo systemctl enable x-ui
+        systemctl enable x-ui
     fi
     if [[ $? == 0 ]]; then
         LOGI "x-ui Set to boot automatically on startup successfully"
@@ -503,9 +453,9 @@ enable() {
 
 disable() {
     if [[ $release == "alpine" ]]; then
-        sudo rc-update del x-ui
+        rc-update del x-ui
     else
-        sudo systemctl disable x-ui
+        systemctl disable x-ui
     fi
     if [[ $? == 0 ]]; then
         LOGI "x-ui Autostart Cancelled successfully"
@@ -550,7 +500,7 @@ show_log() {
                 show_menu
                 ;;
             1)
-                sudo journalctl -u x-ui -e --no-pager -f -p debug
+                journalctl -u x-ui -e --no-pager -f -p debug
                 if [[ $# == 0 ]]; then
                     before_show_menu
                 fi
@@ -602,16 +552,16 @@ disable_bbr() {
 
     if [ -f "/etc/sysctl.d/99-bbr-x-ui.conf" ]; then
         old_settings=$(head -1 /etc/sysctl.d/99-bbr-x-ui.conf | tr -d '#')
-        sudo sysctl -w net.core.default_qdisc="${old_settings%:*}"
-        sudo sysctl -w net.ipv4.tcp_congestion_control="${old_settings#*:}"
-        sudo rm /etc/sysctl.d/99-bbr-x-ui.conf
-        sudo sysctl --system
+        sysctl -w net.core.default_qdisc="${old_settings%:*}"
+        sysctl -w net.ipv4.tcp_congestion_control="${old_settings#*:}"
+        rm /etc/sysctl.d/99-bbr-x-ui.conf
+        sysctl --system
     else
         # Replace BBR with CUBIC configurations
         if [ -f "/etc/sysctl.conf" ]; then
-            sudo sed -i 's/net.core.default_qdisc=fq/net.core.default_qdisc=pfifo_fast/' /etc/sysctl.conf
-            sudo sed -i 's/net.ipv4.tcp_congestion_control=bbr/net.ipv4.tcp_congestion_control=cubic/' /etc/sysctl.conf
-            sudo sysctl -p
+            sed -i 's/net.core.default_qdisc=fq/net.core.default_qdisc=pfifo_fast/' /etc/sysctl.conf
+            sed -i 's/net.ipv4.tcp_congestion_control=bbr/net.ipv4.tcp_congestion_control=cubic/' /etc/sysctl.conf
+            sysctl -p
         fi
     fi
 
@@ -634,19 +584,19 @@ enable_bbr() {
             echo "#$(sysctl -n net.core.default_qdisc):$(sysctl -n net.ipv4.tcp_congestion_control)"
             echo "net.core.default_qdisc = fq"
             echo "net.ipv4.tcp_congestion_control = bbr"
-        } | sudo tee "/etc/sysctl.d/99-bbr-x-ui.conf" > /dev/null
+        } > "/etc/sysctl.d/99-bbr-x-ui.conf"
         if [ -f "/etc/sysctl.conf" ]; then
             # Backup old settings from sysctl.conf, if any
-            sudo sed -i 's/^net.core.default_qdisc/# &/' /etc/sysctl.conf
-            sudo sed -i 's/^net.ipv4.tcp_congestion_control/# &/' /etc/sysctl.conf
+            sed -i 's/^net.core.default_qdisc/# &/' /etc/sysctl.conf
+            sed -i 's/^net.ipv4.tcp_congestion_control/# &/' /etc/sysctl.conf
         fi
-        sudo sysctl --system
+        sysctl --system
     else
-        sudo sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-        sudo sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-        echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.conf
-        sudo sysctl -p
+        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+        echo "net.core.default_qdisc=fq" | tee -a /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" | tee -a /etc/sysctl.conf
+        sysctl -p
     fi
 
     # Verify that BBR is enabled
@@ -658,14 +608,13 @@ enable_bbr() {
 }
 
 update_shell() {
-    curl -fLRo /tmp/x-ui-new -z /usr/bin/x-ui https://github.com/yodit10124/3x-ui/raw/main/x-ui.sh
+    curl -fLRo /usr/bin/x-ui -z /usr/bin/x-ui https://github.com/yodit10124/3x-ui/raw/main/x-ui.sh
     if [[ $? != 0 ]]; then
         echo ""
         LOGE "Failed to download script, Please check whether the machine can connect Github"
         before_show_menu
     else
-        sudo mv -f /tmp/x-ui-new /usr/bin/x-ui
-        sudo chmod +x /usr/bin/x-ui
+        chmod +x /usr/bin/x-ui
         LOGI "Upgrade script succeeded, Please rerun the script"
         before_show_menu
     fi
@@ -677,7 +626,7 @@ check_status() {
         if [[ ! -f /etc/init.d/x-ui ]]; then
             return 2
         fi
-        if [[ $(sudo rc-service x-ui status | grep -F 'status: started' -c) == 1 ]]; then
+        if [[ $(rc-service x-ui status | grep -F 'status: started' -c) == 1 ]]; then
             return 0
         else
             return 1
@@ -686,7 +635,7 @@ check_status() {
         if [[ ! -f ${xui_service}/x-ui.service ]]; then
             return 2
         fi
-        temp=$(sudo systemctl status x-ui | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
+        temp=$(systemctl status x-ui | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
         if [[ "${temp}" == "running" ]]; then
             return 0
         else
@@ -697,13 +646,13 @@ check_status() {
 
 check_enabled() {
     if [[ $release == "alpine" ]]; then
-        if [[ $(sudo rc-update show | grep -F 'x-ui' | grep default -c) == 1 ]]; then
+        if [[ $(rc-update show | grep -F 'x-ui' | grep default -c) == 1 ]]; then
             return 0
         else
             return 1
         fi
     else
-        temp=$(sudo systemctl is-enabled x-ui)
+        temp=$(systemctl is-enabled x-ui)
         if [[ "${temp}" == "enabled" ]]; then
             return 0
         else
@@ -804,7 +753,7 @@ firewall_menu() {
             firewall_menu
             ;;
         2)
-            sudo ufw status numbered
+            ufw status numbered
             firewall_menu
             ;;
         3)
@@ -816,15 +765,15 @@ firewall_menu() {
             firewall_menu
             ;;
         5)
-            sudo ufw enable
+            ufw enable
             firewall_menu
             ;;
         6)
-            sudo ufw disable
+            ufw disable
             firewall_menu
             ;;
         7)
-            sudo ufw status verbose
+            ufw status verbose
             firewall_menu
             ;;
         *)
@@ -836,27 +785,27 @@ firewall_menu() {
 
 install_firewall() {
     if ! command -v ufw &> /dev/null; then
-        echo "sudo ufw firewall is not installed. Installing now..."
-        sudo apt-get update
-        sudo apt-get install -y ufw
+        echo "ufw firewall is not installed. Installing now..."
+        apt-get update
+        apt-get install -y ufw
     else
-        echo "sudo ufw firewall is already installed"
+        echo "ufw firewall is already installed"
     fi
 
     # Check if the firewall is inactive
-    if sudo ufw status | grep -q "Status: active"; then
+    if ufw status | grep -q "Status: active"; then
         echo "Firewall is already active"
     else
         echo "Activating firewall..."
         # Open the necessary ports
-        sudo ufw allow ssh
-        sudo ufw allow http
-        sudo ufw allow https
-        sudo ufw allow 2053/tcp #webPort
-        sudo ufw allow 2096/tcp #subport
+        ufw allow ssh
+        ufw allow http
+        ufw allow https
+        ufw allow 2053/tcp #webPort
+        ufw allow 2096/tcp #subport
 
         # Enable the firewall
-        sudo ufw --force enable
+        ufw --force enable
     fi
 }
 
@@ -878,11 +827,11 @@ open_ports() {
             start_port=$(echo $port | cut -d'-' -f1)
             end_port=$(echo $port | cut -d'-' -f2)
             # Open the port range
-            sudo ufw allow $start_port:$end_port/tcp
-            sudo ufw allow $start_port:$end_port/udp
+            ufw allow $start_port:$end_port/tcp
+            ufw allow $start_port:$end_port/udp
         else
             # Open the single port
-            sudo ufw allow "$port"
+            ufw allow "$port"
         fi
     done
 
@@ -893,10 +842,10 @@ open_ports() {
             start_port=$(echo $port | cut -d'-' -f1)
             end_port=$(echo $port | cut -d'-' -f2)
             # Check if the port range has been successfully opened
-            (sudo ufw status | grep -q "$start_port:$end_port") && echo "$start_port-$end_port"
+            (ufw status | grep -q "$start_port:$end_port") && echo "$start_port-$end_port"
         else
             # Check if the individual port has been successfully opened
-            (sudo ufw status | grep -q "$port") && echo "$port"
+            (ufw status | grep -q "$port") && echo "$port"
         fi
     done
 }
@@ -904,7 +853,7 @@ open_ports() {
 delete_ports() {
     # Display current rules with numbers
     echo "Current UFW rules:"
-    sudo ufw status numbered
+    ufw status numbered
 
     # Ask the user how they want to delete rules
     echo "Do you want to delete rules by:"
@@ -926,7 +875,7 @@ delete_ports() {
         IFS=',' read -ra RULE_NUMBERS <<< "$rule_numbers"
         for rule_number in "${RULE_NUMBERS[@]}"; do
             # Delete the rule by number
-            sudo ufw delete "$rule_number" || echo "Failed to delete rule number $rule_number"
+            ufw delete "$rule_number" || echo "Failed to delete rule number $rule_number"
         done
 
         echo "Selected rules have been deleted."
@@ -949,11 +898,11 @@ delete_ports() {
                 start_port=$(echo $port | cut -d'-' -f1)
                 end_port=$(echo $port | cut -d'-' -f2)
                 # Delete the port range
-                sudo ufw delete allow $start_port:$end_port/tcp
-                sudo ufw delete allow $start_port:$end_port/udp
+                ufw delete allow $start_port:$end_port/tcp
+                ufw delete allow $start_port:$end_port/udp
             else
                 # Delete a single port
-                sudo ufw delete allow "$port"
+                ufw delete allow "$port"
             fi
         done
 
@@ -964,10 +913,10 @@ delete_ports() {
                 start_port=$(echo $port | cut -d'-' -f1)
                 end_port=$(echo $port | cut -d'-' -f2)
                 # Check if the port range has been deleted
-                (sudo ufw status | grep -q "$start_port:$end_port") || echo "$start_port-$end_port"
+                (ufw status | grep -q "$start_port:$end_port") || echo "$start_port-$end_port"
             else
                 # Check if the individual port has been deleted
-                (sudo ufw status | grep -q "$port") || echo "$port"
+                (ufw status | grep -q "$port") || echo "$port"
             fi
         done
     else
@@ -1086,7 +1035,7 @@ ssl_cert_issue_main() {
             ssl_cert_issue_main
             ;;
         2)
-            local domains=$(find ${XUI_HOME}/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+            local domains=$(find /root/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
             if [ -z "$domains" ]; then
                 echo "No certificates found to revoke."
             else
@@ -1103,7 +1052,7 @@ ssl_cert_issue_main() {
             ssl_cert_issue_main
             ;;
         3)
-            local domains=$(find ${XUI_HOME}/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+            local domains=$(find /root/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
             if [ -z "$domains" ]; then
                 echo "No certificates found to renew."
             else
@@ -1120,14 +1069,14 @@ ssl_cert_issue_main() {
             ssl_cert_issue_main
             ;;
         4)
-            local domains=$(find ${XUI_HOME}/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+            local domains=$(find /root/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
             if [ -z "$domains" ]; then
                 echo "No certificates found."
             else
                 echo "Existing domains and their paths:"
                 for domain in $domains; do
-                    local cert_path="${XUI_HOME}/cert/${domain}/fullchain.pem"
-                    local key_path="${XUI_HOME}/cert/${domain}/privkey.pem"
+                    local cert_path="/root/cert/${domain}/fullchain.pem"
+                    local key_path="/root/cert/${domain}/privkey.pem"
                     if [[ -f "${cert_path}" && -f "${key_path}" ]]; then
                         echo -e "Domain: ${domain}"
                         echo -e "\tCertificate Path: ${cert_path}"
@@ -1140,7 +1089,7 @@ ssl_cert_issue_main() {
             ssl_cert_issue_main
             ;;
         5)
-            local domains=$(find ${XUI_HOME}/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+            local domains=$(find /root/cert/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
             if [ -z "$domains" ]; then
                 echo "No certificates found."
             else
@@ -1149,8 +1098,8 @@ ssl_cert_issue_main() {
                 read -rp "Please choose a domain to set the panel paths: " domain
 
                 if echo "$domains" | grep -qw "$domain"; then
-                    local webCertFile="${XUI_HOME}/cert/${domain}/fullchain.pem"
-                    local webKeyFile="${XUI_HOME}/cert/${domain}/privkey.pem"
+                    local webCertFile="/root/cert/${domain}/fullchain.pem"
+                    local webKeyFile="/root/cert/${domain}/privkey.pem"
 
                     if [[ -f "${webCertFile}" && -f "${webKeyFile}" ]]; then
                         ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile"
@@ -1224,26 +1173,26 @@ ssl_cert_issue_for_ip() {
     # install socat
     case "${release}" in
         ubuntu | debian | armbian)
-            sudo apt-get update > /dev/null 2>&1 && sudo apt-get install socat -y > /dev/null 2>&1
+            apt-get update > /dev/null 2>&1 && apt-get install socat -y > /dev/null 2>&1
             ;;
         fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
-            sudo dnf -y update > /dev/null 2>&1 && sudo dnf -y install socat > /dev/null 2>&1
+            dnf -y update > /dev/null 2>&1 && dnf -y install socat > /dev/null 2>&1
             ;;
         centos)
             if [[ "${VERSION_ID}" =~ ^7 ]]; then
-                sudo yum -y update > /dev/null 2>&1 && sudo yum -y install socat > /dev/null 2>&1
+                yum -y update > /dev/null 2>&1 && yum -y install socat > /dev/null 2>&1
             else
-                sudo dnf -y update > /dev/null 2>&1 && sudo dnf -y install socat > /dev/null 2>&1
+                dnf -y update > /dev/null 2>&1 && dnf -y install socat > /dev/null 2>&1
             fi
             ;;
         arch | manjaro | parch)
-            sudo pacman -Sy --noconfirm socat > /dev/null 2>&1
+            pacman -Sy --noconfirm socat > /dev/null 2>&1
             ;;
         opensuse-tumbleweed | opensuse-leap)
-            sudo zypper refresh > /dev/null 2>&1 && sudo zypper -q install -y socat > /dev/null 2>&1
+            zypper refresh > /dev/null 2>&1 && zypper -q install -y socat > /dev/null 2>&1
             ;;
         alpine)
-            sudo apk add socat curl openssl > /dev/null 2>&1
+            apk add socat curl openssl > /dev/null 2>&1
             ;;
         *)
             LOGW "Unsupported OS for automatic socat installation"
@@ -1251,7 +1200,7 @@ ssl_cert_issue_for_ip() {
     esac
 
     # Create certificate directory
-    certPath="${XUI_HOME}/cert/ip"
+    certPath="/root/cert/ip"
     mkdir -p "$certPath"
 
     # Build domain arguments
@@ -1298,7 +1247,7 @@ ssl_cert_issue_for_ip() {
     done
 
     # Reload command - restarts panel after renewal
-    local reloadCmd="sudo systemctl restart x-ui 2>/dev/null || sudo rc-service x-ui restart 2>/dev/null"
+    local reloadCmd="systemctl restart x-ui 2>/dev/null || rc-service x-ui restart 2>/dev/null"
 
     # issue the certificate for IP with shortlived profile
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt --force
@@ -1347,11 +1296,6 @@ ssl_cert_issue_for_ip() {
     ~/.acme.sh/acme.sh --upgrade --auto-upgrade > /dev/null 2>&1
     chmod 600 $certPath/privkey.pem 2> /dev/null
     chmod 644 $certPath/fullchain.pem 2> /dev/null
-    # The panel runs as x-ui, so it must own the certificate files when the
-    # CLI runs as root (acme.sh then writes them as root).
-    if [[ $EUID -eq 0 ]]; then
-        chown -R "${XUI_USER}:${XUI_USER}" "$certPath"
-    fi
 
     # Set certificate paths for the panel
     local webCertFile="${certPath}/fullchain.pem"
@@ -1389,26 +1333,26 @@ ssl_cert_issue() {
     # install socat
     case "${release}" in
         ubuntu | debian | armbian)
-            sudo apt-get update > /dev/null 2>&1 && sudo apt-get install socat -y > /dev/null 2>&1
+            apt-get update > /dev/null 2>&1 && apt-get install socat -y > /dev/null 2>&1
             ;;
         fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
-            sudo dnf -y update > /dev/null 2>&1 && sudo dnf -y install socat > /dev/null 2>&1
+            dnf -y update > /dev/null 2>&1 && dnf -y install socat > /dev/null 2>&1
             ;;
         centos)
             if [[ "${VERSION_ID}" =~ ^7 ]]; then
-                sudo yum -y update > /dev/null 2>&1 && sudo yum -y install socat > /dev/null 2>&1
+                yum -y update > /dev/null 2>&1 && yum -y install socat > /dev/null 2>&1
             else
-                sudo dnf -y update > /dev/null 2>&1 && sudo dnf -y install socat > /dev/null 2>&1
+                dnf -y update > /dev/null 2>&1 && dnf -y install socat > /dev/null 2>&1
             fi
             ;;
         arch | manjaro | parch)
-            sudo pacman -Sy --noconfirm socat > /dev/null 2>&1
+            pacman -Sy --noconfirm socat > /dev/null 2>&1
             ;;
         opensuse-tumbleweed | opensuse-leap)
-            sudo zypper refresh > /dev/null 2>&1 && sudo zypper -q install -y socat > /dev/null 2>&1
+            zypper refresh > /dev/null 2>&1 && zypper -q install -y socat > /dev/null 2>&1
             ;;
         alpine)
-            sudo apk add socat curl openssl > /dev/null 2>&1
+            apk add socat curl openssl > /dev/null 2>&1
             ;;
         *)
             LOGW "Unsupported OS for automatic socat installation"
@@ -1454,7 +1398,7 @@ ssl_cert_issue() {
     fi
 
     # create a directory for the certificate
-    certPath="${XUI_HOME}/cert/${domain}"
+    certPath="/root/cert/${domain}"
     if [ ! -d "$certPath" ]; then
         mkdir -p "$certPath"
     else
@@ -1492,18 +1436,18 @@ ssl_cert_issue() {
     LOGI "This command will run on every certificate issue and renew."
     read -rp "Would you like to modify --reloadcmd for ACME? (y/n): " setReloadcmd
     if [[ "$setReloadcmd" == "y" || "$setReloadcmd" == "Y" ]]; then
-        echo -e "\n${green}\t1.${plain} Preset: sudo systemctl reload nginx ; x-ui restart"
+        echo -e "\n${green}\t1.${plain} Preset: systemctl reload nginx ; x-ui restart"
         echo -e "${green}\t2.${plain} Input your own command"
         echo -e "${green}\t0.${plain} Keep default reloadcmd"
         read -rp "Choose an option: " choice
         case "$choice" in
             1)
-                LOGI "Reloadcmd is: sudo systemctl reload nginx ; x-ui restart"
-                reloadCmd="sudo systemctl reload nginx ; x-ui restart"
+                LOGI "Reloadcmd is: systemctl reload nginx ; x-ui restart"
+                reloadCmd="systemctl reload nginx ; x-ui restart"
                 ;;
             2)
                 LOGD "It's recommended to put x-ui restart at the end, so it won't raise an error if other services fails"
-                read -rp "Please enter your reloadcmd (example: sudo systemctl reload nginx ; x-ui restart): " reloadCmd
+                read -rp "Please enter your reloadcmd (example: systemctl reload nginx ; x-ui restart): " reloadCmd
                 LOGI "Your reloadcmd is: ${reloadCmd}"
                 ;;
             *)
@@ -1515,8 +1459,8 @@ ssl_cert_issue() {
     # install the certificate
     local installOutput=""
     installOutput=$(~/.acme.sh/acme.sh --installcert -d ${domain} \
-        --key-file ${XUI_HOME}/cert/${domain}/privkey.pem \
-        --fullchain-file ${XUI_HOME}/cert/${domain}/fullchain.pem --reloadcmd "${reloadCmd}" 2>&1)
+        --key-file /root/cert/${domain}/privkey.pem \
+        --fullchain-file /root/cert/${domain}/fullchain.pem --reloadcmd "${reloadCmd}" 2>&1)
     local installRc=$?
     echo "${installOutput}"
 
@@ -1525,7 +1469,7 @@ ssl_cert_issue() {
         installWroteFiles=1
     fi
 
-    if [[ -f "${XUI_HOME}/cert/${domain}/privkey.pem" && -f "${XUI_HOME}/cert/${domain}/fullchain.pem" && (${installRc} -eq 0 || ${installWroteFiles} -eq 1) ]]; then
+    if [[ -f "/root/cert/${domain}/privkey.pem" && -f "/root/cert/${domain}/fullchain.pem" && (${installRc} -eq 0 || ${installWroteFiles} -eq 1) ]]; then
         LOGI "Installing certificate succeeded, enabling auto renew..."
     else
         LOGE "Installing certificate failed, exiting."
@@ -1549,17 +1493,12 @@ ssl_cert_issue() {
         chmod 600 $certPath/privkey.pem
         chmod 644 $certPath/fullchain.pem
     fi
-    # The panel runs as x-ui, so it must own the certificate files when the
-    # CLI runs as root (acme.sh then writes them as root).
-    if [[ $EUID -eq 0 ]]; then
-        chown -R "${XUI_USER}:${XUI_USER}" "$certPath"
-    fi
 
     # Prompt user to set panel paths after successful certificate installation
     read -rp "Would you like to set this certificate for the panel? (y/n): " setPanel
     if [[ "$setPanel" == "y" || "$setPanel" == "Y" ]]; then
-        local webCertFile="${XUI_HOME}/cert/${domain}/fullchain.pem"
-        local webKeyFile="${XUI_HOME}/cert/${domain}/privkey.pem"
+        local webCertFile="/root/cert/${domain}/fullchain.pem"
+        local webKeyFile="/root/cert/${domain}/privkey.pem"
 
         if [[ -f "$webCertFile" && -f "$webKeyFile" ]]; then
             ${xui_folder}/x-ui cert -webCert "$webCertFile" -webCertKey "$webKeyFile"
@@ -1637,7 +1576,7 @@ ssl_cert_issue_CF() {
         fi
 
         # Install the certificate
-        certPath="${XUI_HOME}/cert/${CF_Domain}"
+        certPath="/root/cert/${CF_Domain}"
         if [ -d "$certPath" ]; then
             rm -rf ${certPath}
         fi
@@ -1654,18 +1593,18 @@ ssl_cert_issue_CF() {
         LOGI "This command will run on every certificate issue and renew."
         read -rp "Would you like to modify --reloadcmd for ACME? (y/n): " setReloadcmd
         if [[ "$setReloadcmd" == "y" || "$setReloadcmd" == "Y" ]]; then
-            echo -e "\n${green}\t1.${plain} Preset: sudo systemctl reload nginx ; x-ui restart"
+            echo -e "\n${green}\t1.${plain} Preset: systemctl reload nginx ; x-ui restart"
             echo -e "${green}\t2.${plain} Input your own command"
             echo -e "${green}\t0.${plain} Keep default reloadcmd"
             read -rp "Choose an option: " choice
             case "$choice" in
                 1)
-                    LOGI "Reloadcmd is: sudo systemctl reload nginx ; x-ui restart"
-                    reloadCmd="sudo systemctl reload nginx ; x-ui restart"
+                    LOGI "Reloadcmd is: systemctl reload nginx ; x-ui restart"
+                    reloadCmd="systemctl reload nginx ; x-ui restart"
                     ;;
                 2)
                     LOGD "It's recommended to put x-ui restart at the end, so it won't raise an error if other services fails"
-                    read -rp "Please enter your reloadcmd (example: sudo systemctl reload nginx ; x-ui restart): " reloadCmd
+                    read -rp "Please enter your reloadcmd (example: systemctl reload nginx ; x-ui restart): " reloadCmd
                     LOGI "Your reloadcmd is: ${reloadCmd}"
                     ;;
                 *)
@@ -1694,11 +1633,6 @@ ssl_cert_issue_CF() {
             ls -lah ${certPath}/*
             chmod 600 ${certPath}/privkey.pem
             chmod 644 ${certPath}/fullchain.pem
-        fi
-        # The panel runs as x-ui, so it must own the certificate files when the
-        # CLI runs as root (acme.sh then writes them as root).
-        if [[ $EUID -eq 0 ]]; then
-            chown -R "${XUI_USER}:${XUI_USER}" "${certPath}"
         fi
 
         # Prompt user to set panel paths after successful certificate installation
@@ -1801,9 +1735,9 @@ iplimit_main() {
             if [[ $NUM =~ ^[0-9]+$ ]]; then
                 create_iplimit_jails ${NUM}
                 if [[ $release == "alpine" ]]; then
-                    sudo rc-service fail2ban restart
+                    rc-service fail2ban restart
                 else
-                    sudo systemctl restart fail2ban
+                    systemctl restart fail2ban
                 fi
             else
                 echo -e "${red}${NUM} is not a number! Please, try again.${plain}"
@@ -1813,7 +1747,7 @@ iplimit_main() {
         3)
             confirm "Proceed with Unbanning everyone from IP Limit jail?" "y"
             if [[ $? == 0 ]]; then
-                sudo fail2ban-client reload --restart --unban 3x-ipl
+                fail2ban-client reload --restart --unban 3x-ipl
                 truncate -s 0 "${iplimit_banned_log_path}"
                 echo -e "${green}All users Unbanned successfully.${plain}"
                 iplimit_main
@@ -1830,7 +1764,7 @@ iplimit_main() {
             read -rp "Enter the IP address you want to ban: " ban_ip
             ip_validation
             if [[ $ban_ip =~ $ipv4_regex || $ban_ip =~ $ipv6_regex ]]; then
-                sudo fail2ban-client set 3x-ipl banip "$ban_ip"
+                fail2ban-client set 3x-ipl banip "$ban_ip"
                 echo -e "${green}IP Address ${ban_ip} has been banned successfully.${plain}"
             else
                 echo -e "${red}Invalid IP address format! Please try again.${plain}"
@@ -1841,7 +1775,7 @@ iplimit_main() {
             read -rp "Enter the IP address you want to unban: " unban_ip
             ip_validation
             if [[ $unban_ip =~ $ipv4_regex || $unban_ip =~ $ipv6_regex ]]; then
-                sudo fail2ban-client set 3x-ipl unbanip "$unban_ip"
+                fail2ban-client set 3x-ipl unbanip "$unban_ip"
                 echo -e "${green}IP Address ${unban_ip} has been unbanned successfully.${plain}"
             else
                 echo -e "${red}Invalid IP address format! Please try again.${plain}"
@@ -1858,9 +1792,9 @@ iplimit_main() {
             ;;
         9)
             if [[ $release == "alpine" ]]; then
-                sudo rc-service fail2ban restart
+                rc-service fail2ban restart
             else
-                sudo systemctl restart fail2ban
+                systemctl restart fail2ban
             fi
             iplimit_main
             ;;
@@ -1889,39 +1823,39 @@ install_iplimit() {
         # at install time prevents that confusing log spam for new installs.
         case "${release}" in
             ubuntu)
-                sudo apt-get update
+                apt-get update
                 if [[ "${os_version}" -ge 24 ]]; then
-                    sudo apt-get install python3-pip -y
+                    apt-get install python3-pip -y
                     python3 -m pip install pyasynchat --break-system-packages
                 fi
-                sudo apt-get install fail2ban nftables -y
+                apt-get install fail2ban nftables -y
                 ;;
             debian)
-                sudo apt-get update
+                apt-get update
                 if [ "$os_version" -ge 12 ]; then
-                    sudo apt-get install -y python3-systemd
+                    apt-get install -y python3-systemd
                 fi
-                sudo apt-get install -y fail2ban nftables
+                apt-get install -y fail2ban nftables
                 ;;
             armbian)
-                sudo apt-get update && sudo apt-get install fail2ban nftables -y
+                apt-get update && apt-get install fail2ban nftables -y
                 ;;
             fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
-                sudo dnf -y update && sudo dnf -y install fail2ban nftables
+                dnf -y update && dnf -y install fail2ban nftables
                 ;;
             centos)
                 if [[ "${VERSION_ID}" =~ ^7 ]]; then
-                    sudo yum update -y && sudo yum install epel-release -y
-                    sudo yum -y install fail2ban nftables
+                    yum update -y && yum install epel-release -y
+                    yum -y install fail2ban nftables
                 else
-                    sudo dnf -y update && sudo dnf -y install fail2ban nftables
+                    dnf -y update && dnf -y install fail2ban nftables
                 fi
                 ;;
             arch | manjaro | parch)
-                sudo pacman -Syu --noconfirm fail2ban nftables
+                pacman -Syu --noconfirm fail2ban nftables
                 ;;
             alpine)
-                sudo apk add fail2ban nftables
+                apk add fail2ban nftables
                 ;;
             *)
                 echo -e "${red}Unsupported operating system. Please check the script and install the necessary packages manually.${plain}\n"
@@ -1960,19 +1894,19 @@ install_iplimit() {
 
     # Launching fail2ban
     if [[ $release == "alpine" ]]; then
-        if [[ $(sudo rc-service fail2ban status | grep -F 'status: started' -c) == 0 ]]; then
-            sudo rc-service fail2ban start
+        if [[ $(rc-service fail2ban status | grep -F 'status: started' -c) == 0 ]]; then
+            rc-service fail2ban start
         else
-            sudo rc-service fail2ban restart
+            rc-service fail2ban restart
         fi
-        sudo rc-update add fail2ban
+        rc-update add fail2ban
     else
-        if ! sudo systemctl is-active --quiet fail2ban; then
-            sudo systemctl start fail2ban
+        if ! systemctl is-active --quiet fail2ban; then
+            systemctl start fail2ban
         else
-            sudo systemctl restart fail2ban
+            systemctl restart fail2ban
         fi
-        sudo systemctl enable fail2ban
+        systemctl enable fail2ban
     fi
 
     echo -e "${green}IP Limit installed and configured successfully!${plain}\n"
@@ -1986,48 +1920,48 @@ remove_iplimit() {
     read -rp "Choose an option: " num
     case "$num" in
         1)
-            sudo rm -f /etc/fail2ban/filter.d/3x-ipl.conf
-            sudo rm -f /etc/fail2ban/action.d/3x-ipl.conf
-            sudo rm -f /etc/fail2ban/jail.d/3x-ipl.conf
+            rm -f /etc/fail2ban/filter.d/3x-ipl.conf
+            rm -f /etc/fail2ban/action.d/3x-ipl.conf
+            rm -f /etc/fail2ban/jail.d/3x-ipl.conf
             if [[ $release == "alpine" ]]; then
-                sudo rc-service fail2ban restart
+                rc-service fail2ban restart
             else
-                sudo systemctl restart fail2ban
+                systemctl restart fail2ban
             fi
             echo -e "${green}IP Limit removed successfully!${plain}\n"
             before_show_menu
             ;;
         2)
-            sudo rm -rf /etc/fail2ban
+            rm -rf /etc/fail2ban
             if [[ $release == "alpine" ]]; then
-                sudo rc-service fail2ban stop
+                rc-service fail2ban stop
             else
-                sudo systemctl stop fail2ban
+                systemctl stop fail2ban
             fi
             case "${release}" in
                 ubuntu | debian | armbian)
-                    sudo apt-get remove -y fail2ban
-                    sudo apt-get purge -y fail2ban -y
-                    sudo apt-get autoremove -y
+                    apt-get remove -y fail2ban
+                    apt-get purge -y fail2ban -y
+                    apt-get autoremove -y
                     ;;
                 fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
-                    sudo dnf remove fail2ban -y
-                    sudo dnf autoremove -y
+                    dnf remove fail2ban -y
+                    dnf autoremove -y
                     ;;
                 centos)
                     if [[ "${VERSION_ID}" =~ ^7 ]]; then
-                        sudo yum remove fail2ban -y
-                        sudo yum autoremove -y
+                        yum remove fail2ban -y
+                        yum autoremove -y
                     else
-                        sudo dnf remove fail2ban -y
-                        sudo dnf autoremove -y
+                        dnf remove fail2ban -y
+                        dnf autoremove -y
                     fi
                     ;;
                 arch | manjaro | parch)
-                    sudo pacman -Rns --noconfirm fail2ban
+                    pacman -Rns --noconfirm fail2ban
                     ;;
                 alpine)
-                    sudo apk del fail2ban
+                    apk del fail2ban
                     ;;
                 *)
                     echo -e "${red}Unsupported operating system. Please uninstall Fail2ban manually.${plain}\n"
@@ -2053,12 +1987,12 @@ show_banlog() {
     echo -e "${green}Checking ban logs...${plain}\n"
 
     if [[ $release == "alpine" ]]; then
-        if [[ $(sudo rc-service fail2ban status | grep -F 'status: started' -c) == 0 ]]; then
+        if [[ $(rc-service fail2ban status | grep -F 'status: started' -c) == 0 ]]; then
             echo -e "${red}Fail2ban service is not running!${plain}\n"
             return 1
         fi
     else
-        if ! sudo systemctl is-active --quiet fail2ban; then
+        if ! systemctl is-active --quiet fail2ban; then
             echo -e "${red}Fail2ban service is not running!${plain}\n"
             return 1
         fi
@@ -2082,7 +2016,7 @@ show_banlog() {
     fi
 
     echo -e "\n${green}Current jail status:${plain}"
-    sudo fail2ban-client status 3x-ipl || echo -e "${yellow}Unable to get jail status${plain}"
+    fail2ban-client status 3x-ipl || echo -e "${yellow}Unable to get jail status${plain}"
 }
 
 create_iplimit_jails() {
@@ -2090,14 +2024,14 @@ create_iplimit_jails() {
     local bantime="${1:-30}"
 
     # Uncomment 'allowipv6 = auto' in fail2ban.conf
-    sudo sed -i 's/#allowipv6 = auto/allowipv6 = auto/g' /etc/fail2ban/fail2ban.conf
+    sed -i 's/#allowipv6 = auto/allowipv6 = auto/g' /etc/fail2ban/fail2ban.conf
 
     # On Debian 12+ fail2ban's default backend should be changed to systemd
     if [[ "${release}" == "debian" && ${os_version} -ge 12 ]]; then
-        sudo sed -i '0,/action =/s/backend = auto/backend = systemd/' /etc/fail2ban/jail.conf
+        sed -i '0,/action =/s/backend = auto/backend = systemd/' /etc/fail2ban/jail.conf
     fi
 
-    cat << EOF | sudo tee /etc/fail2ban/jail.d/3x-ipl.conf > /dev/null
+    cat << EOF > /etc/fail2ban/jail.d/3x-ipl.conf
 [3x-ipl]
 enabled=true
 backend=auto
@@ -2109,14 +2043,14 @@ findtime=32
 bantime=${bantime}m
 EOF
 
-    cat << EOF | sudo tee /etc/fail2ban/filter.d/3x-ipl.conf > /dev/null
+    cat << EOF > /etc/fail2ban/filter.d/3x-ipl.conf
 [Definition]
 datepattern = ^%%Y/%%m/%%d %%H:%%M:%%S
 failregex   = \[LIMIT_IP\]\s*Email\s*=\s*<F-USER>.+</F-USER>\s*\|\|\s*Disconnecting OLD IP\s*=\s*<ADDR>\s*\|\|\s*Timestamp\s*=\s*\d+
 ignoreregex =
 EOF
 
-    cat << EOF | sudo tee /etc/fail2ban/action.d/3x-ipl.conf > /dev/null
+    cat << EOF > /etc/fail2ban/action.d/3x-ipl.conf
 [INCLUDES]
 before = iptables-allports.conf
 
@@ -2155,7 +2089,7 @@ iplimit_remove_conflicts() {
     for file in "${jail_files[@]}"; do
         # Check for [3x-ipl] config in jail file then remove it
         if test -f "${file}" && grep -qw '3x-ipl' ${file}; then
-            sudo sed -i "/\[3x-ipl\]/,/^$/d" ${file}
+            sed -i "/\[3x-ipl\]/,/^$/d" ${file}
             echo -e "${yellow}Removing conflicts of [3x-ipl] in jail (${file})!${plain}\n"
         fi
     done
