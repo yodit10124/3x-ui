@@ -213,10 +213,12 @@ func (x *XrayAPI) AddUser(Protocol string, inboundTag string, user map[string]an
 		case "xchacha20-poly1305", "xchacha20-ietf-poly1305":
 			ssCipherType = shadowsocks.CipherType_XCHACHA20_POLY1305
 		default:
-			ssCipherType = shadowsocks.CipherType_NONE
+			// Not a legacy cipher: fall through to shadowsocks-2022 below.
+			// (xray-core removed CipherType_NONE; UNKNOWN (0) is the sentinel.)
+			ssCipherType = shadowsocks.CipherType_UNKNOWN
 		}
 
-		if ssCipherType != shadowsocks.CipherType_NONE {
+		if ssCipherType != shadowsocks.CipherType_UNKNOWN {
 			account = serial.ToTypedMessage(&shadowsocks.Account{
 				Password:   password,
 				CipherType: ssCipherType,
