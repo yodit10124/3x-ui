@@ -578,6 +578,69 @@ get_local_ipv6() {
     fi
 }
 
+# Check if an IPv4 address is private, loopback, or link-local.
+is_private_ipv4() {
+    case "$1" in
+        10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|192.168.*|127.*|169.254.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Query external services for the public IPv4 (used when the machine only
+# has private IPv4s, e.g. behind NAT). Prints the public IPv4, or nothing on failure.
+get_external_public_ipv4() {
+    local URL_lists=(
+        "https://api.ip.sb/ip"
+        "https://ipinfo.io/ip"
+        "https://api4.ipify.org"
+        "https://ipv4.icanhazip.com"
+        "https://v4.api.ipinfo.io/ip"
+        "https://ipv4.myexternalip.com/raw"
+        "https://4.ident.me"
+        "https://check-host.net/ip"
+    )
+    local ip_address=""
+    for ip_address in "${URL_lists[@]}"; do
+        local response=$(curl -s -w "\n%{http_code}" --max-time 3 "${ip_address}" 2> /dev/null)
+        local http_code=$(echo "$response" | tail -n1)
+        local ip_result=$(echo "$response" | head -n-1 | tr -d '[:space:]')
+        if [[ "${http_code}" == "200" && -n "${ip_result}" ]] && [[ "$ip_result" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! is_private_ipv4 "$ip_result"; then
+            echo "$ip_result"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# IPv4 addresses to sign in a self-signed certificate.
+# Prefers public local IPv4s; if the machine only has private IPv4s (NAT),
+# fetches the public IPv4 from an external service instead, so the cert
+# SAN is reachable from outside. Falls back to the local list if the
+# external lookup fails.
+get_sign_ipv4() {
+    local local_ipv4_list=$(get_local_ipv4)
+    local public_ipv4_list=""
+    local ip=""
+    for ip in $local_ipv4_list; do
+        if ! is_private_ipv4 "$ip"; then
+            public_ipv4_list+="${ip}"$'\n'
+        fi
+    done
+    if [[ -n "$public_ipv4_list" ]]; then
+        printf '%s' "$public_ipv4_list" | sort -u
+        return 0
+    fi
+    # No public IPv4 attached locally (NAT/private network): try external services.
+    echo -e "${yellow}Local IPv4 is private (NAT); fetching public IPv4 from an external service...${plain}" >&2
+    local external_ip=$(get_external_public_ipv4)
+    if [[ -n "$external_ip" ]]; then
+        echo "$external_ip"
+        return 0
+    fi
+    # Last resort: local (private) IPv4s so the cert can still be generated.
+    echo "$local_ipv4_list"
+}
+
 # Generate a self-signed certificate (CN=8620) covering local IPs and configure the panel.
 # $1 = which IPs to include: "4" (IPv4 only), "6" (IPv6 only), "both"
 # $2 = server IP (fallback for SSL_HOST)
@@ -596,7 +659,7 @@ setup_self_signed_certificate() {
     local ipv4_list=""
     local ipv6_list=""
     if [[ "$sign_mode" == "4" || "$sign_mode" == "both" ]]; then
-        ipv4_list=$(get_local_ipv4)
+        ipv4_list=$(get_sign_ipv4)
     fi
     if [[ "$sign_mode" == "6" || "$sign_mode" == "both" ]]; then
         ipv6_list=$(get_local_ipv6)
