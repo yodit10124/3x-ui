@@ -911,9 +911,21 @@ config_after_install() {
 
             ${xui_folder}/x-ui setting -username "${config_username}" -password "${config_password}" -port "${config_port}" -webBasePath "${config_webBasePath}"
 
+            # Fresh install with no certificate: prompt for SSL setup
+            # (default: self-signed CN=8620, sign both IPv4 and IPv6),
+            # matching the other install paths. Still optional: option 5
+            # skips and leaves the panel on HTTP.
+            if [[ -z "${existing_cert}" ]]; then
+                echo ""
+                echo -e "${green}═══════════════════════════════════════════${plain}"
+                echo -e "${green}     SSL Certificate Setup (RECOMMENDED)   ${plain}"
+                echo -e "${green}═══════════════════════════════════════════${plain}"
+                echo -e "${yellow}Let's Encrypt now supports both domains and IP addresses!${plain}"
+                echo ""
+                prompt_and_setup_ssl "${config_port}" "${config_webBasePath}" "${server_ip}"
+            fi
+
             # Display final credentials and access information
-            # No SSL certificate is installed on first install; set one up
-            # later from the x-ui menu if needed.
             echo ""
             echo -e "${green}═══════════════════════════════════════════${plain}"
             echo -e "${green}     Panel Installation Complete!         ${plain}"
@@ -922,10 +934,16 @@ config_after_install() {
             echo -e "${green}Password:    ${config_password}${plain}"
             echo -e "${green}Port:        ${config_port}${plain}"
             echo -e "${green}WebBasePath: ${config_webBasePath}${plain}"
-            echo -e "${green}Access URL:  http://${server_ip}:${config_port}/${config_webBasePath}${plain}"
+            if [[ "${SSL_CONFIGURED}" == "1" ]]; then
+                echo -e "${green}Access URL:  https://${SSL_HOST}:${config_port}/${config_webBasePath}${plain}"
+            elif [[ -n "${existing_cert}" ]]; then
+                echo -e "${green}Access URL:  https://${server_ip}:${config_port}/${config_webBasePath}${plain}"
+            else
+                echo -e "${green}Access URL:  http://${server_ip}:${config_port}/${config_webBasePath}${plain}"
+                echo -e "${yellow}⚠ SSL Certificate: Not configured (panel uses HTTP)${plain}"
+            fi
             echo -e "${green}═══════════════════════════════════════════${plain}"
             echo -e "${yellow}⚠ IMPORTANT: Save these credentials securely!${plain}"
-            echo -e "${yellow}⚠ SSL Certificate: Not configured (panel uses HTTP)${plain}"
         else
             local config_webBasePath=$(gen_random_string 18)
             echo -e "${yellow}WebBasePath is missing or too short. Generating a new one...${plain}"

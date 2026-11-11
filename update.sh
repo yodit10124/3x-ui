@@ -752,6 +752,17 @@ prompt_and_setup_ssl() {
                 *) sign_mode="both" ;;
             esac
             setup_self_signed_certificate "$sign_mode" "${server_ip}"
+            # Restart panel so the running instance loads the new cert.
+            # (update.sh starts x-ui before config_after_update runs, so
+            # without this the panel keeps serving HTTP with the old
+            # settings even though the cert is written to the DB.)
+            if [[ "${SSL_CONFIGURED}" == "1" ]]; then
+                if [[ $release == "alpine" ]]; then
+                    rc-service x-ui restart > /dev/null 2>&1
+                else
+                    systemctl restart x-ui > /dev/null 2>&1
+                fi
+            fi
             ;;
         2)
             # User chose Let's Encrypt domain option
