@@ -436,6 +436,8 @@
 "hstsMaxAgeDesc" = "Strict-Transport-Security max-age in seconds, sent only over HTTPS. 0 disables the header. Default is one year (31536000)."
 "wsTrustedOrigins" = "Trusted WebSocket origins"
 "wsTrustedOriginsDesc" = "External origins allowed to open a WebSocket to the panel, in addition to the panel's own address (comma-separated, e.g. https://panel.example.com:8443). Only needed when a reverse proxy serves the panel under a different address. Leave empty for same-origin only."
+"geoMaxFileSizeMB" = "Max Geo file download size (MiB)"
+"geoMaxFileSizeMBDesc" = "Maximum size of a single GeoIP/GeoSite file downloaded from a remote source. Downloads larger than this are rejected and the old file is kept. Default is 100 MiB; real Geo databases are at most ~15 MiB."
 "expireTimeDiff" = "Expiration Date Notification"
 "expireTimeDiffDesc" = "Get notified about expiration date when reaching this threshold. (unit: day)"
 "trafficDiff" = "Traffic Cap Notification"

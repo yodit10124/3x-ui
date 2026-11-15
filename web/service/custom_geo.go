@@ -25,6 +25,11 @@ const (
 	customGeoTypeGeoip    = "geoip"
 	minDatBytes           = 64
 	customGeoProbeTimeout = 12 * time.Second
+	// defaultGeoMaxFileSizeMB caps a single Geo file download when no
+	// valid limit is configured. Real GeoIP/GeoSite databases are ~15 MiB
+	// at most, so 100 MiB leaves ample room while bounding how much a
+	// malicious or compromised remote source can write to the disk.
+	defaultGeoMaxFileSizeMB = 100
 )
 
 var (
@@ -69,6 +74,7 @@ type CustomGeoUpdateAllResult struct {
 
 type CustomGeoService struct {
 	serverService    *ServerService
+	settingService   *SettingService
 	updateAllGetAll  func() ([]model.CustomGeoResource, error)
 	updateAllApply   func(id int, onStartup bool) (string, error)
 	updateAllRestart func() error
@@ -76,12 +82,28 @@ type CustomGeoService struct {
 
 func NewCustomGeoService() *CustomGeoService {
 	s := &CustomGeoService{
-		serverService: &ServerService{},
+		serverService:  &ServerService{},
+		settingService: &SettingService{},
 	}
 	s.updateAllGetAll = s.GetAll
 	s.updateAllApply = s.applyDownloadAndPersist
 	s.updateAllRestart = func() error { return s.serverService.RestartXrayService() }
 	return s
+}
+
+// geoMaxFileSizeBytes returns the configured maximum download size in
+// bytes. A missing setting service (zero-value service in tests), a
+// missing setting, or a stored value <= 0 all fall back to the default,
+// so the limit can never be disabled by accident.
+func (s *CustomGeoService) geoMaxFileSizeBytes() int64 {
+	if s == nil || s.settingService == nil {
+		return defaultGeoMaxFileSizeMB * 1024 * 1024
+	}
+	mb, err := s.settingService.GetGeoMaxFileSizeMB()
+	if err != nil || mb <= 0 {
+		return defaultGeoMaxFileSizeMB * 1024 * 1024
+	}
+	return int64(mb) * 1024 * 1024
 }
 
 func NormalizeAliasKey(alias string) string {
@@ -474,6 +496,16 @@ func (s *CustomGeoService) downloadToPathOnce(resourceURL, destPath string, last
 		return false, "", fmt.Errorf("%w: unexpected status %d", ErrCustomGeoDownload, resp.StatusCode)
 	}
 
+	// Enforce the download size limit before writing anything: a
+	// malicious or compromised remote source must not be able to fill
+	// the disk. The Content-Length check rejects oversized files
+	// without downloading; the LimitReader below is the hard limit for
+	// chunked responses that carry no Content-Length.
+	maxBytes := s.geoMaxFileSizeBytes()
+	if resp.ContentLength > maxBytes {
+		return false, "", fmt.Errorf("%w: file too large: Content-Length %d exceeds limit %d", ErrCustomGeoDownload, resp.ContentLength, maxBytes)
+	}
+
 	binDir := filepath.Dir(safeDestPath)
 	if err = os.MkdirAll(binDir, 0o755); err != nil {
 		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
@@ -487,7 +519,7 @@ func (s *CustomGeoService) downloadToPathOnce(resourceURL, destPath string, last
 	if err != nil {
 		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
 	}
-	n, err := io.Copy(out, resp.Body)
+	n, err := io.Copy(out, io.LimitReader(resp.Body, maxBytes+1))
 	closeErr := out.Close()
 	if err != nil {
 		_ = os.Remove(safeTmpPath)
@@ -496,6 +528,10 @@ func (s *CustomGeoService) downloadToPathOnce(resourceURL, destPath string, last
 	if closeErr != nil {
 		_ = os.Remove(safeTmpPath)
 		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, closeErr)
+	}
+	if n > maxBytes {
+		_ = os.Remove(safeTmpPath)
+		return false, "", fmt.Errorf("%w: file too large: exceeds limit %d bytes", ErrCustomGeoDownload, maxBytes)
 	}
 	if n < minDatBytes {
 		_ = os.Remove(safeTmpPath)

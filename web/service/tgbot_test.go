@@ -1,6 +1,10 @@
 package service
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -90,6 +94,64 @@ func tgbotTestCallbackQuery(userID int64, data string) *telego.CallbackQuery {
 		},
 		Data: data,
 	}
+}
+
+// fakeTelegramAPI answers Bot API calls against a local test server so the
+// bot's send/delete paths can run without Telegram. It records how many
+// messages were sent and deleted.
+type fakeTelegramAPI struct {
+	mu      sync.Mutex
+	sends   int
+	deletes int
+}
+
+func (f *fakeTelegramAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	method := path.Base(r.URL.Path)
+	f.mu.Lock()
+	switch method {
+	case "sendMessage", "editMessageText", "editMessageReplyMarkup":
+		f.sends++
+	case "deleteMessage":
+		f.deletes++
+	}
+	f.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	switch method {
+	case "sendMessage", "editMessageText", "editMessageReplyMarkup":
+		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":42,"date":1700000000,"chat":{"id":%d,"type":"private"}}}`, tgbotTestChatID)
+	default:
+		fmt.Fprint(w, `{"ok":true,"result":true}`)
+	}
+}
+
+func (f *fakeTelegramAPI) deleteCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.deletes
+}
+
+// setupFakeTgbot installs a bot backed by the fake API server and marks it
+// running, so sends and deletes actually execute. The previous bot state is
+// restored when the test ends.
+func setupFakeTgbot(t *testing.T) *fakeTelegramAPI {
+	t.Helper()
+	api := &fakeTelegramAPI{}
+	srv := httptest.NewServer(api)
+	t.Cleanup(srv.Close)
+	fakeBot, err := telego.NewBot("123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		telego.WithAPIServer(srv.URL), telego.WithHTTPClient(srv.Client()))
+	if err != nil {
+		t.Fatalf("NewBot: %v", err)
+	}
+	oldBot := bot
+	oldRunning := isRunning.Load()
+	bot = fakeBot
+	isRunning.Store(true)
+	t.Cleanup(func() {
+		bot = oldBot
+		isRunning.Store(oldRunning)
+	})
+	return api
 }
 
 // TestIsPersonalBotCallback: only the two personal queries are open to
@@ -366,5 +428,156 @@ func TestBuildJSONForProtocolUsesSession(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("JSON missing %q: %s", want, got)
 		}
+	}
+}
+
+// TestSendMsgToTgbotDeleteAfterKeepsNewInputState: the audit scenario — the
+// admin fills in the email, then, while the "received email" prompt is
+// still alive, clicks "change ID". The old prompt's timer must not clear
+// the new awaiting_id step when it fires; the timer only deletes its own
+// message. On the old code (the timer cleared the input state) this test
+// fails with state "".
+func TestSendMsgToTgbotDeleteAfterKeepsNewInputState(t *testing.T) {
+	setupTgbotTestDB(t)
+	api := setupFakeTgbot(t)
+	tb := (&Tgbot{}).NewTgbot()
+
+	addClientSessionsMu.Lock()
+	tb.newAddClientSession(tgbotTestChatID, tgbotTestAdminID, 1)
+	addClientSessionsMu.Unlock()
+
+	// Arm the timer of an earlier prompt (1s here instead of the
+	// production 3s, same code path).
+	tb.SendMsgToTgbotDeleteAfter(tgbotTestChatID, "received_email", 1)
+
+	// Before the timer fires, the admin moves on to the next step via the
+	// "change ID" button, which sets awaiting_id synchronously.
+	tb.answerCallback(tgbotTestCallbackQuery(tgbotTestAdminID, "add_client_ch_default_id"), true)
+
+	addClientSessionsMu.Lock()
+	sess := getAddClientSession(tgbotTestChatID, tgbotTestAdminID)
+	state := ""
+	if sess != nil {
+		state = sess.state
+	}
+	addClientSessionsMu.Unlock()
+	if state != "awaiting_id" {
+		t.Fatalf("state after moving to next step = %q, want awaiting_id", state)
+	}
+
+	// Wait past the old prompt's expiry: the new step must survive it.
+	time.Sleep(2 * time.Second)
+	addClientSessionsMu.Lock()
+	sess = getAddClientSession(tgbotTestChatID, tgbotTestAdminID)
+	state = ""
+	if sess != nil {
+		state = sess.state
+	}
+	addClientSessionsMu.Unlock()
+	if state != "awaiting_id" {
+		t.Fatalf("old prompt timer cleared the new step: state = %q, want awaiting_id", state)
+	}
+	// The timer still deletes its own message.
+	if got := api.deleteCount(); got == 0 {
+		t.Fatalf("timer did not delete its message (deleteMessage calls = 0)")
+	}
+}
+
+// TestAdminIdsConcurrentReload: a bot reload swapping the admin list while
+// messages are being handled must not trip the race detector, and any
+// single snapshot a reader observes must be one complete generation —
+// never a mix of two. On the old code (plain slice, writes locked but
+// reads unlocked) this test fails under -race.
+func TestAdminIdsConcurrentReload(t *testing.T) {
+	setupTgbotTestDB(t)
+	setupFakeTgbot(t)
+	tb := (&Tgbot{}).NewTgbot()
+
+	setA := []int64{111, 222}
+	setB := []int64{333, 444}
+	setAdminIds(setA)
+	t.Cleanup(func() { setAdminIds(nil) })
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Reload loop: swap the snapshot between two disjoint generations.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				setAdminIds(setA)
+				setAdminIds(setB)
+			}
+		}
+	}()
+	// Reader loops: each iteration loads ONE snapshot and checks it is a
+	// single complete generation, then exercises the permission check.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					ids := getAdminIds()
+					seenA, seenB := false, false
+					for _, id := range ids {
+						if id == 111 || id == 222 {
+							seenA = true
+						}
+						if id == 333 || id == 444 {
+							seenB = true
+						}
+					}
+					if seenA && seenB {
+						t.Errorf("single admin snapshot mixes two generations: %v", ids)
+						return
+					}
+					if len(ids) != 2 {
+						t.Errorf("admin snapshot has %d entries, want 2: %v", len(ids), ids)
+						return
+					}
+					// Permission checks run concurrently with the reload.
+					_ = checkAdmin(111)
+					_ = checkAdmin(333)
+					_ = checkAdmin(999)
+				}
+			}
+		}()
+	}
+	// Broadcast loop: iterate the snapshot and send via the fake bot.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				tb.SendMsgToTgbotAdmins("ping")
+			}
+		}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// Deterministic tail: a final known snapshot reads back exactly.
+	setAdminIds(setA)
+	if !checkAdmin(111) || !checkAdmin(222) || checkAdmin(333) {
+		t.Fatalf("final snapshot mismatch: 111=%v 222=%v 333=%v",
+			checkAdmin(111), checkAdmin(222), checkAdmin(333))
+	}
+	setAdminIds(nil)
+	if checkAdmin(111) {
+		t.Fatalf("cleared admin list still reports 111 as admin")
 	}
 }

@@ -19,10 +19,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 )
 
@@ -777,5 +779,121 @@ func TestSSRFTransportHTTPSKeepsSNIAndHost(t *testing.T) {
 	}
 	if gotHost != "example.com:"+port {
 		t.Fatalf("HTTP Host = %q, want example.com:%s", gotHost, port)
+	}
+}
+
+// setupGeoMaxSizeTest creates a throw-away database with the Geo download
+// limit set to limitMB MiB and returns a service that reads it, plus a
+// destination file inside a throw-away bin folder pre-filled with marker
+// bytes (the "old file" that must survive a rejected download).
+func setupGeoMaxSizeTest(t *testing.T, limitMB int) (*CustomGeoService, string) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "x-ui.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+	t.Cleanup(func() { database.CloseDB() })
+	if err := (&SettingService{}).setInt("geoMaxFileSizeMB", limitMB); err != nil {
+		t.Fatalf("setInt geoMaxFileSizeMB: %v", err)
+	}
+	dir := t.TempDir()
+	t.Setenv("XUI_BIN_FOLDER", dir)
+	dest := filepath.Join(dir, "geoip_t.dat")
+	if err := os.WriteFile(dest, bytes.Repeat([]byte("A"), 100), 0o644); err != nil {
+		t.Fatalf("write old file: %v", err)
+	}
+	return NewCustomGeoService(), dest
+}
+
+func assertGeoOldFileKept(t *testing.T, dest string) {
+	t.Helper()
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("old file missing after rejected download: %v", err)
+	}
+	if !bytes.Equal(got, bytes.Repeat([]byte("A"), 100)) {
+		t.Fatalf("old file changed after rejected download: %d bytes", len(got))
+	}
+	if _, err := os.Stat(dest + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("temp file left behind: err=%v", err)
+	}
+}
+
+// TestDownloadToPathRejectsOversizeContentLength: a server declaring a
+// Content-Length above the limit is rejected before any byte is written.
+func TestDownloadToPathRejectsOversizeContentLength(t *testing.T) {
+	disableSSRFCheck(t)
+	s, dest := setupGeoMaxSizeTest(t, 1) // 1 MiB limit
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "2097152") // 2 MiB
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, 1024))
+	}))
+	defer ts.Close()
+
+	_, _, err := s.downloadToPath(ts.URL, dest, "")
+	if err == nil {
+		t.Fatal("oversized Content-Length accepted, want an error")
+	}
+	if !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("error = %v, want it to mention the size limit", err)
+	}
+	assertGeoOldFileKept(t, dest)
+}
+
+// TestDownloadToPathRejectsOversizeStream: a chunked response with no
+// Content-Length streaming past the limit is cut off by the hard read
+// limit and rejected; the old file survives.
+func TestDownloadToPathRejectsOversizeStream(t *testing.T) {
+	disableSSRFCheck(t)
+	s, dest := setupGeoMaxSizeTest(t, 1) // 1 MiB limit
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// No Content-Length header: Go serves this chunked.
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, (1<<20)+1024)) // 1 MiB + 1 KiB
+	}))
+	defer ts.Close()
+
+	_, _, err := s.downloadToPath(ts.URL, dest, "")
+	if err == nil {
+		t.Fatal("oversized stream accepted, want an error")
+	}
+	if !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("error = %v, want it to mention the size limit", err)
+	}
+	assertGeoOldFileKept(t, dest)
+}
+
+// TestDownloadToPathAcceptsUnderLimit: a normal download below the limit
+// still replaces the old file.
+func TestDownloadToPathAcceptsUnderLimit(t *testing.T) {
+	disableSSRFCheck(t)
+	s, dest := setupGeoMaxSizeTest(t, 1) // 1 MiB limit
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, 1024))
+	}))
+	defer ts.Close()
+
+	_, _, err := s.downloadToPath(ts.URL, dest, "")
+	if err != nil {
+		t.Fatalf("download under the limit failed: %v", err)
+	}
+	st, err := os.Stat(dest)
+	if err != nil || st.Size() != 1024 {
+		t.Fatalf("dest size = %v, err = %v, want 1024", st, err)
+	}
+}
+
+// TestGeoMaxFileSizeBytesFallback: without a setting service, or with a
+// missing/invalid setting, the limit falls back to the 100 MiB default
+// instead of disabling the cap.
+func TestGeoMaxFileSizeBytesFallback(t *testing.T) {
+	want := int64(defaultGeoMaxFileSizeMB * 1024 * 1024)
+	if got := (&CustomGeoService{}).geoMaxFileSizeBytes(); got != want {
+		t.Fatalf("zero-value service limit = %d, want %d", got, want)
+	}
+	if got := NewCustomGeoService().geoMaxFileSizeBytes(); got != want {
+		t.Fatalf("service without a database limit = %d, want %d", got, want)
 	}
 }

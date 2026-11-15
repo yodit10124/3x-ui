@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/config"
@@ -23,6 +24,14 @@ var (
 	logger  *logging.Logger
 	logFile *os.File
 
+	// loggerMu guards logger, logFile and logBuffer. Log calls come from
+	// many goroutines (the WebSocket hub, request handlers, cron jobs),
+	// and InitLogger replaces the logger while they run, so the shared
+	// state must never be touched without this lock. A plain mutex (not
+	// an RWMutex): log calls mutate the buffer, so they need exclusive
+	// access too.
+	loggerMu sync.Mutex
+
 	// logBuffer maintains recent log entries in memory for web UI retrieval
 	logBuffer []struct {
 		time  string
@@ -34,6 +43,8 @@ var (
 // InitLogger initializes dual logging backends: console/syslog and file.
 // Console logging uses the specified level, file logging always uses DEBUG level.
 func InitLogger(level logging.Level) {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	newLogger := logging.MustGetLogger("x-ui")
 	backends := make([]logging.Backend, 0, 2)
 
@@ -83,6 +94,7 @@ func initDefaultBackend() logging.Backend {
 
 // initFileBackend creates the file logging backend.
 // Creates log directory and truncates log file on startup for fresh logs.
+// Called from InitLogger with loggerMu held.
 func initFileBackend() logging.Backend {
 	logDir := config.GetLogFolder()
 	if err := os.MkdirAll(logDir, 0o750); err != nil {
@@ -119,6 +131,8 @@ func newFormatter(withTime bool) logging.Formatter {
 // CloseLogger closes the log file and cleans up resources.
 // Should be called during application shutdown.
 func CloseLogger() {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	if logFile != nil {
 		_ = logFile.Close()
 		logFile = nil
@@ -127,65 +141,86 @@ func CloseLogger() {
 
 // Debug logs a debug message and adds it to the log buffer.
 func Debug(args ...any) {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	logger.Debug(args...)
 	addToBuffer("DEBUG", fmt.Sprint(args...))
 }
 
 // Debugf logs a formatted debug message and adds it to the log buffer.
 func Debugf(format string, args ...any) {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	logger.Debugf(format, args...)
 	addToBuffer("DEBUG", fmt.Sprintf(format, args...))
 }
 
 // Info logs an info message and adds it to the log buffer.
 func Info(args ...any) {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	logger.Info(args...)
 	addToBuffer("INFO", fmt.Sprint(args...))
 }
 
 // Infof logs a formatted info message and adds it to the log buffer.
 func Infof(format string, args ...any) {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	logger.Infof(format, args...)
 	addToBuffer("INFO", fmt.Sprintf(format, args...))
 }
 
 // Notice logs a notice message and adds it to the log buffer.
 func Notice(args ...any) {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	logger.Notice(args...)
 	addToBuffer("NOTICE", fmt.Sprint(args...))
 }
 
 // Noticef logs a formatted notice message and adds it to the log buffer.
 func Noticef(format string, args ...any) {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	logger.Noticef(format, args...)
 	addToBuffer("NOTICE", fmt.Sprintf(format, args...))
 }
 
 // Warning logs a warning message and adds it to the log buffer.
 func Warning(args ...any) {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	logger.Warning(args...)
 	addToBuffer("WARNING", fmt.Sprint(args...))
 }
 
 // Warningf logs a formatted warning message and adds it to the log buffer.
 func Warningf(format string, args ...any) {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	logger.Warningf(format, args...)
 	addToBuffer("WARNING", fmt.Sprintf(format, args...))
 }
 
 // Error logs an error message and adds it to the log buffer.
 func Error(args ...any) {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	logger.Error(args...)
 	addToBuffer("ERROR", fmt.Sprint(args...))
 }
 
 // Errorf logs a formatted error message and adds it to the log buffer.
 func Errorf(format string, args ...any) {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	logger.Errorf(format, args...)
 	addToBuffer("ERROR", fmt.Sprintf(format, args...))
 }
 
 // addToBuffer adds a log entry to the in-memory ring buffer for web UI retrieval.
+// Callers must hold loggerMu.
 func addToBuffer(level string, newLog string) {
 	t := time.Now()
 	if len(logBuffer) >= maxLogBufferSize {
@@ -206,6 +241,8 @@ func addToBuffer(level string, newLog string) {
 
 // GetLogs retrieves up to c log entries from the buffer that are at or below the specified level.
 func GetLogs(c int, level string) []string {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
 	var output []string
 	logLevel, _ := logging.LogLevel(level)
 

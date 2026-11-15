@@ -52,7 +52,16 @@ var defaultValueMap = map[string]string{
 	// the panel itself only sees the proxy's plain-HTTP request. Empty
 	// means "same origin only". Entries are matched as a full triple
 	// (scheme, host, effective port); a bare host never matches.
-	"wsTrustedOrigins":            "",
+	"wsTrustedOrigins": "",
+	// geoMaxFileSizeMB: maximum size in MiB of a single GeoIP/GeoSite file
+	// downloaded from a remote source. The largest real GeoIP/GeoSite
+	// databases are ~15 MiB, so 100 MiB leaves ample room for growth
+	// while bounding how much a malicious or compromised remote source
+	// can write to the disk. Enforced both on Content-Length and during
+	// the actual read (LimitReader), so chunked responses without a
+	// Content-Length are covered too. A stored value <= 0 falls back to
+	// the default instead of disabling the limit.
+	"geoMaxFileSizeMB":            "100",
 	"secret":                      random.Seq(32),
 	"webBasePath":                 "/",
 	"sessionMaxAge":               "360",
@@ -442,6 +451,12 @@ func (s *SettingService) GetWSTrustedOrigins() ([]string, error) {
 		}
 	}
 	return origins, nil
+}
+
+// GetGeoMaxFileSizeMB returns the maximum size in MiB of a single Geo
+// file downloaded from a remote source.
+func (s *SettingService) GetGeoMaxFileSizeMB() (int, error) {
+	return s.getInt("geoMaxFileSizeMB")
 }
 
 func (s *SettingService) GetExpireDiff() (int, error) {

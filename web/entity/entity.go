@@ -30,6 +30,7 @@ type AllSetting struct {
 	WebSecureCookie  bool   `json:"webSecureCookie" form:"webSecureCookie"`   // Set Secure on the session cookie (TLS terminated by a reverse proxy)
 	WebHSTSMaxAge    int    `json:"webHSTSMaxAge" form:"webHSTSMaxAge"`       // HSTS max-age in seconds, 0 disables it (HTTPS only)
 	WsTrustedOrigins string `json:"wsTrustedOrigins" form:"wsTrustedOrigins"` // Comma-separated external origins allowed to open a WebSocket
+	GeoMaxFileSizeMB int    `json:"geoMaxFileSizeMB" form:"geoMaxFileSizeMB"` // Max Geo file download size in MiB (min 1)
 	SessionMaxAge    int    `json:"sessionMaxAge" form:"sessionMaxAge"`       // Session maximum age in minutes
 
 	// UI settings
@@ -113,6 +114,10 @@ func (s *AllSetting) CheckValid() error {
 
 	if s.WebHSTSMaxAge < 0 {
 		return common.NewError("HSTS max-age must not be negative:", s.WebHSTSMaxAge)
+	}
+
+	if s.GeoMaxFileSizeMB < 0 {
+		return common.NewError("Geo max file size must not be negative:", s.GeoMaxFileSizeMB)
 	}
 
 	_, err := time.LoadLocation(s.TimeLocation)

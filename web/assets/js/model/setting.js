@@ -9,6 +9,7 @@ class AllSetting {
         this.webSecureCookie = false;
         this.webHSTSMaxAge = 31536000;
         this.wsTrustedOrigins = "";
+        this.geoMaxFileSizeMB = 100;
         this.webBasePath = "/";
         this.sessionMaxAge = 360;
         this.pageSize = 25;

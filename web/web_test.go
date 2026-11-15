@@ -11,6 +11,8 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +26,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/web/service"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/op/go-logging"
 	"github.com/robfig/cron/v3"
 )
@@ -305,5 +308,136 @@ func TestSelfSignedCertFixtureLoads(t *testing.T) {
 	certPath, keyPath := writeSelfSignedCert(t)
 	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
 		t.Fatalf("fixture certificate does not load: %v", err)
+	}
+}
+
+// startPanelBehindProxy fronts the real panel router with a reverse proxy
+// that preserves the external Host, like a production TLS-terminating
+// proxy (nginx proxy_set_header Host $host, or ProxyPreserveHost). The
+// backend itself serves plain HTTP, so it sees r.TLS == nil while the
+// browser's Origin is the external https://panel.example.com.
+func startPanelBehindProxy(t *testing.T, settings map[string]string, preserveHost bool) string {
+	t.Helper()
+	engine := setupSecureCookieEngine(t, settings)
+	backend := httptest.NewServer(engine)
+	t.Cleanup(backend.Close)
+
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatalf("parse backend URL: %v", err)
+	}
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(target)
+			if preserveHost {
+				// Preserve the external Host the browser used; without
+				// this the panel sees the backend's own host and both
+				// the CSRF check (Origin must match Host) and the
+				// WebSocket origin check compare against the wrong name.
+				r.Out.Host = "panel.example.com"
+			}
+		},
+	}
+	front := httptest.NewServer(proxy)
+	t.Cleanup(front.Close)
+	return front.URL
+}
+
+// loginThroughProxy logs in via the proxy the way the panel frontend
+// does: JSON body, X-Requested-With header, and the external Origin.
+func loginThroughProxy(t *testing.T, proxyURL string) []*http.Cookie {
+	t.Helper()
+	body := strings.NewReader(`{"username":"admin","password":"admin"}`)
+	req, err := http.NewRequest(http.MethodPost, proxyURL+"/login", body)
+	if err != nil {
+		t.Fatalf("login request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Origin", "https://panel.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("login through proxy: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login through proxy: status %d", resp.StatusCode)
+	}
+	cookies := resp.Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("login through proxy: no Set-Cookie")
+	}
+	return cookies
+}
+
+func dialWSViaProxy(proxyURL string, cookies []*http.Cookie) (*websocket.Conn, *http.Response, error) {
+	wsURL := "ws://" + strings.TrimPrefix(proxyURL, "http://") + "/ws"
+	header := http.Header{}
+	header.Set("Origin", "https://panel.example.com")
+	for _, c := range cookies {
+		header.Add("Cookie", c.Name+"="+c.Value)
+	}
+	return (&websocket.Dialer{HandshakeTimeout: 5 * time.Second}).Dial(wsURL, header)
+}
+
+// TestWebSocketThroughReverseProxy: the real deployment shape — a
+// TLS-terminating reverse proxy in front of the panel. The browser
+// reaches the proxy over HTTPS while the proxy talks plain HTTP to the
+// panel, preserving the external Host.
+//
+//   - With wsTrustedOrigins set to the external origin, the WebSocket
+//     connects: the panel only sees plain HTTP, so the HTTPS origin
+//     matches nothing on its own, but it matches the trusted entry.
+//   - Without wsTrustedOrigins, the same connection is refused (403):
+//     the HTTPS origin matches neither the panel's own plain-HTTP
+//     origin nor any trusted entry.
+//   - Without Host preservation, even the login is refused: the CSRF
+//     check requires Origin to match the request Host, and the backend
+//     would see its own address instead of the external name.
+func TestWebSocketThroughReverseProxy(t *testing.T) {
+	proxyURL := startPanelBehindProxy(t, map[string]string{
+		"wsTrustedOrigins": "https://panel.example.com",
+		"webSecureCookie":  "true",
+	}, true)
+	cookies := loginThroughProxy(t, proxyURL)
+	conn, _, err := dialWSViaProxy(proxyURL, cookies)
+	if err != nil {
+		t.Fatalf("websocket dial through proxy failed: %v", err)
+	}
+	conn.Close()
+
+	proxyURL = startPanelBehindProxy(t, nil, true)
+	cookies = loginThroughProxy(t, proxyURL)
+	_, resp, err := dialWSViaProxy(proxyURL, cookies)
+	if err == nil {
+		t.Fatal("websocket dial without wsTrustedOrigins succeeded, want rejection")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("websocket dial without wsTrustedOrigins: err=%v status=%d, want 403", err, status)
+	}
+
+	proxyURL = startPanelBehindProxy(t, map[string]string{
+		"wsTrustedOrigins": "https://panel.example.com",
+		"webSecureCookie":  "true",
+	}, false)
+	body := strings.NewReader(`{"username":"admin","password":"admin"}`)
+	req, err := http.NewRequest(http.MethodPost, proxyURL+"/login", body)
+	if err != nil {
+		t.Fatalf("login request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Origin", "https://panel.example.com")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("login without Host preservation: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode == http.StatusOK {
+		t.Fatal("login without Host preservation succeeded, want the CSRF check to refuse it")
 	}
 }

@@ -68,4 +68,12 @@ func TestGetSecureCookieAndHSTSDefaults(t *testing.T) {
 	if maxAge != 31536000 {
 		t.Fatalf("default webHSTSMaxAge = %d, want 31536000", maxAge)
 	}
+
+	maxMB, err := svc.GetGeoMaxFileSizeMB()
+	if err != nil {
+		t.Fatalf("GetGeoMaxFileSizeMB: %v", err)
+	}
+	if maxMB != 100 {
+		t.Fatalf("default geoMaxFileSizeMB = %d, want 100", maxMB)
+	}
 }

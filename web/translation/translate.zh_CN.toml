@@ -436,6 +436,8 @@
 "hstsMaxAgeDesc" = "Strict-Transport-Security 的 max-age（秒），仅在 HTTPS 下发送。0 表示禁用。默认一年（31536000）。"
 "wsTrustedOrigins" = "可信 WebSocket 来源"
 "wsTrustedOriginsDesc" = "除面板自身地址外，允许连接面板 WebSocket 的外部来源（逗号分隔，例如 https://panel.example.com:8443）。仅当反向代理以不同地址提供面板时才需要填写。留空表示仅允许同源。"
+"geoMaxFileSizeMB" = "Geo 文件最大下载体积（MiB）"
+"geoMaxFileSizeMBDesc" = "从远程源下载单个 GeoIP/GeoSite 文件的最大体积。超过此体积的下载会被拒绝，旧文件保留。默认 100 MiB；实际 Geo 数据库最大约 15 MiB。"
 "expireTimeDiff" = "到期通知阈值"
 "expireTimeDiffDesc" = "达到此阈值时，将收到有关到期时间的通知（单位：天）"
 "trafficDiff" = "流量耗尽阈值"
