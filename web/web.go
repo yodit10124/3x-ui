@@ -25,6 +25,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/web/middleware"
 	"github.com/mhsanaei/3x-ui/v2/web/network"
 	"github.com/mhsanaei/3x-ui/v2/web/service"
+	"github.com/mhsanaei/3x-ui/v2/web/session"
 	"github.com/mhsanaei/3x-ui/v2/web/websocket"
 
 	"github.com/gin-contrib/gzip"
@@ -170,6 +171,15 @@ func (s *Server) getHtmlTemplate(funcMap template.FuncMap) (*template.Template, 
 	return t, nil
 }
 
+// useSecureCookie decides whether the session cookie gets the Secure flag.
+// Direct TLS (a certificate or key is configured) enables it automatically;
+// the explicit webSecureCookie setting covers TLS terminated by a reverse
+// proxy in front of the panel. X-Forwarded-Proto is never consulted here:
+// any client can send that header, so it must not decide cookie security.
+func useSecureCookie(certFile, keyFile string, secureCookie bool) bool {
+	return certFile != "" || keyFile != "" || secureCookie
+}
+
 // initRouter initializes Gin, registers middleware, templates, static
 // assets, controllers and returns the configured engine.
 func (s *Server) initRouter() (*gin.Engine, error) {
@@ -188,8 +198,35 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 		return nil, err
 	}
 
+	// Whether the panel is served over HTTPS, which decides the Secure
+	// flag on the session cookie and the HSTS header:
+	//   - direct TLS: a certificate/key is configured (same condition as
+	//     Start(), which fails the boot if the cert cannot load);
+	//   - proxied TLS: the operator explicitly set webSecureCookie, for
+	//     deployments where a reverse proxy terminates TLS and the panel
+	//     itself serves plain HTTP.
+	// Deliberately NOT derived from X-Forwarded-Proto: any client can
+	// send that header, so it must never decide cookie security.
+	certFile, err := s.settingService.GetCertFile()
+	if err != nil {
+		return nil, err
+	}
+	keyFile, err := s.settingService.GetKeyFile()
+	if err != nil {
+		return nil, err
+	}
+	secureCookie, err := s.settingService.GetSecureCookie()
+	if err != nil {
+		return nil, err
+	}
+	https := useSecureCookie(certFile, keyFile, secureCookie)
+	hstsMaxAge, err := s.settingService.GetHSTSMaxAge()
+	if err != nil {
+		return nil, err
+	}
+
 	// H3/L3: always on, independent of whether a web domain is configured.
-	engine.Use(middleware.SecurityHeadersMiddleware())
+	engine.Use(middleware.SecurityHeadersMiddleware(hstsMaxAge, https))
 	engine.Use(middleware.CSRFMiddleware())
 	if webDomain != "" {
 		engine.Use(middleware.DomainValidatorMiddleware(webDomain))
@@ -208,12 +245,17 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	assetsBasePath := basePath + "assets/"
 
 	store := cookie.NewStore(secret)
-	// Configure default session cookie options, including expiration (MaxAge)
+	// Configure default session cookie options, including expiration (MaxAge).
+	// Secure is set whenever the panel is served over HTTPS (direct TLS or
+	// explicitly configured proxy TLS) and recorded in the session package
+	// so logout deletes the cookie with the same attributes.
 	sessionOptions := sessions.Options{
 		Path:     basePath,
 		HttpOnly: true,
+		Secure:   https,
 		SameSite: http.SameSiteLaxMode,
 	}
+	session.SetSecureCookie(https)
 	if sessionMaxAge, err := s.settingService.GetSessionMaxAge(); err == nil && sessionMaxAge > 0 {
 		sessionOptions.MaxAge = sessionMaxAge * 60 // minutes -> seconds
 	}
@@ -280,7 +322,10 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	go s.wsHub.Run()
 
 	// Initialize WebSocket controller
-	s.ws = controller.NewWebSocketController(s.wsHub)
+	s.ws = controller.NewWebSocketController(s.wsHub, func() []string {
+		origins, _ := s.settingService.GetWSTrustedOrigins()
+		return origins
+	})
 	// Register WebSocket route with basePath (g already has basePath prefix)
 	g.GET("/ws", s.ws.HandleWebSocket)
 

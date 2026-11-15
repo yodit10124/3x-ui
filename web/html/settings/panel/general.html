@@ -107,6 +107,27 @@
                 <a-input type="text" v-model="allSetting.webKeyFile"></a-input>
             </template>
         </a-setting-list-item>
+        <a-setting-list-item paddings="small">
+            <template #title>{{ i18n "pages.settings.secureCookie"}}</template>
+            <template #description>{{ i18n "pages.settings.secureCookieDesc"}}</template>
+            <template #control>
+                <a-switch v-model="allSetting.webSecureCookie"></a-switch>
+            </template>
+        </a-setting-list-item>
+        <a-setting-list-item paddings="small">
+            <template #title>{{ i18n "pages.settings.hstsMaxAge"}}</template>
+            <template #description>{{ i18n "pages.settings.hstsMaxAgeDesc"}}</template>
+            <template #control>
+                <a-input-number :min="0" v-model="allSetting.webHSTSMaxAge" :style="{ width: '100%' }"></a-input>
+            </template>
+        </a-setting-list-item>
+        <a-setting-list-item paddings="small">
+            <template #title>{{ i18n "pages.settings.wsTrustedOrigins"}}</template>
+            <template #description>{{ i18n "pages.settings.wsTrustedOriginsDesc"}}</template>
+            <template #control>
+                <a-input type="text" v-model="allSetting.wsTrustedOrigins" placeholder="https://panel.example.com:8443"></a-input>
+            </template>
+        </a-setting-list-item>
     </a-collapse-panel>
     <a-collapse-panel key="4" header='{{ i18n "pages.settings.externalTraffic" }}'>
         <a-setting-list-item paddings="small">

@@ -168,23 +168,57 @@ func isBlockedIP(ip net.IP) bool {
 		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
 }
 
+// checkBlockedIP is the active blocklist decision, used both when resolving
+// a hostname and when validating an IP literal. Override in tests (via
+// disableSSRFCheck) to allow httptest servers on localhost.
+var checkBlockedIP = func(ip net.IP) bool { return isBlockedIP(ip) }
+
+// resolveHostIPs resolves a hostname exactly once and returns every
+// candidate IP. It performs no policy check itself: the caller (the
+// dialer, or checkSSRFDefault for URL validation) validates the answers
+// with checkBlockedIP before using them. Override in tests to control
+// the answers the dialer sees.
+var resolveHostIPs = func(ctx context.Context, hostname string) ([]net.IP, error) {
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
+	if err != nil {
+		return nil, fmt.Errorf("%w: cannot resolve host %s", ErrCustomGeoSSRFBlocked, hostname)
+	}
+	ips := make([]net.IP, 0, len(addrs))
+	for _, addr := range addrs {
+		ips = append(ips, addr.IP)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("%w: %s resolves to no address", ErrCustomGeoSSRFBlocked, hostname)
+	}
+	return ips, nil
+}
+
 // checkSSRFDefault validates that the given host does not resolve to a private/internal IP.
 // It is context-aware so that dial context cancellation/deadlines are respected during DNS resolution.
 func checkSSRFDefault(ctx context.Context, hostname string) error {
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
+	ips, err := resolveHostIPs(ctx, hostname)
 	if err != nil {
-		return fmt.Errorf("%w: cannot resolve host %s", ErrCustomGeoSSRFBlocked, hostname)
+		return err
 	}
-	for _, ipAddr := range ips {
-		if isBlockedIP(ipAddr.IP) {
-			return fmt.Errorf("%w: %s resolves to blocked address %s", ErrCustomGeoSSRFBlocked, hostname, ipAddr.IP)
+	for _, ip := range ips {
+		if checkBlockedIP(ip) {
+			return fmt.Errorf("%w: %s resolves to blocked address %s", ErrCustomGeoSSRFBlocked, hostname, ip)
 		}
 	}
 	return nil
 }
 
-// checkSSRF is the active SSRF guard. Override in tests to allow localhost test servers.
+// checkSSRF is the active SSRF guard for URL validation (sanitizeURL),
+// where no connection follows yet. Override in tests to allow localhost
+// test servers.
 var checkSSRF = checkSSRFDefault
+
+// ssrfDialer opens the TCP connection to a validated address. Override in
+// tests to record the dialed address without touching the network.
+var ssrfDialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, network, addr)
+}
 
 func ssrfSafeTransport() http.RoundTripper {
 	base, ok := http.DefaultTransport.(*http.Transport)
@@ -192,17 +226,58 @@ func ssrfSafeTransport() http.RoundTripper {
 		base = &http.Transport{}
 	}
 	cloned := base.Clone()
+	// Geo downloads connect directly: an environment proxy (HTTP_PROXY
+	// and friends) would receive the raw hostname and resolve it itself,
+	// bypassing this validation entirely. These are server-to-server
+	// fetches of public files, so no proxy is needed.
+	cloned.Proxy = nil
 	cloned.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, _, err := net.SplitHostPort(addr)
+		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrCustomGeoSSRFBlocked, err)
 		}
-		if err := checkSSRF(ctx, host); err != nil {
-			return nil, err
+		// Resolve once, validate every candidate, and dial a validated IP
+		// directly. IP literals are validated as-is; hostnames are
+		// resolved by resolveHostIPs (one lookup) and the first validated
+		// IP is dialled. The validated addresses are exactly the ones
+		// that can be connected to, so a DNS answer that changes between
+		// the check and the connect (rebinding) cannot move the
+		// connection to an internal address. Redirects re-enter this
+		// function, so every hop gets the same treatment.
+		var candidates []net.IP
+		if ip := net.ParseIP(host); ip != nil {
+			if checkBlockedIP(ip) {
+				return nil, fmt.Errorf("%w: %s is a blocked address", ErrCustomGeoSSRFBlocked, host)
+			}
+			candidates = []net.IP{ip}
+		} else {
+			candidates, err = resolveHostIPs(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			for _, ip := range candidates {
+				if checkBlockedIP(ip) {
+					return nil, fmt.Errorf("%w: %s resolves to blocked address %s", ErrCustomGeoSSRFBlocked, host, ip)
+				}
+			}
 		}
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, network, addr)
+		var dialErr error
+		for _, ip := range candidates {
+			conn, err := ssrfDialer(ctx, network, net.JoinHostPort(ip.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+			dialErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+		}
+		return nil, dialErr
 	}
+	// TLS ServerName and the HTTP Host header are derived from the
+	// request URL by the Transport, not from the dial address, so HTTPS
+	// still verifies the original domain and HTTP still sends the
+	// original Host.
 	return cloned
 }
 

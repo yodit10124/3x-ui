@@ -6,6 +6,9 @@ class AllSetting {
         this.webPort = 2053;
         this.webCertFile = "";
         this.webKeyFile = "";
+        this.webSecureCookie = false;
+        this.webHSTSMaxAge = 31536000;
+        this.wsTrustedOrigins = "";
         this.webBasePath = "/";
         this.sessionMaxAge = 360;
         this.pageSize = 25;

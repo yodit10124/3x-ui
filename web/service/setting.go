@@ -28,11 +28,31 @@ var defaultValueMap = map[string]string{
 	// Fresh installs bind the panel to all interfaces by default.
 	// An operator can still change this in the settings; existing
 	// databases keep their stored value.
-	"webListen":                   "0.0.0.0",
-	"webDomain":                   "",
-	"webPort":                     "2053",
-	"webCertFile":                 "",
-	"webKeyFile":                  "",
+	"webListen":   "0.0.0.0",
+	"webDomain":   "",
+	"webPort":     "2053",
+	"webCertFile": "",
+	"webKeyFile":  "",
+	// webSecureCookie: explicit opt-in for TLS terminated by a reverse
+	// proxy. Direct TLS (webCertFile/webKeyFile set) enables Secure
+	// cookies automatically; this flag covers the proxy case, where the
+	// panel itself serves plain HTTP but the browser reaches it over
+	// HTTPS. Never derived from X-Forwarded-Proto: any client can send
+	// that header, so trusting it would let an HTTP attacker flip the
+	// cookie flag (or, worse, make the panel believe it is on HTTPS).
+	"webSecureCookie": "false",
+	// webHSTSMaxAge: Strict-Transport-Security max-age in seconds, sent
+	// only when the panel is served over HTTPS. 0 disables the header.
+	// Default is one year; HTTP-only deployments are unaffected.
+	"webHSTSMaxAge": "31536000",
+	// wsTrustedOrigins: comma-separated list of full origins
+	// (scheme://host[:port]) allowed to open a WebSocket to the panel in
+	// addition to the panel's own origin. This covers reverse-proxy
+	// deployments, where the browser's Origin is the public address but
+	// the panel itself only sees the proxy's plain-HTTP request. Empty
+	// means "same origin only". Entries are matched as a full triple
+	// (scheme, host, effective port); a bare host never matches.
+	"wsTrustedOrigins":            "",
 	"secret":                      random.Seq(32),
 	"webBasePath":                 "/",
 	"sessionMaxAge":               "360",
@@ -392,6 +412,36 @@ func (s *SettingService) SetKeyFile(webKeyFile string) error {
 
 func (s *SettingService) GetKeyFile() (string, error) {
 	return s.getString("webKeyFile")
+}
+
+// GetSecureCookie reports whether the login session cookie must carry the
+// Secure attribute. This is the explicit reverse-proxy opt-in; direct TLS
+// is detected separately in web.Start.
+func (s *SettingService) GetSecureCookie() (bool, error) {
+	return s.getBool("webSecureCookie")
+}
+
+// GetHSTSMaxAge returns the Strict-Transport-Security max-age in seconds.
+// Zero disables the HSTS header.
+func (s *SettingService) GetHSTSMaxAge() (int, error) {
+	return s.getInt("webHSTSMaxAge")
+}
+
+// GetWSTrustedOrigins returns the configured list of external WebSocket
+// origins (scheme://host[:port]), split on commas with whitespace trimmed
+// and empty entries dropped. An empty setting yields an empty list.
+func (s *SettingService) GetWSTrustedOrigins() ([]string, error) {
+	raw, err := s.getString("wsTrustedOrigins")
+	if err != nil {
+		return nil, err
+	}
+	origins := make([]string, 0)
+	for _, part := range strings.Split(raw, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			origins = append(origins, part)
+		}
+	}
+	return origins, nil
 }
 
 func (s *SettingService) GetExpireDiff() (int, error) {

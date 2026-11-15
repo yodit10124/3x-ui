@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -23,12 +24,18 @@ import (
 // login/panel page is a blank white screen. That is what happened with the
 // first build of this fix (2026-11-07): HTML and APIs all returned 200,
 // but the page was white in a real browser.
-func SecurityHeadersMiddleware() gin.HandlerFunc {
+func SecurityHeadersMiddleware(hstsMaxAge int, https bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; form-action 'self'; base-uri 'self'; object-src 'none'")
 		c.Header("X-Frame-Options", "SAMEORIGIN")
 		c.Header("X-Content-Type-Options", "nosniff")
 		c.Header("Referrer-Policy", "same-origin")
+		// HSTS is only meaningful (and only safe) over HTTPS: sending it
+		// on a plain-HTTP deployment would make browsers refuse to ever
+		// reach the panel over HTTP afterwards. maxAge <= 0 disables it.
+		if https && hstsMaxAge > 0 {
+			c.Header("Strict-Transport-Security", "max-age="+strconv.Itoa(hstsMaxAge))
+		}
 		c.Next()
 	}
 }

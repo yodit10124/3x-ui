@@ -21,13 +21,16 @@ type Msg struct {
 // AllSetting contains all configuration settings for the 3x-ui panel including web server and Telegram bot settings.
 type AllSetting struct {
 	// Web server settings
-	WebListen     string `json:"webListen" form:"webListen"`         // Web server listen IP address
-	WebDomain     string `json:"webDomain" form:"webDomain"`         // Web server domain for domain validation
-	WebPort       int    `json:"webPort" form:"webPort"`             // Web server port number
-	WebCertFile   string `json:"webCertFile" form:"webCertFile"`     // Path to SSL certificate file for web server
-	WebKeyFile    string `json:"webKeyFile" form:"webKeyFile"`       // Path to SSL private key file for web server
-	WebBasePath   string `json:"webBasePath" form:"webBasePath"`     // Base path for web panel URLs
-	SessionMaxAge int    `json:"sessionMaxAge" form:"sessionMaxAge"` // Session maximum age in minutes
+	WebListen        string `json:"webListen" form:"webListen"`               // Web server listen IP address
+	WebDomain        string `json:"webDomain" form:"webDomain"`               // Web server domain for domain validation
+	WebPort          int    `json:"webPort" form:"webPort"`                   // Web server port number
+	WebCertFile      string `json:"webCertFile" form:"webCertFile"`           // Path to SSL certificate file for web server
+	WebKeyFile       string `json:"webKeyFile" form:"webKeyFile"`             // Path to SSL private key file for web server
+	WebBasePath      string `json:"webBasePath" form:"webBasePath"`           // Base path for web panel URLs
+	WebSecureCookie  bool   `json:"webSecureCookie" form:"webSecureCookie"`   // Set Secure on the session cookie (TLS terminated by a reverse proxy)
+	WebHSTSMaxAge    int    `json:"webHSTSMaxAge" form:"webHSTSMaxAge"`       // HSTS max-age in seconds, 0 disables it (HTTPS only)
+	WsTrustedOrigins string `json:"wsTrustedOrigins" form:"wsTrustedOrigins"` // Comma-separated external origins allowed to open a WebSocket
+	SessionMaxAge    int    `json:"sessionMaxAge" form:"sessionMaxAge"`       // Session maximum age in minutes
 
 	// UI settings
 	PageSize    int    `json:"pageSize" form:"pageSize"`       // Number of items per page in lists
@@ -106,6 +109,10 @@ func (s *AllSetting) CheckValid() error {
 	}
 	if !strings.HasSuffix(s.WebBasePath, "/") {
 		s.WebBasePath += "/"
+	}
+
+	if s.WebHSTSMaxAge < 0 {
+		return common.NewError("HSTS max-age must not be negative:", s.WebHSTSMaxAge)
 	}
 
 	_, err := time.LoadLocation(s.TimeLocation)

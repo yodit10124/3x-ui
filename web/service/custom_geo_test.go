@@ -1,25 +1,56 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 )
 
 // disableSSRFCheck disables the SSRF guard for the duration of a test,
-// allowing httptest servers on localhost. It restores the original on cleanup.
+// allowing httptest servers on localhost. It restores the originals on cleanup.
 func disableSSRFCheck(t *testing.T) {
 	t.Helper()
-	orig := checkSSRF
+	origCheck := checkSSRF
+	origBlocked := checkBlockedIP
+	origResolve := resolveHostIPs
 	checkSSRF = func(_ context.Context, _ string) error { return nil }
-	t.Cleanup(func() { checkSSRF = orig })
+	checkBlockedIP = func(net.IP) bool { return false }
+	resolveHostIPs = func(ctx context.Context, host string) ([]net.IP, error) {
+		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		ips := make([]net.IP, 0, len(addrs))
+		for _, addr := range addrs {
+			ips = append(ips, addr.IP)
+		}
+		return ips, nil
+	}
+	t.Cleanup(func() {
+		checkSSRF = origCheck
+		checkBlockedIP = origBlocked
+		resolveHostIPs = origResolve
+	})
 }
 
 func TestNormalizeAliasKey(t *testing.T) {
@@ -344,5 +375,407 @@ func TestProbeCustomGeoURL_HEAD405GETRange(t *testing.T) {
 	defer ts.Close()
 	if err := probeCustomGeoURL(ts.URL); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// --- DNS-rebinding SSRF regression tests (issue 5) ---
+
+// fakeConn is a minimal net.Conn that serves a canned HTTP response and
+// discards whatever the client writes. The response is fed only after the
+// client writes the request (like a real server): a buffer pre-loaded at
+// dial time lets the transport's readLoop peek a byte before the request
+// is registered, which kills the connection with a spurious
+// readLoopPeekFailLocked error. Read blocks while the buffer is empty
+// (until Close), like a real server connection.
+type fakeConn struct {
+	mu        sync.Mutex
+	cond      *sync.Cond
+	buf       *bytes.Buffer
+	response  string
+	responded bool
+	closed    bool
+	addr      net.Addr
+}
+
+type fakeAddr string
+
+func (a fakeAddr) Network() string { return "tcp" }
+func (a fakeAddr) String() string  { return string(a) }
+
+func newFakeConn(response string, addr string) *fakeConn {
+	c := &fakeConn{buf: &bytes.Buffer{}, response: response, addr: fakeAddr(addr)}
+	c.cond = sync.NewCond(&c.mu)
+	return c
+}
+
+func (c *fakeConn) Read(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for c.buf.Len() == 0 && !c.closed {
+		c.cond.Wait()
+	}
+	if c.buf.Len() == 0 {
+		return 0, io.EOF
+	}
+	return c.buf.Read(b)
+}
+
+func (c *fakeConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	if !c.responded {
+		// First write carries the request: answer it now.
+		c.responded = true
+		c.buf.WriteString(c.response)
+		c.cond.Broadcast()
+	}
+	c.mu.Unlock()
+	return len(b), nil
+}
+
+func (c *fakeConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	c.cond.Broadcast()
+	return nil
+}
+func (c *fakeConn) LocalAddr() net.Addr              { return c.addr }
+func (c *fakeConn) RemoteAddr() net.Addr             { return c.addr }
+func (c *fakeConn) SetDeadline(time.Time) error      { return nil }
+func (c *fakeConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *fakeConn) SetWriteDeadline(time.Time) error { return nil }
+
+// recordingDialer records every address the transport dials and answers
+// each dial with the next canned HTTP response from responses.
+type recordingDialer struct {
+	mu        sync.Mutex
+	dialed    []string
+	responses []string
+}
+
+func (d *recordingDialer) dial(_ context.Context, _, addr string) (net.Conn, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.dialed = append(d.dialed, addr)
+	body := "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+	if len(d.responses) > 0 {
+		body = d.responses[0]
+		d.responses = d.responses[1:]
+	}
+	return newFakeConn(body, addr), nil
+}
+
+func (d *recordingDialer) dialedAddrs() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := append([]string(nil), d.dialed...)
+	return out
+}
+
+// installSSRFTestHooks replaces the resolver and dialer for the duration
+// of a test and restores them on cleanup.
+func installSSRFTestHooks(t *testing.T, resolve func(context.Context, string) ([]net.IP, error), dialer *recordingDialer) {
+	t.Helper()
+	origResolve := resolveHostIPs
+	origDialer := ssrfDialer
+	resolveHostIPs = resolve
+	ssrfDialer = dialer.dial
+	t.Cleanup(func() {
+		resolveHostIPs = origResolve
+		ssrfDialer = origDialer
+	})
+}
+
+// TestSSRFTransportRebindingBlocked is the core regression test: the
+// resolver answers a public IP on the first lookup and a loopback IP on
+// any later lookup (the rebinding attack). The transport must resolve
+// exactly once and dial the validated public IP — never the loopback
+// address a second resolution would return.
+func TestSSRFTransportRebindingBlocked(t *testing.T) {
+	resolveCalls := 0
+	dialer := &recordingDialer{}
+	installSSRFTestHooks(t, func(_ context.Context, host string) ([]net.IP, error) {
+		resolveCalls++
+		if resolveCalls == 1 {
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		}
+		return []net.IP{net.ParseIP("127.0.0.1")}, nil
+	}, dialer)
+
+	// Disable keep-alives: each request must dial a fresh connection
+	// (a reused fakeConn would EOF on the transport's read peek and
+	// mask the dial-time check under test).
+	tr := ssrfSafeTransport().(*http.Transport)
+	tr.DisableKeepAlives = true
+	client := &http.Client{Transport: tr}
+	resp, err := client.Get("http://example.com/")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "OK" {
+		t.Fatalf("body = %q, want OK", body)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("resolver called %d times, want exactly 1 (no re-resolution at dial time)", resolveCalls)
+	}
+	dialed := dialer.dialedAddrs()
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:80" {
+		t.Fatalf("dialed %v, want [93.184.216.34:80] — the connection must go to the validated public IP", dialed)
+	}
+}
+
+// TestSSRFTransportBlocksPrivateIP: a hostname resolving to a private IP
+// is rejected before any dial happens.
+func TestSSRFTransportBlocksPrivateIP(t *testing.T) {
+	dialer := &recordingDialer{}
+	installSSRFTestHooks(t, func(_ context.Context, _ string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("10.0.0.5")}, nil
+	}, dialer)
+
+	// Disable keep-alives: each request must dial a fresh connection
+	// (a reused fakeConn would EOF on the transport's read peek and
+	// mask the dial-time check under test).
+	tr := ssrfSafeTransport().(*http.Transport)
+	tr.DisableKeepAlives = true
+	client := &http.Client{Transport: tr}
+	_, err := client.Get("http://internal.example.com/")
+	if err == nil {
+		t.Fatal("GET to a private IP succeeded, want an SSRF error")
+	}
+	if !errors.Is(err, ErrCustomGeoSSRFBlocked) {
+		t.Fatalf("GET error = %v, want it to wrap %v", err, ErrCustomGeoSSRFBlocked)
+	}
+	if got := dialer.dialedAddrs(); len(got) != 0 {
+		t.Fatalf("dialed %v, want no dial at all", got)
+	}
+}
+
+// TestSSRFTransportBlocksMixedAnswer: one blocked IP among the candidates
+// rejects the whole answer, even if a public IP is also present.
+func TestSSRFTransportBlocksMixedAnswer(t *testing.T) {
+	dialer := &recordingDialer{}
+	installSSRFTestHooks(t, func(_ context.Context, _ string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("93.184.216.34"), net.ParseIP("169.254.169.254")}, nil
+	}, dialer)
+
+	// Disable keep-alives: each request must dial a fresh connection
+	// (a reused fakeConn would EOF on the transport's read peek and
+	// mask the dial-time check under test).
+	tr := ssrfSafeTransport().(*http.Transport)
+	tr.DisableKeepAlives = true
+	client := &http.Client{Transport: tr}
+	_, err := client.Get("http://example.com/")
+	if err == nil {
+		t.Fatal("GET with a mixed public/private answer succeeded, want an SSRF error")
+	}
+	if !errors.Is(err, ErrCustomGeoSSRFBlocked) {
+		t.Fatalf("GET error = %v, want it to wrap %v", err, ErrCustomGeoSSRFBlocked)
+	}
+	if got := dialer.dialedAddrs(); len(got) != 0 {
+		t.Fatalf("dialed %v, want no dial at all", got)
+	}
+}
+
+// TestSSRFTransportIPLiteral: IP-literal hosts are validated as-is and
+// never resolved; a public literal is dialled directly.
+func TestSSRFTransportIPLiteral(t *testing.T) {
+	resolveCalls := 0
+	dialer := &recordingDialer{}
+	installSSRFTestHooks(t, func(_ context.Context, _ string) ([]net.IP, error) {
+		resolveCalls++
+		return nil, fmt.Errorf("resolver must not be called for IP literals")
+	}, dialer)
+
+	// Disable keep-alives: each request must dial a fresh connection
+	// (a reused fakeConn would EOF on the transport's read peek and
+	// mask the dial-time check under test).
+	tr := ssrfSafeTransport().(*http.Transport)
+	tr.DisableKeepAlives = true
+	client := &http.Client{Transport: tr}
+	resp, err := client.Get("http://93.184.216.34/")
+	if err != nil {
+		t.Fatalf("GET public IP literal: %v", err)
+	}
+	resp.Body.Close()
+	if resolveCalls != 0 {
+		t.Fatalf("resolver called %d times for an IP literal, want 0", resolveCalls)
+	}
+	if got := dialer.dialedAddrs(); len(got) != 1 || got[0] != "93.184.216.34:80" {
+		t.Fatalf("dialed %v, want [93.184.216.34:80]", got)
+	}
+
+	// A loopback literal is blocked without a dial.
+	_, err = client.Get("http://127.0.0.1:1234/")
+	if err == nil {
+		t.Fatal("GET to a loopback literal succeeded, want an SSRF error")
+	}
+	if !errors.Is(err, ErrCustomGeoSSRFBlocked) {
+		t.Fatalf("GET error = %v, want it to wrap %v", err, ErrCustomGeoSSRFBlocked)
+	}
+}
+
+// TestSSRFTransportRedirectRevalidated: a redirect to a host that resolves
+// to a private IP is blocked; the redirect target goes through the same
+// resolve-once-and-dial-validated-IP path as the original URL.
+func TestSSRFTransportRedirectRevalidated(t *testing.T) {
+	dialer := &recordingDialer{
+		responses: []string{
+			"HTTP/1.1 302 Found\r\nLocation: http://internal.example.com/\r\nContent-Length: 0\r\n\r\n",
+		},
+	}
+	installSSRFTestHooks(t, func(_ context.Context, host string) ([]net.IP, error) {
+		switch host {
+		case "example.com":
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		case "internal.example.com":
+			return []net.IP{net.ParseIP("10.1.2.3")}, nil
+		}
+		return nil, fmt.Errorf("unexpected host %s", host)
+	}, dialer)
+
+	// Disable keep-alives: each request must dial a fresh connection
+	// (a reused fakeConn would EOF on the transport's read peek and
+	// mask the dial-time check under test).
+	tr := ssrfSafeTransport().(*http.Transport)
+	tr.DisableKeepAlives = true
+	client := &http.Client{Transport: tr}
+	_, err := client.Get("http://example.com/")
+	t.Logf("redirect test: dialed=%v err=%v", dialer.dialedAddrs(), err)
+	if err == nil {
+		t.Fatal("redirect to a private IP succeeded, want an SSRF error")
+	}
+	if !errors.Is(err, ErrCustomGeoSSRFBlocked) {
+		t.Fatalf("GET error = %v, want it to wrap %v", err, ErrCustomGeoSSRFBlocked)
+	}
+	// Only the first hop was dialled; the redirect target was blocked
+	// before its dial.
+	if got := dialer.dialedAddrs(); len(got) != 1 || got[0] != "93.184.216.34:80" {
+		t.Fatalf("dialed %v, want only [93.184.216.34:80]", got)
+	}
+}
+
+// TestSSRFTransportIgnoresProxy: with HTTP_PROXY pointing at a dead proxy,
+// the download still goes direct — the proxy must not get the hostname
+// (and must not bypass validation by resolving it itself).
+func TestSSRFTransportIgnoresProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:9")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+	t.Setenv("http_proxy", "http://127.0.0.1:9")
+	t.Setenv("https_proxy", "http://127.0.0.1:9")
+
+	dialer := &recordingDialer{}
+	installSSRFTestHooks(t, func(_ context.Context, _ string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("93.184.216.34")}, nil
+	}, dialer)
+
+	// Disable keep-alives: each request must dial a fresh connection
+	// (a reused fakeConn would EOF on the transport's read peek and
+	// mask the dial-time check under test).
+	tr := ssrfSafeTransport().(*http.Transport)
+	tr.DisableKeepAlives = true
+	client := &http.Client{Transport: tr}
+	resp, err := client.Get("http://example.com/")
+	if err != nil {
+		t.Fatalf("GET with a dead proxy configured: %v (the proxy must be ignored)", err)
+	}
+	resp.Body.Close()
+	if got := dialer.dialedAddrs(); len(got) != 1 || got[0] != "93.184.216.34:80" {
+		t.Fatalf("dialed %v, want a direct dial of [93.184.216.34:80]", got)
+	}
+}
+
+// TestSSRFTransportHTTPSKeepsSNIAndHost: over HTTPS the TLS ServerName and
+// the HTTP Host header still carry the original domain, even though the
+// TCP connection goes to the validated IP.
+func TestSSRFTransportHTTPSKeepsSNIAndHost(t *testing.T) {
+	// A self-signed certificate for example.com, trusted by the test client.
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "example.com"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"example.com"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	serverCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("load key pair: %v", err)
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(certPEM)
+
+	var gotSNI, gotHost string
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		_, _ = w.Write([]byte("ok"))
+	}))
+	srv.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			gotSNI = hi.ServerName
+			return &serverCert, nil
+		},
+	}
+	srv.StartTLS()
+	defer srv.Close()
+
+	// The server listens on 127.0.0.1:<port>; the URL uses example.com
+	// with that port so the dialer resolves example.com to the server.
+	serverURL, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("server URL: %v", err)
+	}
+	_, port, err := net.SplitHostPort(serverURL.Host)
+	if err != nil {
+		t.Fatalf("server host: %v", err)
+	}
+	targetURL := "https://example.com:" + port + "/"
+
+	// Only the resolver is faked here: the TLS handshake needs a real
+	// TCP connection to the test server.
+	origResolve := resolveHostIPs
+	resolveHostIPs = func(_ context.Context, host string) ([]net.IP, error) {
+		if host != "example.com" {
+			return nil, fmt.Errorf("unexpected host %s", host)
+		}
+		return []net.IP{net.ParseIP("127.0.0.1")}, nil
+	}
+	t.Cleanup(func() { resolveHostIPs = origResolve })
+
+	// The test resolver returns loopback, so allow it for this test only.
+	origBlocked := checkBlockedIP
+	checkBlockedIP = func(net.IP) bool { return false }
+	t.Cleanup(func() { checkBlockedIP = origBlocked })
+
+	tr := ssrfSafeTransport().(*http.Transport)
+	tr.TLSClientConfig = &tls.Config{RootCAs: pool}
+	client := &http.Client{Transport: tr}
+	resp, err := client.Get(targetURL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "ok" {
+		t.Fatalf("body = %q, want ok", body)
+	}
+	if gotSNI != "example.com" {
+		t.Fatalf("TLS ServerName = %q, want example.com", gotSNI)
+	}
+	if gotHost != "example.com:"+port {
+		t.Fatalf("HTTP Host = %q, want example.com:%s", gotHost, port)
 	}
 }

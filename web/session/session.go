@@ -5,6 +5,7 @@ package session
 import (
 	"encoding/gob"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
@@ -17,6 +18,26 @@ import (
 const (
 	loginUserKey = "LOGIN_USER"
 )
+
+// secureCookie mirrors the Secure attribute of the session cookie created
+// at login. Set once at startup by web.initRouter (same decision as the
+// login cookie) so ClearSession can delete the cookie with identical
+// attributes; a Secure cookie deleted without Secure would survive in
+// the browser. Guarded by an atomic value because the web server reads it
+// from request goroutines.
+var secureCookie atomic.Bool
+
+// SetSecureCookie records whether session cookies carry the Secure flag.
+// Called once during router setup; later calls (e.g. a settings change
+// followed by a panel restart) simply overwrite it.
+func SetSecureCookie(secure bool) {
+	secureCookie.Store(secure)
+}
+
+// SecureCookie reports the flag recorded by SetSecureCookie.
+func SecureCookie() bool {
+	return secureCookie.Load()
+}
 
 func init() {
 	gob.Register(model.User{})
@@ -75,7 +96,7 @@ func IsLogin(c *gin.Context) bool {
 }
 
 // ClearSession invalidates the session and tells the browser to drop the cookie.
-// The cookie attributes (Path/HttpOnly/SameSite) must mirror those used when
+// The cookie attributes (Path/HttpOnly/SameSite/Secure) must mirror those used when
 // the cookie was created or browsers will keep it.
 func ClearSession(c *gin.Context) error {
 	s := sessions.Default(c)
@@ -88,6 +109,7 @@ func ClearSession(c *gin.Context) error {
 		Path:     cookiePath,
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   SecureCookie(),
 		SameSite: http.SameSiteLaxMode,
 	})
 	return s.Save()

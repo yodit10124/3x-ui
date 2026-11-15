@@ -18,6 +18,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/config"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/util/crypto"
+	"github.com/mhsanaei/3x-ui/v2/util/random"
 	"github.com/mhsanaei/3x-ui/v2/xray"
 
 	"gorm.io/driver/sqlite"
@@ -29,7 +30,9 @@ var db *gorm.DB
 
 const (
 	defaultUsername = "admin"
-	defaultPassword = "admin"
+	// defaultPasswordLength is the length of the random admin password
+	// generated on first start with an empty database.
+	defaultPasswordLength = 16
 )
 
 func initModels() error {
@@ -52,7 +55,12 @@ func initModels() error {
 	return nil
 }
 
-// initUser creates a default admin user if the users table is empty.
+// initUser creates an admin user if the users table is empty. A fresh
+// database started directly — bypassing the install script, which sets
+// its own random credentials afterwards via UpdateFirstUser — gets a
+// random password instead of the well-known admin/admin: the password is
+// printed once in the startup log so the operator can log in and change
+// it. Existing databases are untouched.
 func initUser() error {
 	empty, err := isTableEmpty("users")
 	if err != nil {
@@ -60,7 +68,8 @@ func initUser() error {
 		return err
 	}
 	if empty {
-		hashedPassword, err := crypto.HashPasswordAsBcrypt(defaultPassword)
+		password := random.Seq(defaultPasswordLength)
+		hashedPassword, err := crypto.HashPasswordAsBcrypt(password)
 
 		if err != nil {
 			log.Printf("Error hashing default password: %v", err)
@@ -71,7 +80,16 @@ func initUser() error {
 			Username: defaultUsername,
 			Password: hashedPassword,
 		}
-		return db.Create(user).Error
+		if err := db.Create(user).Error; err != nil {
+			return err
+		}
+		log.Printf("============================================================")
+		log.Printf("3x-ui first start: no admin user found, a random password was generated.")
+		log.Printf("    username: %s", defaultUsername)
+		log.Printf("    password: %s", password)
+		log.Printf("Log in and change it in Settings. This password is only shown once.")
+		log.Printf("============================================================")
+		return nil
 	}
 	return nil
 }

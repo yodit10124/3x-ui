@@ -68,26 +68,146 @@ var (
 		timestamp time.Time
 		mutex     sync.RWMutex
 	}
-
-	// clients data to adding new client
-	receiver_inbound_ID int
-	client_Id           string
-	client_Flow         string
-	client_Email        string
-	client_LimitIP      int
-	client_TotalGB      int64
-	client_ExpiryTime   int64
-	client_Enable       bool
-	client_TgID         string
-	client_Comment      string
-	client_Reset        int
-	client_Security     string
-	client_ShPassword   string
-	client_TrPassword   string
-	client_Method       string
 )
 
-var userStates = make(map[int64]string)
+// addClientSessionTTL bounds how long an unfinished add-client flow stays
+// alive. Expired sessions are dropped on next access.
+const addClientSessionTTL = 30 * time.Minute
+
+// addClientSession holds the in-progress data of one add-client flow,
+// owned by a single Telegram user in a single chat. Two admins working in
+// parallel (or two chats) each get their own session, so their inputs can
+// never overwrite each other.
+type addClientSession struct {
+	userID     int64
+	chatID     int64
+	inboundID  int
+	state      string // awaiting_* step; "" when not waiting for text input
+	id         string
+	flow       string
+	email      string
+	limitIP    int
+	totalGB    int64
+	expiryTime int64
+	enable     bool
+	tgID       string
+	comment    string
+	reset      int
+	security   string
+	shPassword string
+	trPassword string
+	method     string
+	lastActive time.Time
+}
+
+// addClientSessionKey isolates sessions by chat and by the user who started
+// the flow. A group member who did not start the flow cannot read or
+// modify it, and two admins in the same group keep separate sessions.
+type addClientSessionKey struct {
+	chatID int64
+	userID int64
+}
+
+var (
+	// addClientSessionsMu guards every read, write and delete of the
+	// session map and of the sessions inside it. It is held for the
+	// duration of one callback/input step (including the Telegram sends
+	// inside it): add-client flows are rare interactive operations, so
+	// the serialization cost is negligible, and a single lock keeps the
+	// discipline deadlock-free.
+	addClientSessionsMu sync.Mutex
+	addClientSessions   = make(map[addClientSessionKey]*addClientSession)
+)
+
+// newAddClientSession creates a session owned by (chatID, userID) with the
+// default client values. Callers must hold addClientSessionsMu.
+func (t *Tgbot) newAddClientSession(chatID, userID int64, inboundID int) *addClientSession {
+	sess := &addClientSession{
+		userID:     userID,
+		chatID:     chatID,
+		inboundID:  inboundID,
+		id:         uuid.New().String(),
+		flow:       "",
+		email:      t.randomLowerAndNum(8),
+		limitIP:    0,
+		totalGB:    0,
+		expiryTime: 0,
+		enable:     true,
+		tgID:       "",
+		comment:    "",
+		reset:      0,
+		security:   "auto",
+		shPassword: t.randomShadowSocksPassword(),
+		trPassword: t.randomLowerAndNum(10),
+		method:     "",
+		lastActive: time.Now(),
+	}
+	addClientSessions[addClientSessionKey{chatID: chatID, userID: userID}] = sess
+	return sess
+}
+
+// getAddClientSession returns the live session for (chatID, userID), or nil
+// when there is none or it expired. Expired sessions are removed.
+// Callers must hold addClientSessionsMu.
+func getAddClientSession(chatID, userID int64) *addClientSession {
+	key := addClientSessionKey{chatID: chatID, userID: userID}
+	sess, ok := addClientSessions[key]
+	if !ok {
+		return nil
+	}
+	if time.Since(sess.lastActive) > addClientSessionTTL {
+		delete(addClientSessions, key)
+		return nil
+	}
+	sess.lastActive = time.Now()
+	return sess
+}
+
+// deleteAddClientSession removes the session for (chatID, userID), if any.
+// Callers must hold addClientSessionsMu.
+func deleteAddClientSession(chatID, userID int64) {
+	delete(addClientSessions, addClientSessionKey{chatID: chatID, userID: userID})
+}
+
+// clearAddClientInputState clears the awaiting-input step of the session
+// for (chatID, userID), keeping the collected client data. It is used when
+// a command, a button press or the close-keyboard action cancels text
+// input without cancelling the flow itself.
+func clearAddClientInputState(chatID, userID int64) {
+	addClientSessionsMu.Lock()
+	defer addClientSessionsMu.Unlock()
+	if sess := getAddClientSession(chatID, userID); sess != nil {
+		sess.state = ""
+	}
+}
+
+// requireAddClientSession returns the live session for the callback's
+// sender, answering the callback with an error when the flow is gone
+// (expired, cancelled, or never started). Callers must hold
+// addClientSessionsMu.
+func (t *Tgbot) requireAddClientSession(callbackQuery *telego.CallbackQuery) *addClientSession {
+	sess := getAddClientSession(callbackQuery.Message.GetChat().ID, callbackQuery.From.ID)
+	if sess == nil {
+		t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.noQuery"))
+		return nil
+	}
+	return sess
+}
+
+// personalBotCallbacks are the only callbacks a non-admin Telegram user may
+// invoke. client_traffic answers with the caller's own usage (looked up by
+// their Telegram user ID) and client_commands is static help text, so
+// neither leaks another user's data.
+var personalBotCallbacks = map[string]bool{
+	"client_traffic":  true,
+	"client_commands": true,
+}
+
+// isPersonalBotCallback reports whether a callback is a personal query any
+// user may invoke for their own data.
+func isPersonalBotCallback(data string) bool {
+	return personalBotCallbacks[data]
+}
 
 // LoginStatus represents the result of a login attempt.
 type LoginStatus byte
@@ -454,7 +574,7 @@ func (t *Tgbot) OnReceive() {
 		tgBotMutex.Unlock()
 
 		h.HandleMessage(func(ctx *th.Context, message telego.Message) error {
-			delete(userStates, message.Chat.ID)
+			clearAddClientInputState(message.Chat.ID, message.From.ID)
 			t.SendMsgToTgbot(message.Chat.ID, t.I18nBot("tgbot.keyboardClosed"), tu.ReplyKeyboardRemove())
 			return nil
 		}, th.TextEqual(t.I18nBot("tgbot.buttons.closeKeyboard")))
@@ -465,7 +585,7 @@ func (t *Tgbot) OnReceive() {
 				messageWorkerPool <- struct{}{}        // Acquire worker
 				defer func() { <-messageWorkerPool }() // Release worker
 
-				delete(userStates, message.Chat.ID)
+				clearAddClientInputState(message.Chat.ID, message.From.ID)
 				t.answerCommand(&message, message.Chat.ID, checkAdmin(message.From.ID))
 			}()
 			return nil
@@ -477,160 +597,177 @@ func (t *Tgbot) OnReceive() {
 				messageWorkerPool <- struct{}{}        // Acquire worker
 				defer func() { <-messageWorkerPool }() // Release worker
 
-				delete(userStates, query.Message.GetChat().ID)
+				clearAddClientInputState(query.Message.GetChat().ID, query.From.ID)
 				t.answerCallback(&query, checkAdmin(query.From.ID))
 			}()
 			return nil
 		}, th.AnyCallbackQueryWithMessage())
 
 		h.HandleMessage(func(ctx *th.Context, message telego.Message) error {
-			if userState, exists := userStates[message.Chat.ID]; exists {
-				switch userState {
-				case "awaiting_id":
-					if client_Id == strings.TrimSpace(message.Text) {
-						t.SendMsgToTgbotDeleteAfter(message.Chat.ID, t.I18nBot("tgbot.messages.using_default_value"), 3, tu.ReplyKeyboardRemove())
-						delete(userStates, message.Chat.ID)
-						inbound, _ := t.inboundService.GetInbound(receiver_inbound_ID)
-						message_text, _ := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
-						t.addClient(message.Chat.ID, message_text)
-						return nil
-					}
-
-					client_Id = strings.TrimSpace(message.Text)
-					if t.isSingleWord(client_Id) {
-						userStates[message.Chat.ID] = "awaiting_id"
-
-						cancel_btn_markup := tu.InlineKeyboard(
-							tu.InlineKeyboardRow(
-								tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
-							),
-						)
-
-						t.SendMsgToTgbot(message.Chat.ID, t.I18nBot("tgbot.messages.incorrect_input"), cancel_btn_markup)
-					} else {
-						t.SendMsgToTgbotDeleteAfter(message.Chat.ID, t.I18nBot("tgbot.messages.received_id"), 3, tu.ReplyKeyboardRemove())
-						delete(userStates, message.Chat.ID)
-						inbound, _ := t.inboundService.GetInbound(receiver_inbound_ID)
-						message_text, _ := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
-						t.addClient(message.Chat.ID, message_text)
-					}
-				case "awaiting_password_tr":
-					if client_TrPassword == strings.TrimSpace(message.Text) {
-						t.SendMsgToTgbotDeleteAfter(message.Chat.ID, t.I18nBot("tgbot.messages.using_default_value"), 3, tu.ReplyKeyboardRemove())
-						delete(userStates, message.Chat.ID)
-						return nil
-					}
-
-					client_TrPassword = strings.TrimSpace(message.Text)
-					if t.isSingleWord(client_TrPassword) {
-						userStates[message.Chat.ID] = "awaiting_password_tr"
-
-						cancel_btn_markup := tu.InlineKeyboard(
-							tu.InlineKeyboardRow(
-								tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
-							),
-						)
-
-						t.SendMsgToTgbot(message.Chat.ID, t.I18nBot("tgbot.messages.incorrect_input"), cancel_btn_markup)
-					} else {
-						t.SendMsgToTgbotDeleteAfter(message.Chat.ID, t.I18nBot("tgbot.messages.received_password"), 3, tu.ReplyKeyboardRemove())
-						delete(userStates, message.Chat.ID)
-						inbound, _ := t.inboundService.GetInbound(receiver_inbound_ID)
-						message_text, _ := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
-						t.addClient(message.Chat.ID, message_text)
-					}
-				case "awaiting_password_sh":
-					if client_ShPassword == strings.TrimSpace(message.Text) {
-						t.SendMsgToTgbotDeleteAfter(message.Chat.ID, t.I18nBot("tgbot.messages.using_default_value"), 3, tu.ReplyKeyboardRemove())
-						delete(userStates, message.Chat.ID)
-						return nil
-					}
-
-					client_ShPassword = strings.TrimSpace(message.Text)
-					if t.isSingleWord(client_ShPassword) {
-						userStates[message.Chat.ID] = "awaiting_password_sh"
-
-						cancel_btn_markup := tu.InlineKeyboard(
-							tu.InlineKeyboardRow(
-								tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
-							),
-						)
-
-						t.SendMsgToTgbot(message.Chat.ID, t.I18nBot("tgbot.messages.incorrect_input"), cancel_btn_markup)
-					} else {
-						t.SendMsgToTgbotDeleteAfter(message.Chat.ID, t.I18nBot("tgbot.messages.received_password"), 3, tu.ReplyKeyboardRemove())
-						delete(userStates, message.Chat.ID)
-						inbound, _ := t.inboundService.GetInbound(receiver_inbound_ID)
-						message_text, _ := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
-						t.addClient(message.Chat.ID, message_text)
-					}
-				case "awaiting_email":
-					if client_Email == strings.TrimSpace(message.Text) {
-						t.SendMsgToTgbotDeleteAfter(message.Chat.ID, t.I18nBot("tgbot.messages.using_default_value"), 3, tu.ReplyKeyboardRemove())
-						delete(userStates, message.Chat.ID)
-						return nil
-					}
-
-					client_Email = strings.TrimSpace(message.Text)
-					if t.isSingleWord(client_Email) {
-						userStates[message.Chat.ID] = "awaiting_email"
-
-						cancel_btn_markup := tu.InlineKeyboard(
-							tu.InlineKeyboardRow(
-								tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
-							),
-						)
-
-						t.SendMsgToTgbot(message.Chat.ID, t.I18nBot("tgbot.messages.incorrect_input"), cancel_btn_markup)
-					} else {
-						t.SendMsgToTgbotDeleteAfter(message.Chat.ID, t.I18nBot("tgbot.messages.received_email"), 3, tu.ReplyKeyboardRemove())
-						delete(userStates, message.Chat.ID)
-						inbound, _ := t.inboundService.GetInbound(receiver_inbound_ID)
-						message_text, _ := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
-						t.addClient(message.Chat.ID, message_text)
-					}
-				case "awaiting_comment":
-					if client_Comment == strings.TrimSpace(message.Text) {
-						t.SendMsgToTgbotDeleteAfter(message.Chat.ID, t.I18nBot("tgbot.messages.using_default_value"), 3, tu.ReplyKeyboardRemove())
-						delete(userStates, message.Chat.ID)
-						return nil
-					}
-
-					client_Comment = strings.TrimSpace(message.Text)
-					t.SendMsgToTgbotDeleteAfter(message.Chat.ID, t.I18nBot("tgbot.messages.received_comment"), 3, tu.ReplyKeyboardRemove())
-					delete(userStates, message.Chat.ID)
-					inbound, _ := t.inboundService.GetInbound(receiver_inbound_ID)
-					message_text, _ := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
-					t.addClient(message.Chat.ID, message_text)
-				}
-
-			} else {
-				if message.UsersShared != nil {
-					if checkAdmin(message.From.ID) {
-						for _, sharedUser := range message.UsersShared.Users {
-							userID := sharedUser.UserID
-							needRestart, err := t.inboundService.SetClientTelegramUserID(message.UsersShared.RequestID, userID)
-							if needRestart {
-								t.xrayService.SetToNeedRestart()
-							}
-							output := ""
-							if err != nil {
-								output += t.I18nBot("tgbot.messages.selectUserFailed")
-							} else {
-								output += t.I18nBot("tgbot.messages.userSaved")
-							}
-							t.SendMsgToTgbot(message.Chat.ID, output, tu.ReplyKeyboardRemove())
-						}
-					} else {
-						t.SendMsgToTgbot(message.Chat.ID, t.I18nBot("tgbot.noResult"), tu.ReplyKeyboardRemove())
-					}
-				}
-			}
+			t.handleAddClientInput(&message)
 			return nil
 		}, th.AnyMessage())
 
 		h.Start()
 	}()
+}
+
+// handleAddClientInput consumes one text message as the next value of an
+// in-progress add-client flow. The session is keyed by both the chat and
+// the user who started the flow: in a group chat, another member's message
+// can neither read nor overwrite the admin's in-progress client.
+func (t *Tgbot) handleAddClientInput(message *telego.Message) {
+	addClientSessionsMu.Lock()
+	defer addClientSessionsMu.Unlock()
+
+	chatId := message.Chat.ID
+	var userID int64
+	if message.From != nil {
+		userID = message.From.ID
+	}
+	sess := getAddClientSession(chatId, userID)
+	if sess == nil || sess.state == "" {
+		if message.UsersShared != nil {
+			if checkAdmin(userID) {
+				for _, sharedUser := range message.UsersShared.Users {
+					userID := sharedUser.UserID
+					needRestart, err := t.inboundService.SetClientTelegramUserID(message.UsersShared.RequestID, userID)
+					if needRestart {
+						t.xrayService.SetToNeedRestart()
+					}
+					output := ""
+					if err != nil {
+						output += t.I18nBot("tgbot.messages.selectUserFailed")
+					} else {
+						output += t.I18nBot("tgbot.messages.userSaved")
+					}
+					t.SendMsgToTgbot(chatId, output, tu.ReplyKeyboardRemove())
+				}
+			} else {
+				t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.noResult"), tu.ReplyKeyboardRemove())
+			}
+		}
+		return
+	}
+
+	switch sess.state {
+	case "awaiting_id":
+		if sess.id == strings.TrimSpace(message.Text) {
+			t.SendMsgToTgbotDeleteAfter(chatId, userID, t.I18nBot("tgbot.messages.using_default_value"), 3, tu.ReplyKeyboardRemove())
+			sess.state = ""
+			inbound, _ := t.inboundService.GetInbound(sess.inboundID)
+			message_text, _ := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
+			t.addClient(sess, chatId, message_text)
+			return
+		}
+
+		sess.id = strings.TrimSpace(message.Text)
+		if t.isSingleWord(sess.id) {
+			sess.state = "awaiting_id"
+
+			cancel_btn_markup := tu.InlineKeyboard(
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
+				),
+			)
+
+			t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.messages.incorrect_input"), cancel_btn_markup)
+		} else {
+			t.SendMsgToTgbotDeleteAfter(chatId, userID, t.I18nBot("tgbot.messages.received_id"), 3, tu.ReplyKeyboardRemove())
+			sess.state = ""
+			inbound, _ := t.inboundService.GetInbound(sess.inboundID)
+			message_text, _ := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
+			t.addClient(sess, chatId, message_text)
+		}
+	case "awaiting_password_tr":
+		if sess.trPassword == strings.TrimSpace(message.Text) {
+			t.SendMsgToTgbotDeleteAfter(chatId, userID, t.I18nBot("tgbot.messages.using_default_value"), 3, tu.ReplyKeyboardRemove())
+			sess.state = ""
+			return
+		}
+
+		sess.trPassword = strings.TrimSpace(message.Text)
+		if t.isSingleWord(sess.trPassword) {
+			sess.state = "awaiting_password_tr"
+
+			cancel_btn_markup := tu.InlineKeyboard(
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
+				),
+			)
+
+			t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.messages.incorrect_input"), cancel_btn_markup)
+		} else {
+			t.SendMsgToTgbotDeleteAfter(chatId, userID, t.I18nBot("tgbot.messages.received_password"), 3, tu.ReplyKeyboardRemove())
+			sess.state = ""
+			inbound, _ := t.inboundService.GetInbound(sess.inboundID)
+			message_text, _ := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
+			t.addClient(sess, chatId, message_text)
+		}
+	case "awaiting_password_sh":
+		if sess.shPassword == strings.TrimSpace(message.Text) {
+			t.SendMsgToTgbotDeleteAfter(chatId, userID, t.I18nBot("tgbot.messages.using_default_value"), 3, tu.ReplyKeyboardRemove())
+			sess.state = ""
+			return
+		}
+
+		sess.shPassword = strings.TrimSpace(message.Text)
+		if t.isSingleWord(sess.shPassword) {
+			sess.state = "awaiting_password_sh"
+
+			cancel_btn_markup := tu.InlineKeyboard(
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
+				),
+			)
+
+			t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.messages.incorrect_input"), cancel_btn_markup)
+		} else {
+			t.SendMsgToTgbotDeleteAfter(chatId, userID, t.I18nBot("tgbot.messages.received_password"), 3, tu.ReplyKeyboardRemove())
+			sess.state = ""
+			inbound, _ := t.inboundService.GetInbound(sess.inboundID)
+			message_text, _ := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
+			t.addClient(sess, chatId, message_text)
+		}
+	case "awaiting_email":
+		if sess.email == strings.TrimSpace(message.Text) {
+			t.SendMsgToTgbotDeleteAfter(chatId, userID, t.I18nBot("tgbot.messages.using_default_value"), 3, tu.ReplyKeyboardRemove())
+			sess.state = ""
+			return
+		}
+
+		sess.email = strings.TrimSpace(message.Text)
+		if t.isSingleWord(sess.email) {
+			sess.state = "awaiting_email"
+
+			cancel_btn_markup := tu.InlineKeyboard(
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
+				),
+			)
+
+			t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.messages.incorrect_input"), cancel_btn_markup)
+		} else {
+			t.SendMsgToTgbotDeleteAfter(chatId, userID, t.I18nBot("tgbot.messages.received_email"), 3, tu.ReplyKeyboardRemove())
+			sess.state = ""
+			inbound, _ := t.inboundService.GetInbound(sess.inboundID)
+			message_text, _ := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
+			t.addClient(sess, chatId, message_text)
+		}
+	case "awaiting_comment":
+		if sess.comment == strings.TrimSpace(message.Text) {
+			t.SendMsgToTgbotDeleteAfter(chatId, userID, t.I18nBot("tgbot.messages.using_default_value"), 3, tu.ReplyKeyboardRemove())
+			sess.state = ""
+			return
+		}
+
+		sess.comment = strings.TrimSpace(message.Text)
+		t.SendMsgToTgbotDeleteAfter(chatId, userID, t.I18nBot("tgbot.messages.received_comment"), 3, tu.ReplyKeyboardRemove())
+		sess.state = ""
+		inbound, _ := t.inboundService.GetInbound(sess.inboundID)
+		message_text, _ := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
+		t.addClient(sess, chatId, message_text)
+	}
 }
 
 // answerCommand processes incoming command messages from Telegram users.
@@ -905,23 +1042,35 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.errorOperation"))
 				t.searchClient(chatId, email, callbackQuery.Message.GetMessageID())
 			case "add_client_limit_traffic_c":
+				addClientSessionsMu.Lock()
+				defer addClientSessionsMu.Unlock()
+				sess := t.requireAddClientSession(callbackQuery)
+				if sess == nil {
+					return
+				}
 				limitTraffic, _ := strconv.ParseInt(dataArray[1], 10, 64)
-				client_TotalGB = limitTraffic * 1024 * 1024 * 1024
+				sess.totalGB = limitTraffic * 1024 * 1024 * 1024
 				messageId := callbackQuery.Message.GetMessageID()
-				inbound, err := t.inboundService.GetInbound(receiver_inbound_ID)
+				inbound, err := t.inboundService.GetInbound(sess.inboundID)
 				if err != nil {
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 					return
 				}
-				message_text, err := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
+				message_text, err := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
 				if err != nil {
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 					return
 				}
 
-				t.addClient(callbackQuery.Message.GetChat().ID, message_text, messageId)
+				t.addClient(sess, callbackQuery.Message.GetChat().ID, message_text, messageId)
 				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.successfulOperation"))
 			case "add_client_limit_traffic_in":
+				addClientSessionsMu.Lock()
+				defer addClientSessionsMu.Unlock()
+				sess := t.requireAddClientSession(callbackQuery)
+				if sess == nil {
+					return
+				}
 				if len(dataArray) >= 2 {
 					oldInputNumber, err := strconv.Atoi(dataArray[1])
 					inputNumber := oldInputNumber
@@ -1114,35 +1263,47 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.errorOperation"))
 				t.searchClient(chatId, email, callbackQuery.Message.GetMessageID())
 			case "add_client_reset_exp_c":
-				client_ExpiryTime = 0
+				addClientSessionsMu.Lock()
+				defer addClientSessionsMu.Unlock()
+				sess := t.requireAddClientSession(callbackQuery)
+				if sess == nil {
+					return
+				}
+				sess.expiryTime = 0
 				days, _ := strconv.ParseInt(dataArray[1], 10, 64)
 				var date int64
-				if client_ExpiryTime > 0 {
-					if client_ExpiryTime-time.Now().Unix()*1000 < 0 {
+				if sess.expiryTime > 0 {
+					if sess.expiryTime-time.Now().Unix()*1000 < 0 {
 						date = -int64(days * 24 * 60 * 60000)
 					} else {
-						date = client_ExpiryTime + int64(days*24*60*60000)
+						date = sess.expiryTime + int64(days*24*60*60000)
 					}
 				} else {
-					date = client_ExpiryTime - int64(days*24*60*60000)
+					date = sess.expiryTime - int64(days*24*60*60000)
 				}
-				client_ExpiryTime = date
+				sess.expiryTime = date
 
 				messageId := callbackQuery.Message.GetMessageID()
-				inbound, err := t.inboundService.GetInbound(receiver_inbound_ID)
+				inbound, err := t.inboundService.GetInbound(sess.inboundID)
 				if err != nil {
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 					return
 				}
-				message_text, err := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
+				message_text, err := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
 				if err != nil {
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 					return
 				}
 
-				t.addClient(callbackQuery.Message.GetChat().ID, message_text, messageId)
+				t.addClient(sess, callbackQuery.Message.GetChat().ID, message_text, messageId)
 				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.successfulOperation"))
 			case "add_client_reset_exp_in":
+				addClientSessionsMu.Lock()
+				defer addClientSessionsMu.Unlock()
+				sess := t.requireAddClientSession(callbackQuery)
+				if sess == nil {
+					return
+				}
 				if len(dataArray) >= 2 {
 					oldInputNumber, err := strconv.Atoi(dataArray[1])
 					inputNumber := oldInputNumber
@@ -1311,26 +1472,38 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.errorOperation"))
 				t.searchClient(chatId, email, callbackQuery.Message.GetMessageID())
 			case "add_client_ip_limit_c":
+				addClientSessionsMu.Lock()
+				defer addClientSessionsMu.Unlock()
+				sess := t.requireAddClientSession(callbackQuery)
+				if sess == nil {
+					return
+				}
 				if len(dataArray) == 2 {
 					count, _ := strconv.Atoi(dataArray[1])
-					client_LimitIP = count
+					sess.limitIP = count
 				}
 
 				messageId := callbackQuery.Message.GetMessageID()
-				inbound, err := t.inboundService.GetInbound(receiver_inbound_ID)
+				inbound, err := t.inboundService.GetInbound(sess.inboundID)
 				if err != nil {
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 					return
 				}
-				message_text, err := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
+				message_text, err := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
 				if err != nil {
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 					return
 				}
 
-				t.addClient(callbackQuery.Message.GetChat().ID, message_text, messageId)
+				t.addClient(sess, callbackQuery.Message.GetChat().ID, message_text, messageId)
 				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.successfulOperation"))
 			case "add_client_ip_limit_in":
+				addClientSessionsMu.Lock()
+				defer addClientSessionsMu.Unlock()
+				sess := t.requireAddClientSession(callbackQuery)
+				if sess == nil {
+					return
+				}
 				if len(dataArray) >= 2 {
 					oldInputNumber, err := strconv.Atoi(dataArray[1])
 					inputNumber := oldInputNumber
@@ -1484,21 +1657,8 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 				}
 				t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.answers.chooseClient", "Inbound=="+inbound.Remark), clients)
 			case "add_client_to":
-				// assign default values to clients variables
-				client_Id = uuid.New().String()
-				client_Flow = ""
-				client_Email = t.randomLowerAndNum(8)
-				client_LimitIP = 0
-				client_TotalGB = 0
-				client_ExpiryTime = 0
-				client_Enable = true
-				client_TgID = ""
-				client_Comment = ""
-				client_Reset = 0
-				client_Security = "auto"
-				client_ShPassword = t.randomShadowSocksPassword()
-				client_TrPassword = t.randomLowerAndNum(10)
-				client_Method = ""
+				addClientSessionsMu.Lock()
+				defer addClientSessionsMu.Unlock()
 
 				inboundId := dataArray[1]
 				inboundIdInt, err := strconv.Atoi(inboundId)
@@ -1506,20 +1666,20 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 					return
 				}
-				receiver_inbound_ID = inboundIdInt
+				sess := t.newAddClientSession(chatId, callbackQuery.From.ID, inboundIdInt)
 				inbound, err := t.inboundService.GetInbound(inboundIdInt)
 				if err != nil {
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 					return
 				}
 
-				message_text, err := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
+				message_text, err := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
 				if err != nil {
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 					return
 				}
 
-				t.addClient(callbackQuery.Message.GetChat().ID, message_text)
+				t.addClient(sess, callbackQuery.Message.GetChat().ID, message_text)
 			}
 			return
 		} else {
@@ -1538,12 +1698,15 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 		}
 	}
 
-	// The management callbacks below are admin-only. Regular users keep
-	// only their own client callbacks (client_traffic, client_commands and
-	// the client_* link callbacks, with or without an email suffix).
-	if !isAdmin {
-		switch callbackQuery.Data {
-		}
+	// The management callbacks below are admin-only. Non-admins may only
+	// invoke their own personal queries (client_traffic, client_commands);
+	// everything else is refused here. Never rely on which buttons the
+	// client shows, and never on the callback encoding: any chat member
+	// can press a button the bot posted in a group, or replay callback
+	// data.
+	if !isAdmin && !isPersonalBotCallback(callbackQuery.Data) {
+		t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.notAllowed"))
+		return
 	}
 
 	switch callbackQuery.Data {
@@ -1582,21 +1745,9 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 		t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.buttons.commands"))
 		t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.commands.helpAdminCommands"))
 	case "add_client":
-		// assign default values to clients variables
-		client_Id = uuid.New().String()
-		client_Flow = ""
-		client_Email = t.randomLowerAndNum(8)
-		client_LimitIP = 0
-		client_TotalGB = 0
-		client_ExpiryTime = 0
-		client_Enable = true
-		client_TgID = ""
-		client_Comment = ""
-		client_Reset = 0
-		client_Security = "auto"
-		client_ShPassword = t.randomShadowSocksPassword()
-		client_TrPassword = t.randomLowerAndNum(10)
-		client_Method = ""
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		t.newAddClientSession(chatId, callbackQuery.From.ID, 0)
 
 		inbounds, err := t.getInboundsAddClient()
 		if err != nil {
@@ -1606,56 +1757,91 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 		t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.buttons.addClient"))
 		t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.answers.chooseInbound"), inbounds)
 	case "add_client_ch_default_email":
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		sess := t.requireAddClientSession(callbackQuery)
+		if sess == nil {
+			return
+		}
 		t.deleteMessageTgBot(chatId, callbackQuery.Message.GetMessageID())
-		userStates[chatId] = "awaiting_email"
+		sess.state = "awaiting_email"
 		cancel_btn_markup := tu.InlineKeyboard(
 			tu.InlineKeyboardRow(
 				tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
 			),
 		)
-		prompt_message := t.I18nBot("tgbot.messages.email_prompt", "ClientEmail=="+client_Email)
+		prompt_message := t.I18nBot("tgbot.messages.email_prompt", "ClientEmail=="+sess.email)
 		t.SendMsgToTgbot(chatId, prompt_message, cancel_btn_markup)
 	case "add_client_ch_default_id":
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		sess := t.requireAddClientSession(callbackQuery)
+		if sess == nil {
+			return
+		}
 		t.deleteMessageTgBot(chatId, callbackQuery.Message.GetMessageID())
-		userStates[chatId] = "awaiting_id"
+		sess.state = "awaiting_id"
 		cancel_btn_markup := tu.InlineKeyboard(
 			tu.InlineKeyboardRow(
 				tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
 			),
 		)
-		prompt_message := t.I18nBot("tgbot.messages.id_prompt", "ClientId=="+client_Id)
+		prompt_message := t.I18nBot("tgbot.messages.id_prompt", "ClientId=="+sess.id)
 		t.SendMsgToTgbot(chatId, prompt_message, cancel_btn_markup)
 	case "add_client_ch_default_pass_tr":
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		sess := t.requireAddClientSession(callbackQuery)
+		if sess == nil {
+			return
+		}
 		t.deleteMessageTgBot(chatId, callbackQuery.Message.GetMessageID())
-		userStates[chatId] = "awaiting_password_tr"
+		sess.state = "awaiting_password_tr"
 		cancel_btn_markup := tu.InlineKeyboard(
 			tu.InlineKeyboardRow(
 				tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
 			),
 		)
-		prompt_message := t.I18nBot("tgbot.messages.pass_prompt", "ClientPassword=="+client_TrPassword)
+		prompt_message := t.I18nBot("tgbot.messages.pass_prompt", "ClientPassword=="+sess.trPassword)
 		t.SendMsgToTgbot(chatId, prompt_message, cancel_btn_markup)
 	case "add_client_ch_default_pass_sh":
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		sess := t.requireAddClientSession(callbackQuery)
+		if sess == nil {
+			return
+		}
 		t.deleteMessageTgBot(chatId, callbackQuery.Message.GetMessageID())
-		userStates[chatId] = "awaiting_password_sh"
+		sess.state = "awaiting_password_sh"
 		cancel_btn_markup := tu.InlineKeyboard(
 			tu.InlineKeyboardRow(
 				tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
 			),
 		)
-		prompt_message := t.I18nBot("tgbot.messages.pass_prompt", "ClientPassword=="+client_ShPassword)
+		prompt_message := t.I18nBot("tgbot.messages.pass_prompt", "ClientPassword=="+sess.shPassword)
 		t.SendMsgToTgbot(chatId, prompt_message, cancel_btn_markup)
 	case "add_client_ch_default_comment":
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		sess := t.requireAddClientSession(callbackQuery)
+		if sess == nil {
+			return
+		}
 		t.deleteMessageTgBot(chatId, callbackQuery.Message.GetMessageID())
-		userStates[chatId] = "awaiting_comment"
+		sess.state = "awaiting_comment"
 		cancel_btn_markup := tu.InlineKeyboard(
 			tu.InlineKeyboardRow(
 				tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.use_default")).WithCallbackData("add_client_default_info"),
 			),
 		)
-		prompt_message := t.I18nBot("tgbot.messages.comment_prompt", "ClientComment=="+client_Comment)
+		prompt_message := t.I18nBot("tgbot.messages.comment_prompt", "ClientComment=="+sess.comment)
 		t.SendMsgToTgbot(chatId, prompt_message, cancel_btn_markup)
 	case "add_client_ch_default_traffic":
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		if t.requireAddClientSession(callbackQuery) == nil {
+			return
+		}
 		inlineKeyboard := tu.InlineKeyboard(
 			tu.InlineKeyboardRow(
 				tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.cancel")).WithCallbackData(t.encodeQuery("add_client_default_traffic_exp")),
@@ -1687,6 +1873,11 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 		)
 		t.editMessageCallbackTgBot(chatId, callbackQuery.Message.GetMessageID(), inlineKeyboard)
 	case "add_client_ch_default_exp":
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		if t.requireAddClientSession(callbackQuery) == nil {
+			return
+		}
 		inlineKeyboard := tu.InlineKeyboard(
 			tu.InlineKeyboardRow(
 				tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.cancel")).WithCallbackData(t.encodeQuery("add_client_default_traffic_exp")),
@@ -1714,6 +1905,11 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 		)
 		t.editMessageCallbackTgBot(chatId, callbackQuery.Message.GetMessageID(), inlineKeyboard)
 	case "add_client_ch_default_ip_limit":
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		if t.requireAddClientSession(callbackQuery) == nil {
+			return
+		}
 		inlineKeyboard := tu.InlineKeyboard(
 			tu.InlineKeyboardRow(
 				tu.InlineKeyboardButton(t.I18nBot("tgbot.buttons.cancel")).WithCallbackData(t.encodeQuery("add_client_default_ip_limit")),
@@ -1743,67 +1939,101 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 		)
 		t.editMessageCallbackTgBot(chatId, callbackQuery.Message.GetMessageID(), inlineKeyboard)
 	case "add_client_default_info":
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		sess := t.requireAddClientSession(callbackQuery)
+		if sess == nil {
+			return
+		}
 		t.deleteMessageTgBot(chatId, callbackQuery.Message.GetMessageID())
-		t.SendMsgToTgbotDeleteAfter(chatId, t.I18nBot("tgbot.messages.using_default_value"), 3, tu.ReplyKeyboardRemove())
-		delete(userStates, chatId)
-		inbound, _ := t.inboundService.GetInbound(receiver_inbound_ID)
-		message_text, _ := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
-		t.addClient(chatId, message_text)
+		t.SendMsgToTgbotDeleteAfter(chatId, callbackQuery.From.ID, t.I18nBot("tgbot.messages.using_default_value"), 3, tu.ReplyKeyboardRemove())
+		sess.state = ""
+		inbound, _ := t.inboundService.GetInbound(sess.inboundID)
+		message_text, _ := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
+		t.addClient(sess, chatId, message_text)
 	case "add_client_cancel":
-		delete(userStates, chatId)
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		deleteAddClientSession(chatId, callbackQuery.From.ID)
 		t.deleteMessageTgBot(chatId, callbackQuery.Message.GetMessageID())
-		t.SendMsgToTgbotDeleteAfter(chatId, t.I18nBot("tgbot.messages.cancel"), 3, tu.ReplyKeyboardRemove())
+		t.SendMsgToTgbotDeleteAfter(chatId, callbackQuery.From.ID, t.I18nBot("tgbot.messages.cancel"), 3, tu.ReplyKeyboardRemove())
 	case "add_client_default_traffic_exp":
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		sess := t.requireAddClientSession(callbackQuery)
+		if sess == nil {
+			return
+		}
 		messageId := callbackQuery.Message.GetMessageID()
-		inbound, err := t.inboundService.GetInbound(receiver_inbound_ID)
+		inbound, err := t.inboundService.GetInbound(sess.inboundID)
 		if err != nil {
 			t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 			return
 		}
-		message_text, err := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
+		message_text, err := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
 		if err != nil {
 			t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 			return
 		}
-		t.addClient(chatId, message_text, messageId)
-		t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.canceled", "Email=="+client_Email))
+		t.addClient(sess, chatId, message_text, messageId)
+		t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.canceled", "Email=="+sess.email))
 	case "add_client_default_ip_limit":
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		sess := t.requireAddClientSession(callbackQuery)
+		if sess == nil {
+			return
+		}
 		messageId := callbackQuery.Message.GetMessageID()
-		inbound, err := t.inboundService.GetInbound(receiver_inbound_ID)
+		inbound, err := t.inboundService.GetInbound(sess.inboundID)
 		if err != nil {
 			t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 			return
 		}
-		message_text, err := t.BuildInboundClientDataMessage(inbound.Remark, inbound.Protocol)
+		message_text, err := t.BuildInboundClientDataMessage(sess, inbound.Remark, inbound.Protocol)
 		if err != nil {
 			t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 			return
 		}
-		t.addClient(chatId, message_text, messageId)
-		t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.canceled", "Email=="+client_Email))
+		t.addClient(sess, chatId, message_text, messageId)
+		t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.canceled", "Email=="+sess.email))
 	case "add_client_submit_disable":
-		client_Enable = false
-		_, err := t.SubmitAddClient()
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		sess := t.requireAddClientSession(callbackQuery)
+		if sess == nil {
+			return
+		}
+		sess.enable = false
+		_, err := t.SubmitAddClient(sess)
 		if err != nil {
 			errorMessage := fmt.Sprintf("%v", err)
 			t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.messages.error_add_client", "error=="+errorMessage), tu.ReplyKeyboardRemove())
 		} else {
 			t.deleteMessageTgBot(chatId, callbackQuery.Message.GetMessageID())
 			t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.answers.successfulOperation"), tu.ReplyKeyboardRemove())
+			deleteAddClientSession(chatId, callbackQuery.From.ID)
 		}
 	case "add_client_submit_enable":
-		client_Enable = true
-		_, err := t.SubmitAddClient()
+		addClientSessionsMu.Lock()
+		defer addClientSessionsMu.Unlock()
+		sess := t.requireAddClientSession(callbackQuery)
+		if sess == nil {
+			return
+		}
+		sess.enable = true
+		_, err := t.SubmitAddClient(sess)
 		if err != nil {
 			errorMessage := fmt.Sprintf("%v", err)
 			t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.messages.error_add_client", "error=="+errorMessage), tu.ReplyKeyboardRemove())
 		} else {
 			t.deleteMessageTgBot(chatId, callbackQuery.Message.GetMessageID())
 			t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.answers.successfulOperation"), tu.ReplyKeyboardRemove())
+			deleteAddClientSession(chatId, callbackQuery.From.ID)
 		}
 	case "reset_all_traffics_cancel":
 		t.deleteMessageTgBot(chatId, callbackQuery.Message.GetMessageID())
-		t.SendMsgToTgbotDeleteAfter(chatId, t.I18nBot("tgbot.messages.cancel"), 1, tu.ReplyKeyboardRemove())
+		t.SendMsgToTgbotDeleteAfter(chatId, callbackQuery.From.ID, t.I18nBot("tgbot.messages.cancel"), 1, tu.ReplyKeyboardRemove())
 	case "reset_all_traffics":
 		inlineKeyboard := tu.InlineKeyboard(
 			tu.InlineKeyboardRow(
@@ -1874,47 +2104,47 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 }
 
 // BuildInboundClientDataMessage builds a message with client data for the given inbound and protocol.
-func (t *Tgbot) BuildInboundClientDataMessage(inbound_remark string, protocol model.Protocol) (string, error) {
+func (t *Tgbot) BuildInboundClientDataMessage(sess *addClientSession, inbound_remark string, protocol model.Protocol) (string, error) {
 	var message string
 
 	currentTime := time.Now()
 	timestampMillis := currentTime.UnixNano() / int64(time.Millisecond)
 
 	expiryTime := ""
-	diff := client_ExpiryTime/1000 - timestampMillis
-	if client_ExpiryTime == 0 {
+	diff := sess.expiryTime/1000 - timestampMillis
+	if sess.expiryTime == 0 {
 		expiryTime = t.I18nBot("tgbot.unlimited")
 	} else if diff > 172800 {
-		expiryTime = time.Unix((client_ExpiryTime / 1000), 0).Format("2006-01-02 15:04:05")
-	} else if client_ExpiryTime < 0 {
-		expiryTime = fmt.Sprintf("%d %s", client_ExpiryTime/-86400000, t.I18nBot("tgbot.days"))
+		expiryTime = time.Unix((sess.expiryTime / 1000), 0).Format("2006-01-02 15:04:05")
+	} else if sess.expiryTime < 0 {
+		expiryTime = fmt.Sprintf("%d %s", sess.expiryTime/-86400000, t.I18nBot("tgbot.days"))
 	} else {
 		expiryTime = fmt.Sprintf("%d %s", diff/3600, t.I18nBot("tgbot.hours"))
 	}
 
 	traffic_value := ""
-	if client_TotalGB == 0 {
+	if sess.totalGB == 0 {
 		traffic_value = "♾️ Unlimited(Reset)"
 	} else {
-		traffic_value = common.FormatTraffic(client_TotalGB)
+		traffic_value = common.FormatTraffic(sess.totalGB)
 	}
 
 	ip_limit := ""
-	if client_LimitIP == 0 {
+	if sess.limitIP == 0 {
 		ip_limit = "♾️ Unlimited(Reset)"
 	} else {
-		ip_limit = fmt.Sprint(client_LimitIP)
+		ip_limit = fmt.Sprint(sess.limitIP)
 	}
 
 	switch protocol {
 	case model.VMESS, model.VLESS:
-		message = t.I18nBot("tgbot.messages.inbound_client_data_id", "InboundRemark=="+inbound_remark, "ClientId=="+client_Id, "ClientEmail=="+client_Email, "ClientTraffic=="+traffic_value, "ClientExp=="+expiryTime, "IpLimit=="+ip_limit, "ClientComment=="+client_Comment)
+		message = t.I18nBot("tgbot.messages.inbound_client_data_id", "InboundRemark=="+inbound_remark, "ClientId=="+sess.id, "ClientEmail=="+sess.email, "ClientTraffic=="+traffic_value, "ClientExp=="+expiryTime, "IpLimit=="+ip_limit, "ClientComment=="+sess.comment)
 
 	case model.Trojan:
-		message = t.I18nBot("tgbot.messages.inbound_client_data_pass", "InboundRemark=="+inbound_remark, "ClientPass=="+client_TrPassword, "ClientEmail=="+client_Email, "ClientTraffic=="+traffic_value, "ClientExp=="+expiryTime, "IpLimit=="+ip_limit, "ClientComment=="+client_Comment)
+		message = t.I18nBot("tgbot.messages.inbound_client_data_pass", "InboundRemark=="+inbound_remark, "ClientPass=="+sess.trPassword, "ClientEmail=="+sess.email, "ClientTraffic=="+traffic_value, "ClientExp=="+expiryTime, "IpLimit=="+ip_limit, "ClientComment=="+sess.comment)
 
 	case model.Shadowsocks:
-		message = t.I18nBot("tgbot.messages.inbound_client_data_pass", "InboundRemark=="+inbound_remark, "ClientPass=="+client_ShPassword, "ClientEmail=="+client_Email, "ClientTraffic=="+traffic_value, "ClientExp=="+expiryTime, "IpLimit=="+ip_limit, "ClientComment=="+client_Comment)
+		message = t.I18nBot("tgbot.messages.inbound_client_data_pass", "InboundRemark=="+inbound_remark, "ClientPass=="+sess.shPassword, "ClientEmail=="+sess.email, "ClientTraffic=="+traffic_value, "ClientExp=="+expiryTime, "IpLimit=="+ip_limit, "ClientComment=="+sess.comment)
 
 	default:
 		return "", errors.New("unknown protocol")
@@ -1924,7 +2154,7 @@ func (t *Tgbot) BuildInboundClientDataMessage(inbound_remark string, protocol mo
 }
 
 // BuildJSONForProtocol builds a JSON string for the given protocol with client data.
-func (t *Tgbot) BuildJSONForProtocol(protocol model.Protocol) (string, error) {
+func (t *Tgbot) BuildJSONForProtocol(sess *addClientSession, protocol model.Protocol) (string, error) {
 	var jsonString string
 
 	switch protocol {
@@ -1942,7 +2172,7 @@ func (t *Tgbot) BuildJSONForProtocol(protocol model.Protocol) (string, error) {
                 "comment": "%s",
                 "reset": %d
             }]
-        }`, client_Id, client_Security, client_Email, client_LimitIP, client_TotalGB, client_ExpiryTime, client_Enable, client_TgID, client_Comment, client_Reset)
+        }`, sess.id, sess.security, sess.email, sess.limitIP, sess.totalGB, sess.expiryTime, sess.enable, sess.tgID, sess.comment, sess.reset)
 
 	case model.VLESS:
 		jsonString = fmt.Sprintf(`{
@@ -1958,7 +2188,7 @@ func (t *Tgbot) BuildJSONForProtocol(protocol model.Protocol) (string, error) {
                 "comment": "%s",
                 "reset": %d
             }]
-        }`, client_Id, client_Flow, client_Email, client_LimitIP, client_TotalGB, client_ExpiryTime, client_Enable, client_TgID, client_Comment, client_Reset)
+        }`, sess.id, sess.flow, sess.email, sess.limitIP, sess.totalGB, sess.expiryTime, sess.enable, sess.tgID, sess.comment, sess.reset)
 
 	case model.Trojan:
 		jsonString = fmt.Sprintf(`{
@@ -1973,7 +2203,7 @@ func (t *Tgbot) BuildJSONForProtocol(protocol model.Protocol) (string, error) {
                 "comment": "%s",
                 "reset": %d
             }]
-        }`, client_TrPassword, client_Email, client_LimitIP, client_TotalGB, client_ExpiryTime, client_Enable, client_TgID, client_Comment, client_Reset)
+        }`, sess.trPassword, sess.email, sess.limitIP, sess.totalGB, sess.expiryTime, sess.enable, sess.tgID, sess.comment, sess.reset)
 
 	case model.Shadowsocks:
 		jsonString = fmt.Sprintf(`{
@@ -1989,7 +2219,7 @@ func (t *Tgbot) BuildJSONForProtocol(protocol model.Protocol) (string, error) {
                 "comment": "%s",
                 "reset": %d
             }]
-        }`, client_Method, client_ShPassword, client_Email, client_LimitIP, client_TotalGB, client_ExpiryTime, client_Enable, client_TgID, client_Comment, client_Reset)
+        }`, sess.method, sess.shPassword, sess.email, sess.limitIP, sess.totalGB, sess.expiryTime, sess.enable, sess.tgID, sess.comment, sess.reset)
 
 	default:
 		return "", errors.New("unknown protocol")
@@ -1999,22 +2229,22 @@ func (t *Tgbot) BuildJSONForProtocol(protocol model.Protocol) (string, error) {
 }
 
 // SubmitAddClient submits the client addition request to the inbound service.
-func (t *Tgbot) SubmitAddClient() (bool, error) {
+func (t *Tgbot) SubmitAddClient(sess *addClientSession) (bool, error) {
 
-	inbound, err := t.inboundService.GetInbound(receiver_inbound_ID)
+	inbound, err := t.inboundService.GetInbound(sess.inboundID)
 	if err != nil {
 		logger.Warning("getIboundClients run failed:", err)
 		return false, errors.New(t.I18nBot("tgbot.answers.getInboundsFailed"))
 	}
 
-	jsonString, err := t.BuildJSONForProtocol(inbound.Protocol)
+	jsonString, err := t.BuildJSONForProtocol(sess, inbound.Protocol)
 	if err != nil {
 		logger.Warning("BuildJSONForProtocol run failed:", err)
 		return false, errors.New("failed to build JSON for protocol")
 	}
 
 	newInbound := &model.Inbound{
-		Id:       receiver_inbound_ID,
+		Id:       sess.inboundID,
 		Settings: jsonString,
 	}
 
@@ -2077,7 +2307,7 @@ func (t *Tgbot) SendAnswer(chatId int64, msg string, isAdmin bool) {
 
 // SendMsgToTgbot sends a message to the Telegram bot with optional reply markup.
 func (t *Tgbot) SendMsgToTgbot(chatId int64, msg string, replyMarkup ...telego.ReplyMarkup) {
-	if !isRunning {
+	if bot == nil || !isRunning {
 		return
 	}
 
@@ -2804,8 +3034,8 @@ func (t *Tgbot) getCommonClientButtons() [][]telego.InlineKeyboardButton {
 }
 
 // addClient handles the process of adding a new client to an inbound.
-func (t *Tgbot) addClient(chatId int64, msg string, messageID ...int) {
-	inbound, err := t.inboundService.GetInbound(receiver_inbound_ID)
+func (t *Tgbot) addClient(sess *addClientSession, chatId int64, msg string, messageID ...int) {
+	inbound, err := t.inboundService.GetInbound(sess.inboundID)
 	if err != nil {
 		t.SendMsgToTgbot(chatId, err.Error())
 		return
@@ -3212,6 +3442,9 @@ func (t *Tgbot) sendBanLogs(chatId int64, dt bool) {
 
 // sendCallbackAnswerTgBot answers a callback query with a message.
 func (t *Tgbot) sendCallbackAnswerTgBot(id string, message string) {
+	if bot == nil || !isRunning {
+		return
+	}
 	params := telego.AnswerCallbackQueryParams{
 		CallbackQueryID: id,
 		Text:            message,
@@ -3223,6 +3456,9 @@ func (t *Tgbot) sendCallbackAnswerTgBot(id string, message string) {
 
 // editMessageCallbackTgBot edits the reply markup of a message.
 func (t *Tgbot) editMessageCallbackTgBot(chatId int64, messageID int, inlineKeyboard *telego.InlineKeyboardMarkup) {
+	if bot == nil || !isRunning {
+		return
+	}
 	params := telego.EditMessageReplyMarkupParams{
 		ChatID:      tu.ID(chatId),
 		MessageID:   messageID,
@@ -3235,6 +3471,9 @@ func (t *Tgbot) editMessageCallbackTgBot(chatId int64, messageID int, inlineKeyb
 
 // editMessageTgBot edits the text and reply markup of a message.
 func (t *Tgbot) editMessageTgBot(chatId int64, messageID int, text string, inlineKeyboard ...*telego.InlineKeyboardMarkup) {
+	if bot == nil || !isRunning {
+		return
+	}
 	params := telego.EditMessageTextParams{
 		ChatID:    tu.ID(chatId),
 		MessageID: messageID,
@@ -3250,7 +3489,10 @@ func (t *Tgbot) editMessageTgBot(chatId int64, messageID int, text string, inlin
 }
 
 // SendMsgToTgbotDeleteAfter sends a message and deletes it after a specified delay.
-func (t *Tgbot) SendMsgToTgbotDeleteAfter(chatId int64, msg string, delayInSeconds int, replyMarkup ...telego.ReplyMarkup) {
+func (t *Tgbot) SendMsgToTgbotDeleteAfter(chatId, userID int64, msg string, delayInSeconds int, replyMarkup ...telego.ReplyMarkup) {
+	if bot == nil || !isRunning {
+		return
+	}
 	// Determine if replyMarkup was passed; otherwise, set it to nil
 	var replyMarkupParam telego.ReplyMarkup
 	if len(replyMarkup) > 0 {
@@ -3272,12 +3514,15 @@ func (t *Tgbot) SendMsgToTgbotDeleteAfter(chatId int64, msg string, delayInSecon
 	go func() {
 		time.Sleep(time.Duration(delayInSeconds) * time.Second) // Wait for the specified delay
 		t.deleteMessageTgBot(chatId, sentMsg.MessageID)         // Delete the message
-		delete(userStates, chatId)
+		clearAddClientInputState(chatId, userID)
 	}()
 }
 
 // deleteMessageTgBot deletes a message from the chat.
 func (t *Tgbot) deleteMessageTgBot(chatId int64, messageID int) {
+	if bot == nil || !isRunning {
+		return
+	}
 	params := telego.DeleteMessageParams{
 		ChatID:    tu.ID(chatId),
 		MessageID: messageID,
