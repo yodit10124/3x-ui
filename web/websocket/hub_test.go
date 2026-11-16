@@ -289,6 +289,119 @@ func TestHubRegisterRefusedWhenStoppedDuringHandshake(t *testing.T) {
 // TestHubRegisterThenUnregisterImmediately: registration and
 // unregistration are both synchronous, so a disconnect right after
 // registration leaves no record behind.
+// TestHubRegisterRefusedWhenRevokedBetweenValidationAndInsert: the
+// session is still valid when validation answers, but the revocation
+// (logout or password change) and its scan complete before the
+// registration is inserted. The revocation bumps the revocation
+// epoch, so the registration re-validates against the now-revoked
+// session and is refused — the connection never joins the broadcast
+// set and receives no further broadcasts. The ordering is controlled
+// with a blocking validator; no sleeps.
+func TestHubRegisterRefusedWhenRevokedBetweenValidationAndInsert(t *testing.T) {
+	revocations := map[string]func(h *Hub){
+		"logout":          func(h *Hub) { h.CloseSessionClients("session-race") },
+		"password-change": func(h *Hub) { h.CloseUserClients(1) },
+	}
+	for name, revoke := range revocations {
+		t.Run(name, func(t *testing.T) {
+			initTestLogger(t)
+			h := NewHub()
+			var calls atomic.Int32
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var once sync.Once
+			h.SetSessionValidator(func(sessionID string, userID int) bool {
+				if calls.Add(1) == 1 {
+					once.Do(func() { close(entered) })
+					<-release
+					return true // valid at validation time
+				}
+				return false // revoked by the time of the re-validation
+			})
+			h.Start()
+			defer h.Stop()
+
+			c := NewClient("race", "session-race", 1)
+			done := make(chan bool, 1)
+			go func() { done <- h.Register(c) }()
+			waitEntered(t, entered)
+			// The revocation lands while the handshake is in flight:
+			// its scan finds nothing (the connection is not
+			// registered yet), but it bumps the revocation epoch.
+			revoke(h)
+			close(release)
+			select {
+			case ok := <-done:
+				if ok {
+					t.Fatal("Register accepted a session revoked between validation and insert")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Register did not return after validation released")
+			}
+			if n := calls.Load(); n != 2 {
+				t.Fatalf("validator called %d times, want 2 (validation + re-validation)", n)
+			}
+			if !sendClosed(c) {
+				t.Fatal("refused client Send not closed")
+			}
+			if h.GetClientCount() != 0 {
+				t.Fatalf("client count %d, want 0", h.GetClientCount())
+			}
+			// A broadcast afterwards must not reach the refused
+			// connection: it never joined the broadcast set.
+			h.Broadcast(MessageTypeStatus, map[string]string{"ping": "pong"})
+			select {
+			case msg, ok := <-c.Send:
+				if ok {
+					t.Fatalf("refused client received a broadcast: %s", msg)
+				}
+			default:
+			}
+		})
+	}
+}
+
+// TestHubStopWaitsForPumps: Stop does not return while pump
+// goroutines reserved through StartPumps are still running, and
+// returns once the last one finishes.
+func TestHubStopWaitsForPumps(t *testing.T) {
+	initTestLogger(t)
+	h := NewHub()
+	h.Start()
+
+	if !h.StartPumps(2) {
+		t.Fatal("StartPumps refused on a running hub")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		h.Stop()
+		close(stopped)
+	}()
+	// Stop must still be waiting while both pumps run.
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned while pumps were still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+	h.PumpDone()
+	// ... and while one pump still runs.
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned with one pump still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+	h.PumpDone()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return after all pumps finished")
+	}
+	// A reservation after Stop is refused.
+	if h.StartPumps(1) {
+		t.Fatal("StartPumps accepted after Stop")
+	}
+}
+
 func TestHubRegisterThenUnregisterImmediately(t *testing.T) {
 	initTestLogger(t)
 	h := NewHub()

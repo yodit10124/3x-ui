@@ -228,8 +228,24 @@ func (w *WebSocketController) HandleWebSocket(c *gin.Context) {
 	}
 	logger.Debugf("WebSocket client %s registered from %s", client.ID, getRemoteIp(c))
 
-	go w.writePump(client, conn)
-	go w.readPump(client, conn)
+	// Track the pumps with the hub so Stop waits for the TCP
+	// connection and both goroutines to finish. A stop landing
+	// between Register and the pump start refuses the reservation
+	// instead of leaving pumps running after Stop returned.
+	if !w.hub.StartPumps(2) {
+		logger.Debugf("WebSocket client %s pump start refused from %s (hub stopped)", client.ID, getRemoteIp(c))
+		w.hub.Unregister(client)
+		conn.Close()
+		return
+	}
+	go func() {
+		defer w.hub.PumpDone()
+		w.writePump(client, conn)
+	}()
+	go func() {
+		defer w.hub.PumpDone()
+		w.readPump(client, conn)
+	}()
 }
 
 // readPump consumes inbound frames so the gorilla deadline/pong machinery keeps

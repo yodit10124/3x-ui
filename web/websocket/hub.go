@@ -108,16 +108,43 @@ type Client struct {
 // lands during the handshake is refused), and Stop refuses new
 // registrations and waits for the loop to finish shutting down.
 //
-// One residual interleave remains and is covered by the session
-// sweeper: a revocation that lands between Register's validation and
-// its insert is caught at the next sweep (at most one sweep interval
-// later), the same backstop as every other revocation path.
+// Validation and insertion are one atomic decision with respect to
+// revocations. A revocation that lands between Register's validation
+// and its insert would otherwise miss the not-yet-registered
+// connection, which would then receive broadcasts until the next
+// sweep. Every revocation (CloseSessionClients, CloseUserClients,
+// sweeper closes) bumps revEpoch under the hub lock — even when it
+// matches no registered client, because the revocation itself, not
+// the number of clients it closed, is what a concurrent registration
+// must observe. Register records the epoch before validating and
+// re-checks it under the lock at insert: a changed epoch means the
+// validation is stale and must be redone against the revoked
+// session. Either the revocation's scan sees the new client (and
+// closes it) or the registration sees the revocation (and is
+// refused) — there is no ordering in which a revoked session's
+// connection joins the broadcast set. Merely re-validating once
+// before the insert would leave the same window open.
 type Hub struct {
 	clients   map[*Client]struct{}
 	broadcast chan []byte
 	mu        sync.RWMutex
 	ctx       context.Context
 	cancel    context.CancelFunc
+
+	// revEpoch counts revocation events, guarded by mu. See the Hub
+	// comment above: Register re-validates when it changed.
+	revEpoch uint64
+	// pumpClosed is set by Stop under mu, after the event loop
+	// exits, and read by StartPumps under the same lock. Its write
+	// is the barrier that orders Stop's pump wait after every
+	// reservation made before it: a StartPumps that acquired the
+	// lock first has already counted its pumps, and one that
+	// acquires it later sees pumpClosed and is refused.
+	pumpClosed bool
+	// pumps counts the read/write pump goroutines of registered
+	// clients; Stop waits for it, so no TCP connection or goroutine
+	// outlives the shutdown.
+	pumps sync.WaitGroup
 
 	// stopped is set by Stop and refuses every later Register. It is
 	// checked before validation and again under the lock at insert,
@@ -208,6 +235,23 @@ func (h *Hub) getSweepInterval() time.Duration {
 	return d
 }
 
+// revocationEpoch reads the current revocation count.
+func (h *Hub) revocationEpoch() uint64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.revEpoch
+}
+
+// bumpRevocationEpoch records one revocation event. Callers bump
+// before scanning for clients to close: a registration racing the
+// revocation must observe it even when no client is registered yet,
+// because the scan would miss a connection still being validated.
+func (h *Hub) bumpRevocationEpoch() {
+	h.mu.Lock()
+	h.revEpoch++
+	h.mu.Unlock()
+}
+
 // CloseSessionClients closes every connection bound to one login
 // session, e.g. on logout. The hub removes each client (closing its
 // Send channel makes the write pump send a close frame and drop the
@@ -217,6 +261,7 @@ func (h *Hub) CloseSessionClients(sessionID string) {
 	if h == nil || sessionID == "" {
 		return
 	}
+	h.bumpRevocationEpoch()
 	h.mu.RLock()
 	var targets []*Client
 	for c := range h.clients {
@@ -236,6 +281,7 @@ func (h *Hub) CloseUserClients(userID int) {
 	if h == nil || userID == 0 {
 		return
 	}
+	h.bumpRevocationEpoch()
 	h.mu.RLock()
 	var targets []*Client
 	for c := range h.clients {
@@ -267,11 +313,16 @@ func (h *Hub) sweepSessions() {
 		clients = append(clients, c)
 	}
 	h.mu.RUnlock()
+	closedAny := false
 	for _, c := range clients {
 		if !validate(c.SessionID, c.UserID) {
 			h.removeClient(c)
+			closedAny = true
 			logger.Debugf("WebSocket client %s closed: session no longer valid", c.ID)
 		}
+	}
+	if closedAny {
+		h.bumpRevocationEpoch()
 	}
 }
 
@@ -532,6 +583,14 @@ func (h *Hub) GetClientCount() int {
 // wins. A client with no session ID is accepted without validation
 // (the sweeper treats it as invalid and closes it); the validator is
 // skipped entirely when none is set, e.g. in unit tests.
+//
+// The validation and the insert are one atomic decision with respect
+// to revocations (see the Hub comment): Register records the
+// revocation epoch before validating and re-checks it under the lock
+// at insert. A changed epoch means a logout or password change
+// landed mid-validation, so the validation is stale and Register
+// loops to re-validate against the revoked session instead of
+// inserting a connection the revocation's scan could not see.
 func (h *Hub) Register(c *Client) bool {
 	if h == nil || c == nil {
 		return false
@@ -540,21 +599,60 @@ func (h *Hub) Register(c *Client) bool {
 		c.closeOnce.Do(func() { close(c.Send) })
 		return false
 	}
-	if validate := h.getSessionValidator(); validate != nil && c.SessionID != "" {
-		if !validate(c.SessionID, c.UserID) {
+	for {
+		epoch := h.revocationEpoch()
+		if validate := h.getSessionValidator(); validate != nil && c.SessionID != "" {
+			if !validate(c.SessionID, c.UserID) {
+				c.closeOnce.Do(func() { close(c.Send) })
+				return false
+			}
+		}
+		h.mu.Lock()
+		if h.stopped.Load() {
+			h.mu.Unlock()
 			c.closeOnce.Do(func() { close(c.Send) })
 			return false
 		}
+		if h.revEpoch != epoch {
+			h.mu.Unlock()
+			continue
+		}
+		h.clients[c] = struct{}{}
+		logger.Debugf("WebSocket client connected: %s (total: %d)", c.ID, len(h.clients))
+		h.mu.Unlock()
+		return true
+	}
+}
+
+// StartPumps reserves n pump goroutines for a registered client and
+// reports whether the reservation was accepted. The controller calls
+// it right after Register and starts the pumps only on success, so a
+// stop landing between Register and the pump start refuses the
+// reservation instead of leaving pumps running after Stop returned.
+// The reservation and the stopped/pumpClosed checks happen under the
+// hub lock, and Stop sets pumpClosed under the same lock before
+// waiting for the pumps, so a pump can neither start after Stop
+// returned nor be missed by Stop's wait.
+func (h *Hub) StartPumps(n int) bool {
+	if h == nil {
+		return false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.stopped.Load() {
-		c.closeOnce.Do(func() { close(c.Send) })
+	if h.stopped.Load() || h.pumpClosed {
 		return false
 	}
-	h.clients[c] = struct{}{}
-	logger.Debugf("WebSocket client connected: %s (total: %d)", c.ID, len(h.clients))
+	h.pumps.Add(n)
 	return true
+}
+
+// PumpDone marks one pump goroutine finished. The controller defers
+// it in each pump it started through StartPumps.
+func (h *Hub) PumpDone() {
+	if h == nil {
+		return
+	}
+	h.pumps.Done()
 }
 
 // Unregister removes a client from the hub. Synchronous like Register,
@@ -568,10 +666,16 @@ func (h *Hub) Unregister(c *Client) {
 }
 
 // Stop signals the hub to shut down, closes all client connections,
-// and waits for the event loop to finish — so no connection or
-// goroutine is left behind when the panel stops or restarts
-// in-process. Stopping a hub whose loop never started returns at
-// once. A stopped hub refuses every later Register.
+// and waits for the event loop and every pump goroutine to finish —
+// so no connection or goroutine is left behind when the panel stops
+// or restarts in-process. Stopping a hub whose loop never started
+// returns at once. A stopped hub refuses every later Register.
+//
+// Setting pumpClosed under the lock is the barrier for the pump
+// wait: StartPumps reserves under the same lock, so any reservation
+// made before it is counted by the wait, and any made after it sees
+// pumpClosed and is refused. Without it a pump could start between
+// the loop exit and the wait and outlive Stop.
 func (h *Hub) Stop() {
 	if h == nil {
 		return
@@ -583,4 +687,8 @@ func (h *Hub) Stop() {
 	if h.started.Load() {
 		<-h.done
 	}
+	h.mu.Lock()
+	h.pumpClosed = true
+	h.mu.Unlock()
+	h.pumps.Wait()
 }
