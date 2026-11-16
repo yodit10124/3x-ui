@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/web/global"
 	"github.com/mhsanaei/3x-ui/v2/web/service"
+	"github.com/mhsanaei/3x-ui/v2/web/session"
 	panelws "github.com/mhsanaei/3x-ui/v2/web/websocket"
 
 	"github.com/gin-gonic/gin"
@@ -347,7 +349,7 @@ func getServerStatus(t *testing.T, engine *gin.Engine, cookies []*http.Cookie) *
 // password-hash column existed (empty hash) self-heals on its first
 // authenticated request, so the WebSocket sweeper does not keep
 // dropping its connections after an upgrade.
-func TestSessionPasswordHashBackfill(t *testing.T) {
+func TestEmptyPasswordHashSessionRejected(t *testing.T) {
 	engine := setupSecureCookieEngine(t, nil)
 	cookies := loginAsAdmin(t, engine)
 
@@ -355,29 +357,36 @@ func TestSessionPasswordHashBackfill(t *testing.T) {
 	if err := db.Model(&model.LoginSession{}).Where("1 = 1").Update("password_hash", "").Error; err != nil {
 		t.Fatalf("clear password_hash: %v", err)
 	}
-	// The next authenticated request must still succeed (the cookie's
-	// hash is current) and backfill the row.
-	if rec := getServerStatus(t, engine, cookies); rec.Code != http.StatusOK {
-		t.Fatalf("status with pre-hash-column session: %d, want 200", rec.Code)
+	// A session whose row carries no password hash predates the hash
+	// column: it must not be bound to the current password on first
+	// access (that would let it survive a password change that
+	// happened before that access). It is invalid outright and the
+	// row is deleted; the caller logs in again.
+	if rec := getServerStatus(t, engine, cookies); rec.Code != http.StatusNotFound {
+		t.Fatalf("status with empty-hash session: %d, want 404", rec.Code)
 	}
 	var rows []model.LoginSession
 	if err := db.Find(&rows).Error; err != nil {
 		t.Fatalf("read sessions: %v", err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("sessions %d, want 1", len(rows))
+	if len(rows) != 0 {
+		t.Fatalf("sessions %d after empty-hash rejection, want 0", len(rows))
 	}
-	if rows[0].PasswordHash == "" {
-		t.Fatal("password_hash not backfilled")
+	// The same cookie cannot open a WebSocket either.
+	backend := httptest.NewServer(engine)
+	t.Cleanup(backend.Close)
+	if _, resp, err := dialWS(t, backend.URL, cookies); err == nil {
+		t.Fatal("websocket dial with empty-hash session succeeded, want rejection")
+	} else if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("websocket dial with empty-hash session: err=%v status=%d, want 401", err, status)
 	}
-	// The backfilled hash must be the admin's current hash, so the
-	// WebSocket sweeper accepts the session.
-	var admin model.User
-	if err := db.Model(model.User{}).Where("username = ?", "admin").First(&admin).Error; err != nil {
-		t.Fatalf("read admin: %v", err)
-	}
-	if rows[0].PasswordHash != admin.Password {
-		t.Fatal("backfilled password_hash is not the current hash")
+	// A fresh login still works.
+	if rec := getServerStatus(t, engine, loginAsAdmin(t, engine)); rec.Code != http.StatusOK {
+		t.Fatalf("status after re-login: %d, want 200", rec.Code)
 	}
 }
 
@@ -534,15 +543,11 @@ func TestLoginCookieHoldsNoPasswordHash(t *testing.T) {
 	}
 }
 
-// TestOldFormatCookieIsRevoked: a cookie carrying the old format (the
-// session ID plus the full user object, including the bcrypt hash) is
-// rejected and its server-side session revoked, forcing a fresh login.
-func TestOldFormatCookieIsRevoked(t *testing.T) {
-	engine := setupSecureCookieEngine(t, nil)
-	cookies := loginAsAdmin(t, engine)
-
-	// Rebuild the cookie the old way, signed with the panel's own
-	// secret: the same session ID plus the full user object.
+// forgeOldFormatCookie rebuilds a login cookie the old way, signed
+// with the panel's own secret: the same session ID plus the full user
+// object (including the bcrypt hash).
+func forgeOldFormatCookie(t *testing.T, cookies []*http.Cookie) []*http.Cookie {
+	t.Helper()
 	secret, err := (&service.SettingService{}).GetSecret()
 	if err != nil {
 		t.Fatalf("get secret: %v", err)
@@ -554,26 +559,35 @@ func TestOldFormatCookieIsRevoked(t *testing.T) {
 	sc := securecookie.New(secret, nil)
 	// The sessions store serializes the session as
 	// map[interface{}]interface{}.
-	var session map[interface{}]interface{}
+	var values map[interface{}]interface{}
 	var cookieValue string
 	for _, c := range cookies {
 		if c.Name != "3x-ui" {
 			continue
 		}
 		cookieValue = c.Value
-		if err := sc.Decode("3x-ui", c.Value, &session); err != nil {
+		if err := sc.Decode("3x-ui", c.Value, &values); err != nil {
 			t.Fatalf("decode session cookie: %v", err)
 		}
 	}
-	if cookieValue == "" || session == nil {
+	if cookieValue == "" || values == nil {
 		t.Fatal("no 3x-ui cookie from login")
 	}
-	session["LOGIN_USER"] = admin
-	oldValue, err := sc.Encode("3x-ui", session)
+	values["LOGIN_USER"] = admin
+	oldValue, err := sc.Encode("3x-ui", values)
 	if err != nil {
 		t.Fatalf("encode old-format cookie: %v", err)
 	}
-	oldCookies := []*http.Cookie{{Name: "3x-ui", Value: oldValue}}
+	return []*http.Cookie{{Name: "3x-ui", Value: oldValue}}
+}
+
+// TestOldFormatCookieIsRevoked: a cookie carrying the old format (the
+// session ID plus the full user object, including the bcrypt hash) is
+// rejected and its server-side session revoked, forcing a fresh login.
+func TestOldFormatCookieIsRevoked(t *testing.T) {
+	engine := setupSecureCookieEngine(t, nil)
+	cookies := loginAsAdmin(t, engine)
+	oldCookies := forgeOldFormatCookie(t, cookies)
 
 	// Rejected, and the server-side session is gone: the row is
 	// deleted, so the original cookie dies with it.
@@ -594,6 +608,59 @@ func TestOldFormatCookieIsRevoked(t *testing.T) {
 	cookies = loginAsAdmin(t, engine)
 	if rec := getServerStatus(t, engine, cookies); rec.Code != http.StatusOK {
 		t.Fatalf("status after re-login: %d, want 200", rec.Code)
+	}
+}
+
+// TestReloginWithOldCookieDropsUserObject: logging in again while
+// carrying an old-format cookie must not keep the user object in the
+// new cookie. The session map loaded from the old cookie still holds
+// LOGIN_USER (with the bcrypt hash); saving it again would make the
+// next request revoke the fresh session on sight — a login loop that
+// keeps carrying the hash.
+func TestReloginWithOldCookieDropsUserObject(t *testing.T) {
+	engine := setupSecureCookieEngine(t, nil)
+	cookies := loginAsAdmin(t, engine)
+	oldCookies := forgeOldFormatCookie(t, cookies)
+
+	// Re-login carrying the old-format cookie, the way a browser does.
+	body := strings.NewReader(`{"username":"admin","password":"admin"}`)
+	req := httptest.NewRequest(http.MethodPost, "/login", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	for _, c := range oldCookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-login with old cookie: %d, want 200", rec.Code)
+	}
+	newCookies := rec.Result().Cookies()
+
+	var admin model.User
+	if err := database.GetDB().Where("username = ?", "admin").First(&admin).Error; err != nil {
+		t.Fatalf("read admin: %v", err)
+	}
+	var payload []byte
+	for _, c := range newCookies {
+		payload = append(payload, decodeCookiePayload(t, c.Value)...)
+	}
+	if bytes.Contains(payload, []byte(admin.Password)) {
+		t.Fatal("re-login cookie still decodes to the bcrypt password hash")
+	}
+	if bytes.Contains(payload, []byte("LOGIN_USER")) {
+		t.Fatal("re-login cookie still carries the user object (LOGIN_USER)")
+	}
+	if !bytes.Contains(payload, []byte("LOGIN_SESSION_ID")) {
+		t.Fatal("re-login cookie does not decode to a session ID (wrong payload?)")
+	}
+	// The new cookie authenticates: no login loop.
+	if rec := getServerStatus(t, engine, newCookies); rec.Code != http.StatusOK {
+		t.Fatalf("status with re-login cookie: %d, want 200", rec.Code)
+	}
+	// And again, to prove the loop is really gone.
+	if rec := getServerStatus(t, engine, newCookies); rec.Code != http.StatusOK {
+		t.Fatalf("second status with re-login cookie: %d, want 200", rec.Code)
 	}
 }
 
@@ -727,7 +794,23 @@ func TestLogoutClosesWebSocket(t *testing.T) {
 	}
 	defer bConn.Close()
 
-	// Both connections receive pushes.
+	// Both connections receive pushes. The dial returns as soon as the
+	// 101 handshake completes, which is before the handler registers
+	// the client (Register validates the session first), so wait
+	// until both clients are actually in the hub before broadcasting
+	// the single-shot probe — otherwise it can land before
+	// registration and the read times out.
+	hub, ok := global.GetWebServer().GetWSHub().(*panelws.Hub)
+	if !ok || hub == nil {
+		t.Fatal("no hub in test server")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for hub.GetClientCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if hub.GetClientCount() != 2 {
+		t.Fatalf("hub client count %d, want 2", hub.GetClientCount())
+	}
 	panelws.BroadcastStatus(map[string]any{"probe": "ws-before-logout"})
 	readWSUntil(t, aConn, "ws-before-logout", 5*time.Second)
 	readWSUntil(t, bConn, "ws-before-logout", 5*time.Second)
@@ -758,6 +841,81 @@ func TestLogoutClosesWebSocket(t *testing.T) {
 			status = resp.StatusCode
 		}
 		t.Fatalf("websocket dial with logged-out cookie: err=%v status=%d, want 401", err, status)
+	}
+}
+
+// TestLogoutDuringWebSocketHandshake: the logout lands while a
+// WebSocket is still handshaking — authenticated, upgraded, but not
+// yet registered. Register re-validates the session at registration
+// time, so the connection is refused instead of joining the hub and
+// living until the next sweep. The ordering is controlled with a
+// blocking validator (no sleeps): the dial blocks inside validation
+// until the test logs out and releases it.
+func TestLogoutDuringWebSocketHandshake(t *testing.T) {
+	engine := setupSecureCookieEngine(t, nil)
+	backend := httptest.NewServer(engine)
+	t.Cleanup(backend.Close)
+
+	cookies := loginAsAdmin(t, engine)
+
+	hub, ok := global.GetWebServer().GetWSHub().(*panelws.Hub)
+	if !ok || hub == nil {
+		t.Fatal("no hub in test server")
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	hub.SetSessionValidator(func(sessionID string, userID int) bool {
+		once.Do(func() { close(entered) })
+		<-release
+		// The real check: after the logout below the row is gone.
+		return session.ValidateSessionID(sessionID, userID)
+	})
+
+	type dialResult struct {
+		conn *websocket.Conn
+		resp *http.Response
+		err  error
+	}
+	res := make(chan dialResult, 1)
+	go func() {
+		wsURL := "ws://" + strings.TrimPrefix(backend.URL, "http://") + "/ws"
+		header := http.Header{}
+		header.Set("Origin", backend.URL)
+		for _, c := range cookies {
+			header.Add("Cookie", c.Name+"="+c.Value)
+		}
+		conn, resp, err := (&websocket.Dialer{HandshakeTimeout: 5 * time.Second}).Dial(wsURL, header)
+		res <- dialResult{conn, resp, err}
+	}()
+
+	// Wait until the handler is blocked inside Register's validation.
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hub Register never started validation")
+	}
+	if n := hub.GetClientCount(); n != 0 {
+		t.Fatalf("client registered before validation finished: %d", n)
+	}
+
+	// The logout lands while the handshake is in flight.
+	logout(t, engine, cookies)
+	close(release)
+
+	d := <-res
+	if d.err != nil {
+		t.Fatalf("websocket dial failed: %v", d.err)
+	}
+	defer d.conn.Close()
+	_ = d.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, _, err := d.conn.ReadMessage(); err == nil {
+		t.Fatal("websocket stayed open after logout during handshake, want it closed")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("websocket still open after logout during handshake (read timed out): %v", err)
+	}
+	if n := hub.GetClientCount(); n != 0 {
+		t.Fatalf("hub still holds %d clients after refused registration", n)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/util/crypto"
 	ldaputil "github.com/mhsanaei/3x-ui/v2/util/ldap"
+	"github.com/mhsanaei/3x-ui/v2/web/session"
 	"github.com/xlzd/gotp"
 	"gorm.io/gorm"
 )
@@ -166,6 +167,17 @@ func (s *UserService) UpdateFirstUser(username string, password string) error {
 	user.Password = hashedPassword
 	if err := db.Save(user).Error; err != nil {
 		return err
+	}
+	// The password just changed (this is the CLI `x-ui setting
+	// -password` path): revoke every server-side session of the user
+	// so sessions issued under the old password stop working at once,
+	// instead of relying on the password-hash comparison to reject
+	// them on their next request. The web password-change path revokes
+	// the same way (see the setting controller's updateUser). Live
+	// WebSockets of the revoked sessions are closed by the hub
+	// sweeper within one sweep interval.
+	if err := session.RevokeAllSessions(user.Id); err != nil {
+		logger.Warning("user: failed to revoke sessions after CLI password change:", err)
 	}
 	return s.settingService.RotateSecret()
 }

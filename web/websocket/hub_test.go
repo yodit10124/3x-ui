@@ -1,6 +1,8 @@
 package websocket
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,7 +48,7 @@ func sendClosed(c *Client) bool {
 func TestHubCloseSessionClients(t *testing.T) {
 	initTestLogger(t)
 	h := NewHub()
-	go h.Run()
+	h.Start()
 	defer h.Stop()
 
 	a1 := NewClient("a1", "session-a", 1)
@@ -74,7 +76,7 @@ func TestHubCloseSessionClients(t *testing.T) {
 func TestHubCloseUserClients(t *testing.T) {
 	initTestLogger(t)
 	h := NewHub()
-	go h.Run()
+	h.Start()
 	defer h.Stop()
 
 	u1 := NewClient("u1", "session-1", 1)
@@ -99,19 +101,22 @@ func TestHubCloseUserClients(t *testing.T) {
 func TestHubSessionSweeper(t *testing.T) {
 	initTestLogger(t)
 	h := NewHub()
-	h.SetSessionValidator(func(sessionID string, userID int) bool {
-		// Only the "live" session is still valid; "dead" expired.
-		return sessionID == "live"
-	})
 	h.SetSessionSweepInterval(50 * time.Millisecond)
-	go h.Run()
+	h.Start()
 	defer h.Stop()
 
 	dead := NewClient("dead", "dead", 1)
 	live := NewClient("live", "live", 1)
+	// Register first, then install the validator: Register validates
+	// at registration time, so a client that is already invalid
+	// would be refused outright and never reach the sweeper.
 	h.Register(dead)
 	h.Register(live)
 	waitForCount(t, h, 2, 5*time.Second)
+	h.SetSessionValidator(func(sessionID string, userID int) bool {
+		// Only the "live" session is still valid; "dead" expired.
+		return sessionID == "live"
+	})
 
 	// The sweep must close the dead session's connection and leave the
 	// live one alone, within a few sweep intervals.
@@ -130,5 +135,204 @@ func TestHubSessionSweeper(t *testing.T) {
 	}
 	if h.GetClientCount() != 1 {
 		t.Fatalf("client count %d, want 1", h.GetClientCount())
+	}
+}
+
+// TestHubRegisterRefusedAfterStop: once the hub is stopped, Register
+// refuses and closes the client's Send channel instead of leaving a
+// connection nobody will ever close.
+func TestHubRegisterRefusedAfterStop(t *testing.T) {
+	initTestLogger(t)
+	h := NewHub()
+	h.Start()
+	h.Stop()
+
+	c := NewClient("late", "session-x", 1)
+	if h.Register(c) {
+		t.Fatal("Register after Stop accepted, want refused")
+	}
+	if !sendClosed(c) {
+		t.Fatal("refused client Send not closed")
+	}
+	if h.GetClientCount() != 0 {
+		t.Fatalf("client count %d, want 0", h.GetClientCount())
+	}
+}
+
+// TestHubRegisterValidatesSession: Register re-validates the login
+// session at registration time, so a session revoked during the
+// handshake is refused instead of living until the next sweep.
+func TestHubRegisterValidatesSession(t *testing.T) {
+	initTestLogger(t)
+	h := NewHub()
+	h.SetSessionValidator(func(sessionID string, userID int) bool {
+		return sessionID == "live"
+	})
+	h.Start()
+	defer h.Stop()
+
+	dead := NewClient("dead", "dead", 1)
+	if h.Register(dead) {
+		t.Fatal("Register with revoked session accepted, want refused")
+	}
+	if !sendClosed(dead) {
+		t.Fatal("refused client Send not closed")
+	}
+	live := NewClient("live", "live", 1)
+	if !h.Register(live) {
+		t.Fatal("Register with valid session refused, want accepted")
+	}
+	if h.GetClientCount() != 1 {
+		t.Fatalf("client count %d, want 1", h.GetClientCount())
+	}
+}
+
+// blockingValidator blocks inside the validation until release is
+// closed, then answers with valid.Load(). entered closes on the first
+// call, so the test can perform the revocation (or stop) while the
+// registration is still in flight — deterministic ordering, no sleeps.
+func blockingValidator(t *testing.T, valid *atomic.Bool) (func(string, int) bool, chan struct{}, chan struct{}) {
+	t.Helper()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	validate := func(sessionID string, userID int) bool {
+		once.Do(func() { close(entered) })
+		<-release
+		return valid.Load()
+	}
+	return validate, entered, release
+}
+
+func waitEntered(t *testing.T, entered chan struct{}) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Register never entered validation")
+	}
+}
+
+// TestHubRegisterRefusedWhenSessionRevokedDuringHandshake: the
+// handshake is in flight (Register blocked in validation) when the
+// session is revoked; validation then answers false and the
+// registration is refused.
+func TestHubRegisterRefusedWhenSessionRevokedDuringHandshake(t *testing.T) {
+	initTestLogger(t)
+	h := NewHub()
+	valid := &atomic.Bool{}
+	valid.Store(true)
+	validate, entered, release := blockingValidator(t, valid)
+	h.SetSessionValidator(validate)
+	h.Start()
+	defer h.Stop()
+
+	c := NewClient("hs", "session-hs", 1)
+	done := make(chan bool, 1)
+	go func() { done <- h.Register(c) }()
+	waitEntered(t, entered)
+	// The logout lands while the handshake is in flight.
+	valid.Store(false)
+	close(release)
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("Register accepted a session revoked during the handshake")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Register did not return after validation released")
+	}
+	if !sendClosed(c) {
+		t.Fatal("refused client Send not closed")
+	}
+	if h.GetClientCount() != 0 {
+		t.Fatalf("client count %d, want 0", h.GetClientCount())
+	}
+}
+
+// TestHubRegisterRefusedWhenStoppedDuringHandshake: the hub stops
+// while a registration is being validated; the stopped flag is
+// re-checked under the lock at insert, so the registration is
+// refused even though the session is still valid.
+func TestHubRegisterRefusedWhenStoppedDuringHandshake(t *testing.T) {
+	initTestLogger(t)
+	h := NewHub()
+	valid := &atomic.Bool{}
+	valid.Store(true)
+	validate, entered, release := blockingValidator(t, valid)
+	h.SetSessionValidator(validate)
+	h.Start()
+	defer h.Stop()
+
+	c := NewClient("hs", "session-hs", 1)
+	done := make(chan bool, 1)
+	go func() { done <- h.Register(c) }()
+	waitEntered(t, entered)
+	h.Stop() // waits for the loop to exit; Register is still blocked
+	close(release)
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("Register accepted after the hub stopped")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Register did not return after validation released")
+	}
+	if !sendClosed(c) {
+		t.Fatal("refused client Send not closed")
+	}
+	if h.GetClientCount() != 0 {
+		t.Fatalf("client count %d, want 0", h.GetClientCount())
+	}
+}
+
+// TestHubRegisterThenUnregisterImmediately: registration and
+// unregistration are both synchronous, so a disconnect right after
+// registration leaves no record behind.
+func TestHubRegisterThenUnregisterImmediately(t *testing.T) {
+	initTestLogger(t)
+	h := NewHub()
+	h.Start()
+	defer h.Stop()
+
+	c := NewClient("fast", "session-fast", 1)
+	if !h.Register(c) {
+		t.Fatal("Register refused, want accepted")
+	}
+	h.Unregister(c)
+	if h.GetClientCount() != 0 {
+		t.Fatalf("client count %d, want 0", h.GetClientCount())
+	}
+	if !sendClosed(c) {
+		t.Fatal("unregistered client Send not closed")
+	}
+	// A broadcast afterwards must not resurrect or panic on the record.
+	h.Broadcast(MessageTypeStatus, map[string]string{"ping": "pong"})
+	if h.GetClientCount() != 0 {
+		t.Fatalf("client count %d after broadcast, want 0", h.GetClientCount())
+	}
+}
+
+// TestHubStopClosesClientsAndWaits: Stop closes every registered
+// client and waits for the event loop to finish, so when Stop returns
+// the shutdown has already happened — no connection or goroutine is
+// left behind for an in-process restart.
+func TestHubStopClosesClientsAndWaits(t *testing.T) {
+	initTestLogger(t)
+	h := NewHub()
+	h.Start()
+
+	c := NewClient("stop", "session-stop", 1)
+	if !h.Register(c) {
+		t.Fatal("Register refused, want accepted")
+	}
+	h.Stop()
+	// Stop waited for the loop to exit, so the shutdown already ran:
+	// no polling, the client must be gone right now.
+	if h.GetClientCount() != 0 {
+		t.Fatalf("client count %d right after Stop, want 0", h.GetClientCount())
+	}
+	if !sendClosed(c) {
+		t.Fatal("client Send not closed right after Stop")
 	}
 }

@@ -216,8 +216,16 @@ func (w *WebSocketController) HandleWebSocket(c *gin.Context) {
 	// when that session is revoked (logout, password change, expiry)
 	// the hub can close exactly this connection. A logged-out cookie
 	// fails GetLoginUser above, so it cannot reconnect either.
+	// Register re-validates the session and reports failure: a
+	// logout that landed during the handshake, or a hub that stopped
+	// while the upgrade was in flight, must not start pumps for a
+	// connection nobody will ever close.
 	client := websocket.NewClient(uuid.New().String(), session.GetSessionID(c), user.Id)
-	w.hub.Register(client)
+	if !w.hub.Register(client) {
+		logger.Debugf("WebSocket client %s registration refused from %s (session revoked or hub stopped)", client.ID, getRemoteIp(c))
+		conn.Close()
+		return
+	}
 	logger.Debugf("WebSocket client %s registered from %s", client.ID, getRemoteIp(c))
 
 	go w.writePump(client, conn)

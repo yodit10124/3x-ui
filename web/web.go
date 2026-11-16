@@ -332,7 +332,7 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	// (expiry) nor a password change or user deletion by more than one
 	// sweep interval. Logout closes its connections immediately instead.
 	s.wsHub.SetSessionValidator(session.ValidateSessionID)
-	go s.wsHub.Run()
+	s.wsHub.Start()
 
 	// Initialize WebSocket controller
 	s.ws = controller.NewWebSocketController(s.wsHub, func() []string {

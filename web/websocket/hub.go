@@ -37,7 +37,6 @@ const (
 	enqueueTimeout    = 100 * time.Millisecond
 	clientSendQueue   = 512  // ~50s of buffering for a momentarily slow browser.
 	hubBroadcastQueue = 2048 // Headroom for cron-storm + admin-mutation bursts.
-	hubControlQueue   = 64   // Backlog for register/unregister bursts (page reloads, disconnect storms).
 
 	// minBroadcastInterval throttles per-type broadcasts so cron storms or
 	// rapid mutations cannot drown the hub. Bursts within the interval are
@@ -94,14 +93,45 @@ type Client struct {
 }
 
 // Hub fan-outs messages to all connected clients.
+//
+// Registration is synchronous: Register inserts the client into the
+// map under the hub lock and reports success, Unregister removes it
+// the same way. The old design queued both through separate channels
+// and the hub loop consumed them in select order, which left three
+// holes: an unregister processed before its register left a dead
+// client in the registry; a logout missed a connection still queued
+// for registration; and Stop closed only registered clients while a
+// queued registration was never processed and its goroutines lingered
+// after an internal restart. Synchronous registration closes all
+// three: the last operation wins deterministically, Register
+// re-validates the session at registration time (so a logout that
+// lands during the handshake is refused), and Stop refuses new
+// registrations and waits for the loop to finish shutting down.
+//
+// One residual interleave remains and is covered by the session
+// sweeper: a revocation that lands between Register's validation and
+// its insert is caught at the next sweep (at most one sweep interval
+// later), the same backstop as every other revocation path.
 type Hub struct {
-	clients    map[*Client]struct{}
-	broadcast  chan []byte
-	register   chan *Client
-	unregister chan *Client
-	mu         sync.RWMutex
-	ctx        context.Context
-	cancel     context.CancelFunc
+	clients   map[*Client]struct{}
+	broadcast chan []byte
+	mu        sync.RWMutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+
+	// stopped is set by Stop and refuses every later Register. It is
+	// checked before validation and again under the lock at insert,
+	// so a stop that lands while a registration is being validated
+	// still wins.
+	stopped atomic.Bool
+	// started reports whether Run has begun; Stop waits for the loop
+	// to exit only when it has, so stopping a never-started hub
+	// cannot hang.
+	started atomic.Bool
+	// done closes when Run returns, i.e. after the loop has shut down
+	// and closed every registered client.
+	done     chan struct{}
+	doneOnce sync.Once
 
 	throttleMu    sync.Mutex
 	lastBroadcast map[MessageType]time.Time
@@ -124,10 +154,9 @@ func NewHub() *Hub {
 	h := &Hub{
 		clients:       make(map[*Client]struct{}),
 		broadcast:     make(chan []byte, hubBroadcastQueue),
-		register:      make(chan *Client, hubControlQueue),
-		unregister:    make(chan *Client, hubControlQueue),
 		ctx:           ctx,
 		cancel:        cancel,
+		done:          make(chan struct{}),
 		lastBroadcast: make(map[MessageType]time.Time),
 	}
 	h.sweepIntervalNs.Store(int64(defaultSessionSweepInterval))
@@ -273,11 +302,29 @@ func (h *Hub) shouldThrottle(msgType MessageType) bool {
 	return false
 }
 
+// Start launches the event loop in a goroutine. It marks the hub
+// started synchronously, before the goroutine exists, so Stop can
+// reliably wait for the loop to exit: setting the flag inside Run
+// would race with a Stop that lands before the goroutine is first
+// scheduled. Callers must use Start, not `go h.Run()`.
+func (h *Hub) Start() {
+	h.started.Store(true)
+	go h.Run()
+}
+
 // Run drives the hub. The inner loop is wrapped in a panic-recovery harness
 // that retries up to hubRestartAttempts times with backoff so a transient
 // panic doesn't permanently kill real-time updates for commercial deployments.
 // After the cap, the hub stays down and the frontend falls back to REST polling.
+// Run returns once the hub has stopped (see Stop); done closes then, so
+// Stop can wait for the shutdown to complete. A Hub runs at most once —
+// the web server creates a fresh Hub on every (re)start.
 func (h *Hub) Run() {
+	h.started.Store(true)
+	defer func() {
+		h.started.Store(false)
+		h.doneOnce.Do(func() { close(h.done) })
+	}()
 	for attempt := 0; attempt < hubRestartAttempts; attempt++ {
 		stopped := h.runOnce()
 		if stopped {
@@ -319,22 +366,6 @@ func (h *Hub) runOnce() (stopped bool) {
 		case <-sweepTicker.C:
 			h.sweepSessions()
 
-		case c := <-h.register:
-			if c == nil {
-				continue
-			}
-			h.mu.Lock()
-			h.clients[c] = struct{}{}
-			n := len(h.clients)
-			h.mu.Unlock()
-			logger.Debugf("WebSocket client connected: %s (total: %d)", c.ID, n)
-
-		case c := <-h.unregister:
-			if c == nil {
-				continue
-			}
-			h.removeClient(c)
-
 		case msg := <-h.broadcast:
 			h.fanout(msg)
 		}
@@ -365,10 +396,7 @@ func (h *Hub) removeClient(c *Client) {
 }
 
 // fanout delivers msg to every client. Each send is non-blocking — a client
-// whose buffer is full is collected for direct removal at the end. We do NOT
-// route slow-client unregistrations through the unregister channel: under
-// burst load (panel restart, network blip) that channel can fill up while the
-// hub itself is the consumer, causing a self-deadlock.
+// whose buffer is full is collected for direct removal at the end.
 func (h *Hub) fanout(msg []byte) {
 	if msg == nil {
 		return
@@ -489,41 +517,70 @@ func (h *Hub) GetClientCount() int {
 	return len(h.clients)
 }
 
-// Register adds a client to the hub.
-func (h *Hub) Register(c *Client) {
+// Register adds a client to the hub and reports whether it was accepted.
+// Registration is synchronous (the client is in the map when Register
+// returns), so a disconnect immediately afterwards cannot be processed
+// before the registration, and a logout or stop cannot miss a
+// connection that is still "on its way in".
+//
+// Registration is refused — and the client's Send channel closed so its
+// pumps exit — when the hub is stopped, or when the injected session
+// validator says the login session is no longer valid. The validation
+// runs before the insert (without holding the hub lock, so a slow
+// check cannot stall broadcasts); the stopped flag is re-checked
+// under the lock at insert, so a stop landing mid-validation still
+// wins. A client with no session ID is accepted without validation
+// (the sweeper treats it as invalid and closes it); the validator is
+// skipped entirely when none is set, e.g. in unit tests.
+func (h *Hub) Register(c *Client) bool {
 	if h == nil || c == nil {
-		return
+		return false
 	}
-	select {
-	case h.register <- c:
-	case <-h.ctx.Done():
+	if h.stopped.Load() {
+		c.closeOnce.Do(func() { close(c.Send) })
+		return false
 	}
+	if validate := h.getSessionValidator(); validate != nil && c.SessionID != "" {
+		if !validate(c.SessionID, c.UserID) {
+			c.closeOnce.Do(func() { close(c.Send) })
+			return false
+		}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.stopped.Load() {
+		c.closeOnce.Do(func() { close(c.Send) })
+		return false
+	}
+	h.clients[c] = struct{}{}
+	logger.Debugf("WebSocket client connected: %s (total: %d)", c.ID, len(h.clients))
+	return true
 }
 
-// Unregister removes a client from the hub. Fast path queues for the hub
-// goroutine; if the channel is saturated (disconnect storm) we fall back
-// to a direct removal under the write lock so dead clients aren't left in
-// the registry waiting for their Send buffer to fill (minutes of wasted
-// fanout work at low broadcast rates).
-//
-// Direct removal is safe from any caller: external goroutines (read/write
-// pumps) hold no hub locks, and the hub goroutine itself never holds h.mu
-// when it calls Unregister — fanout releases its RLock before per-client
-// sends, so we can't self-deadlock here.
+// Unregister removes a client from the hub. Synchronous like Register,
+// so the last operation wins deterministically: a disconnect right
+// after registration leaves no record behind.
 func (h *Hub) Unregister(c *Client) {
 	if h == nil || c == nil {
 		return
 	}
-	select {
-	case h.unregister <- c:
-	default:
-		h.removeClient(c)
-	}
+	h.removeClient(c)
 }
 
-// Stop signals the hub to shut down and close all client connections.
+// Stop signals the hub to shut down, closes all client connections,
+// and waits for the event loop to finish — so no connection or
+// goroutine is left behind when the panel stops or restarts
+// in-process. Stopping a hub whose loop never started returns at
+// once. A stopped hub refuses every later Register.
 func (h *Hub) Stop() {
-	if h != nil && h.cancel != nil {
+	if h == nil {
+		return
+	}
+	h.stopped.Store(true)
+	if h.cancel != nil {
 		h.cancel()
+	}
+	if h.started.Load() {
+		<-h.done
 	}
 }

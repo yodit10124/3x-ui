@@ -159,6 +159,10 @@ func TestValidateImportedDBObjects(t *testing.T) {
 		"CREATE TABLE client_traffics (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT)",
 		"CREATE TABLE history_of_seeders (id INTEGER PRIMARY KEY AUTOINCREMENT, seeder_name TEXT)",
 		"CREATE TABLE custom_geo_resources (id INTEGER PRIMARY KEY AUTOINCREMENT, geo_type TEXT)",
+		// login_sessions holds the revocable login sessions: a backup
+		// taken by a version that has the table must import, or the
+		// backup cannot be restored at all.
+		"CREATE TABLE login_sessions (id TEXT PRIMARY KEY, user_id INTEGER, username TEXT, password_hash TEXT, expires_at DATETIME)",
 	)
 	if err := ValidateImportedDBObjects(allTables); err != nil {
 		t.Errorf("real-shape import db should pass, got %v", err)

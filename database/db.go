@@ -296,9 +296,17 @@ var allowedImportTables = map[string]bool{
 	"client_traffics":      true,
 	"history_of_seeders":   true,
 	"custom_geo_resources": true,
-	"sqlite_sequence":      true,
-	"sqlite_stat1":         true,
-	"sqlite_stat4":         true,
+	// login_sessions holds the revocable login sessions (one row per
+	// login). A backup taken by a version that has the table must
+	// import: without this entry the import is rejected as an
+	// unexpected table and the backup cannot be restored at all.
+	// Restored rows are inert on their own — the cookie-signing
+	// secret rotates on import, so old cookies fail validation, and
+	// expired rows are ignored by auth anyway.
+	"login_sessions":  true,
+	"sqlite_sequence": true,
+	"sqlite_stat1":    true,
+	"sqlite_stat4":    true,
 }
 
 // ValidateImportedDBObjects enumerates sqlite_master of the candidate

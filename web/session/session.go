@@ -220,6 +220,13 @@ func SetLoginUser(c *gin.Context, user *model.User) error {
 	if err := db.Create(row).Error; err != nil {
 		return err
 	}
+	// A re-login with an old-format cookie must not carry the user
+	// object into the new cookie: the session map loaded from the old
+	// cookie still holds LOGIN_USER (with the bcrypt hash), and saving
+	// it again would make the next request revoke the fresh session
+	// on sight — a login loop that keeps carrying the hash. Drop the
+	// key so the new cookie holds only the session ID.
+	s.Delete(loginUserKey)
 	s.Set(loginSessionKey, id)
 	return s.Save()
 }
@@ -232,9 +239,9 @@ func SetLoginUser(c *gin.Context, user *model.User) error {
 // request, so a stolen cookie yields no password hash for offline
 // guessing (the signature only proves the cookie was not tampered with;
 // it never hid its contents). Returns nil when the request carries no
-// session, the row is missing or expired, the user is gone, or the
-// password hash changed since the session was created (password
-// change revokes the row; see RevokeAllSessions).
+// session, the row is missing, expired or carries no password hash,
+// the user is gone, or the password hash changed since the session was
+// created (password change revokes the row; see RevokeAllSessions).
 func GetLoginUser(c *gin.Context) *model.User {
 	s := sessions.Default(c)
 	// Old-format cookies carry the full user object, including the
@@ -277,14 +284,18 @@ func GetLoginUser(c *gin.Context) *model.User {
 	if row.PasswordHash != "" && fresh.Password != row.PasswordHash {
 		return nil
 	}
-	// Sessions created before the password-hash column existed carry an
-	// empty hash; backfill once from the current hash so the WebSocket
-	// sweeper accepts them. (The WebSocket upgrade request backfills
-	// too, before the connection is registered.)
+	// A session whose row carries no password hash predates the hash
+	// column and must not be trusted: binding it to the current
+	// password on first access would let it survive a password change
+	// that happened before that access (the CLI password change does
+	// not delete rows — see UpdateFirstUser). Invalidate it outright
+	// instead of backfilling; the caller logs in again for a fresh
+	// session. The WebSocket sweeper agrees (ValidateSessionID rejects
+	// an empty hash), so HTTP auth and live connections now enforce
+	// the same rule.
 	if row.PasswordHash == "" {
-		if err := database.GetDB().Model(&model.LoginSession{}).Where("id = ?", row.Id).Update("password_hash", fresh.Password).Error; err != nil {
-			logger.Warning("session: failed to backfill session password hash:", err)
-		}
+		database.GetDB().Delete(&model.LoginSession{}, "id = ?", row.Id)
+		return nil
 	}
 	return fresh
 }
