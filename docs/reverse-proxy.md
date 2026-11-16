@@ -46,8 +46,16 @@ Rules:
   may be omitted only when it is the scheme default, 443 for HTTPS and
   80 for HTTP). A bare host never matches, and a trusted entry never
   covers a different port.
-- Leave the field empty for same-origin-only deployments (no proxy, or a
-  proxy on the same address).
+- Leave the field empty only when the origin the panel itself derives
+  from the request (scheme from the connection, host from the Host
+  header) already equals the browser's Origin: a direct deployment, or
+  a proxy that forwards to the panel over HTTPS with the same host.
+  **When TLS terminates at the proxy and the proxy talks plain HTTP to
+  the panel, the field must be set to the exact external HTTPS origin
+  — even when the hostname is the same.** The panel sees an `http://`
+  origin while the browser sends `https://`, so the two never match
+  and the WebSocket is refused without a trusted entry. The same
+  hostname is not the same origin.
 - Changes take effect immediately; no panel restart is needed.
 
 ## 3. Preserve the external Host at the proxy
@@ -67,7 +75,12 @@ nginx:
 location / {
     proxy_pass http://127.0.0.1:2053;
     proxy_http_version 1.1;
-    proxy_set_header Host $host;
+    # $http_host is the Host header the client sent, port included.
+    # $host drops the port, so with a public address such as
+    # https://panel.example.com:8443 the browser's Origin contains
+    # :8443 while the panel would see Host panel.example.com, and the
+    # CSRF check refuses the login. Always forward the full Host.
+    proxy_set_header Host $http_host;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
 }

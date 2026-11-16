@@ -655,6 +655,20 @@ func (t *Tgbot) handleAddClientInput(message *telego.Message) {
 		return
 	}
 
+	// The session was created by an admin, but the admin list can change
+	// while a flow is in progress (revocation, then a bot reload). The
+	// sender's admin status is therefore re-checked on every input: a
+	// revoked user must not keep editing the draft or trigger reads and
+	// echoes of inbound data. The final client creation stays protected
+	// by the admin callback check, but nothing before it may leak
+	// management information. setAdminIds deletes the sessions of
+	// revoked users as well; this check covers the race window between
+	// the revocation and that cleanup.
+	if !checkAdmin(userID) {
+		deleteAddClientSession(chatId, userID)
+		return
+	}
+
 	switch sess.state {
 	case "awaiting_id":
 		if sess.id == strings.TrimSpace(message.Text) {
@@ -2266,6 +2280,29 @@ func setAdminIds(ids []int64) {
 	cp := make([]int64, len(ids))
 	copy(cp, ids)
 	adminIds.Store(&cp)
+	// Revocation must take effect at once: drop the in-progress
+	// add-client sessions of users who are no longer admins, so a
+	// revoked admin cannot keep editing a draft they started while
+	// they were an admin. handleAddClientInput re-checks on every
+	// input as a second layer, for the race window.
+	purgeRevokedSessions(cp)
+}
+
+// purgeRevokedSessions deletes the add-client sessions of every user not
+// present in the current admin list. Callers must not hold
+// addClientSessionsMu.
+func purgeRevokedSessions(admins []int64) {
+	keep := make(map[int64]bool, len(admins))
+	for _, id := range admins {
+		keep[id] = true
+	}
+	addClientSessionsMu.Lock()
+	defer addClientSessionsMu.Unlock()
+	for key := range addClientSessions {
+		if !keep[key.userID] {
+			delete(addClientSessions, key)
+		}
+	}
 }
 
 // getAdminIds returns the current admin list snapshot. The returned slice

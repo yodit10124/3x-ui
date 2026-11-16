@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -98,36 +99,71 @@ func tgbotTestCallbackQuery(userID int64, data string) *telego.CallbackQuery {
 
 // fakeTelegramAPI answers Bot API calls against a local test server so the
 // bot's send/delete paths can run without Telegram. It records how many
-// messages were sent and deleted.
+// messages were sent and deleted, assigns each sent message a distinct
+// increasing ID, and records the ID of every deleted message, so a test can
+// wait for the delete of one specific message.
 type fakeTelegramAPI struct {
 	mu      sync.Mutex
 	sends   int
-	deletes int
+	nextID  int
+	deleted []int
 }
 
 func (f *fakeTelegramAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	method := path.Base(r.URL.Path)
 	f.mu.Lock()
+	id := 0
 	switch method {
 	case "sendMessage", "editMessageText", "editMessageReplyMarkup":
 		f.sends++
+		if f.nextID == 0 {
+			f.nextID = 100
+		}
+		id = f.nextID
+		f.nextID++
 	case "deleteMessage":
-		f.deletes++
+		var req struct {
+			MessageID int `json:"message_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil && req.MessageID != 0 {
+			f.deleted = append(f.deleted, req.MessageID)
+		}
 	}
 	f.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	switch method {
 	case "sendMessage", "editMessageText", "editMessageReplyMarkup":
-		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":42,"date":1700000000,"chat":{"id":%d,"type":"private"}}}`, tgbotTestChatID)
+		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%d,"date":1700000000,"chat":{"id":%d,"type":"private"}}}`, id, tgbotTestChatID)
 	default:
 		fmt.Fprint(w, `{"ok":true,"result":true}`)
 	}
 }
 
-func (f *fakeTelegramAPI) deleteCount() int {
+func (f *fakeTelegramAPI) sendCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.deletes
+	return f.sends
+}
+
+// lastSentID returns the ID assigned to the most recently sent message, or
+// 0 if nothing was sent yet.
+func (f *fakeTelegramAPI) lastSentID() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.nextID == 0 {
+		return 0
+	}
+	return f.nextID - 1
+}
+
+// deletedMessageIDs returns the IDs of the messages deleted so far, in
+// order.
+func (f *fakeTelegramAPI) deletedMessageIDs() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]int, len(f.deleted))
+	copy(out, f.deleted)
+	return out
 }
 
 // setupFakeTgbot installs a bot backed by the fake API server and marks it
@@ -354,6 +390,10 @@ func TestAddClientSessionConcurrent(t *testing.T) {
 func TestHandleAddClientInput(t *testing.T) {
 	inboundID := setupTgbotTestDB(t)
 	tb := (&Tgbot{}).NewTgbot()
+	// Input handling re-checks the admin status on every message, so
+	// the test must load the admin list the way Start() does.
+	setAdminIds([]int64{tgbotTestAdminID})
+	t.Cleanup(func() { setAdminIds(nil) })
 
 	addClientSessionsMu.Lock()
 	sess := tb.newAddClientSession(tgbotTestChatID, tgbotTestAdminID, inboundID)
@@ -403,6 +443,74 @@ func TestHandleAddClientInputNoSession(t *testing.T) {
 	})
 }
 
+// TestHandleAddClientInputRevokedAdmin covers the audit scenario
+// "start input -> revoked -> keep sending text": an admin enters the
+// add-client flow, is removed from the admin list (and the bot reloaded),
+// then keeps sending text before the session expires. The revoked user
+// must not be able to keep editing the draft or trigger reads and echoes
+// of inbound data.
+//
+// Two layers are exercised:
+//   - an admin-list update deletes the sessions of revoked users at once;
+//   - even if such a session still exists (the revocation raced the
+//     input), handling the input re-checks the admin status, deletes the
+//     session and refuses without sending anything.
+func TestHandleAddClientInputRevokedAdmin(t *testing.T) {
+	setupTgbotTestDB(t)
+	api := setupFakeTgbot(t)
+	tb := (&Tgbot{}).NewTgbot()
+	setAdminIds([]int64{tgbotTestAdminID})
+	t.Cleanup(func() { setAdminIds(nil) })
+
+	// The admin starts an add-client flow and reaches the email step.
+	addClientSessionsMu.Lock()
+	sess := tb.newAddClientSession(tgbotTestChatID, tgbotTestAdminID, 1)
+	sess.state = "awaiting_email"
+	addClientSessionsMu.Unlock()
+
+	// Revocation via an admin-list update must drop the session at once.
+	setAdminIds([]int64{222})
+	addClientSessionsMu.Lock()
+	if got := getAddClientSession(tgbotTestChatID, tgbotTestAdminID); got != nil {
+		addClientSessionsMu.Unlock()
+		t.Fatal("revoked admin's session survived the admin-list update")
+	}
+	addClientSessionsMu.Unlock()
+
+	// A further text message must not recreate or use the flow, and must
+	// not echo any management information.
+	tb.handleAddClientInput(&telego.Message{
+		Chat: telego.Chat{ID: tgbotTestChatID},
+		From: &telego.User{ID: tgbotTestAdminID},
+		Text: "attacker@example.com",
+	})
+	if got := api.sendCount(); got != 0 {
+		t.Fatalf("revoked admin input produced %d sends, want 0", got)
+	}
+
+	// Second layer: a session that still exists for a user who is not an
+	// admin (revocation raced the input) must be deleted on the next
+	// input, again without reading or echoing inbound data.
+	addClientSessionsMu.Lock()
+	sess = tb.newAddClientSession(tgbotTestChatID, tgbotTestUserID, 1)
+	sess.state = "awaiting_email"
+	addClientSessionsMu.Unlock()
+	tb.handleAddClientInput(&telego.Message{
+		Chat: telego.Chat{ID: tgbotTestChatID},
+		From: &telego.User{ID: tgbotTestUserID},
+		Text: "attacker@example.com",
+	})
+	addClientSessionsMu.Lock()
+	if got := getAddClientSession(tgbotTestChatID, tgbotTestUserID); got != nil {
+		addClientSessionsMu.Unlock()
+		t.Fatal("non-admin session survived input handling")
+	}
+	addClientSessionsMu.Unlock()
+	if got := api.sendCount(); got != 0 {
+		t.Fatalf("non-admin input produced %d sends, want 0", got)
+	}
+}
+
 // TestBuildJSONForProtocolUsesSession: the client JSON is built from the
 // session's own data, not from shared state.
 func TestBuildJSONForProtocolUsesSession(t *testing.T) {
@@ -447,8 +555,11 @@ func TestSendMsgToTgbotDeleteAfterKeepsNewInputState(t *testing.T) {
 	addClientSessionsMu.Unlock()
 
 	// Arm the timer of an earlier prompt (1s here instead of the
-	// production 3s, same code path).
+	// production 3s, same code path). Each sent message gets a distinct
+	// ID from the fake API, so the armed message can be told apart from
+	// the prompt the callback sends next.
 	tb.SendMsgToTgbotDeleteAfter(tgbotTestChatID, "received_email", 1)
+	armedID := api.lastSentID()
 
 	// Before the timer fires, the admin moves on to the next step via the
 	// "change ID" button, which sets awaiting_id synchronously.
@@ -465,8 +576,29 @@ func TestSendMsgToTgbotDeleteAfterKeepsNewInputState(t *testing.T) {
 		t.Fatalf("state after moving to next step = %q, want awaiting_id", state)
 	}
 
-	// Wait past the old prompt's expiry: the new step must survive it.
-	time.Sleep(2 * time.Second)
+	// Wait for the old prompt's own delete event, not a fixed sleep: the
+	// wait is synchronised with the timer actually firing. The callback
+	// above deletes its own message (id 7), so a bare delete count would
+	// not prove the timer ran.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		deleted := false
+		for _, id := range api.deletedMessageIDs() {
+			if id == armedID {
+				deleted = true
+				break
+			}
+		}
+		if deleted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("old prompt message %d was never deleted, timer did not fire", armedID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The old timer ran, and the new step must have survived it.
 	addClientSessionsMu.Lock()
 	sess = getAddClientSession(tgbotTestChatID, tgbotTestAdminID)
 	state = ""
@@ -476,10 +608,6 @@ func TestSendMsgToTgbotDeleteAfterKeepsNewInputState(t *testing.T) {
 	addClientSessionsMu.Unlock()
 	if state != "awaiting_id" {
 		t.Fatalf("old prompt timer cleared the new step: state = %q, want awaiting_id", state)
-	}
-	// The timer still deletes its own message.
-	if got := api.deleteCount(); got == 0 {
-		t.Fatalf("timer did not delete its message (deleteMessage calls = 0)")
 	}
 }
 
