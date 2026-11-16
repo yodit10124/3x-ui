@@ -63,6 +63,43 @@ func TestWaitReadyNeverReady(t *testing.T) {
 	}
 }
 
+// TestStopWaitsForProcessExit: Stop sends SIGTERM and used to
+// return at once, so a caller that started a replacement right
+// after Stop could race the old process for its ports — and the
+// readiness probe could connect to the OLD api and declare the new
+// process ready early. The fake traps SIGTERM and exits a second
+// later: Stop must wait for it instead of returning while it still
+// runs.
+func TestStopWaitsForProcessExit(t *testing.T) {
+	setupImportTestEnv(t, false)
+	binDir := os.Getenv("XUI_BIN_FOLDER")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then echo \"Xray 99.0-test (test)\"; exit 0; fi\ntrap 'sleep 1; exit 0' TERM\nwhile true; do sleep 1; done\n"
+	if err := os.WriteFile(filepath.Join(binDir, xray.GetBinaryName()), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = (&XrayService{}).StopXray() })
+
+	if err := (&XrayService{}).RestartXray(true); err != nil {
+		t.Fatalf("RestartXray: %v", err)
+	}
+	if !(&XrayService{}).IsXrayRunning() {
+		t.Fatal("Xray should be running before Stop")
+	}
+	start := time.Now()
+	if err := (&XrayService{}).StopXray(); err != nil {
+		t.Fatalf("StopXray: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 800*time.Millisecond {
+		t.Fatalf("Stop returned after %v, want it to wait for the slow-exiting process", elapsed)
+	}
+	if (&XrayService{}).IsXrayRunning() {
+		t.Fatal("Xray still running after Stop returned")
+	}
+}
+
 // TestXrayUpdateTarget: the Windows update target comes from the
 // configured binary folder, never the process working directory —
 // updating ./bin while the panel runs the binary from its configured

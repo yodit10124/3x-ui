@@ -26,6 +26,19 @@ import (
 // config.GetDBPath() reads (via XUI_DB_FOLDER) and, when asked,
 // installs a fake Xray binary that answers -version and otherwise
 // sleeps, so RestartXrayService can succeed in tests.
+// installNoAPITemplate stores a minimal Xray template without the
+// api inbound, so WaitReady proves readiness by sustained liveness
+// instead of a management-API probe the fake binary cannot answer.
+// Success-path tests that restart Xray with the sleeping fake need
+// it; the never-ready test deliberately keeps the default template.
+func installNoAPITemplate(t *testing.T) {
+	t.Helper()
+	tmpl := `{"log": {}, "inbounds": [], "outbounds": [], "routing": {"rules": []}, "stats": {}, "policy": {}}`
+	if err := database.GetDB().Create(&model.Setting{Key: "xrayTemplateConfig", Value: tmpl}).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func setupImportTestEnv(t *testing.T, withFakeXray bool) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -100,6 +113,28 @@ func copyImportTestFile(t *testing.T, src, dst string) {
 	}
 }
 
+func openImportTestCandidate(t *testing.T, path string) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{
+		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func closeImportTestCandidate(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestImportDBDiscardsRestoredSessions is the auditor's scenario:
 // back up a database that holds a live session, log that session
 // out, then restore the backup. The restored session must not come
@@ -107,6 +142,7 @@ func copyImportTestFile(t *testing.T, src, dst string) {
 // session) must be rejected after the import.
 func TestImportDBDiscardsRestoredSessions(t *testing.T) {
 	dbPath := setupImportTestEnv(t, true)
+	installNoAPITemplate(t)
 	insertImportTestSession(t, "session-old")
 
 	// Back up the live database (it holds the session), then log out.
@@ -163,6 +199,134 @@ func TestImportDBDiscardsRestoredSessions(t *testing.T) {
 // after the swap, the import must fail AND the original database
 // must come back — file restored, connection reopened on it, and
 // the fallback file gone (it was moved back, not deleted).
+// TestImportDBRollsBackManuallyStoppedState: when Xray was
+// manually stopped before the import, a failed import must leave
+// it stopped AND manually stopped. The import's restart attempt
+// clears the manual-stop flag even when the import then fails, so
+// without restoring it the health check would auto-start Xray
+// after a failed rollback.
+func TestImportDBRollsBackManuallyStoppedState(t *testing.T) {
+	dbPath := setupImportTestEnv(t, true)
+	installNoAPITemplate(t)
+
+	// Start Xray, then stop it manually from the panel.
+	if err := (&XrayService{}).RestartXray(true); err != nil {
+		t.Fatalf("RestartXray: %v", err)
+	}
+	if err := (&ServerService{}).StopXrayService(); err != nil {
+		t.Fatalf("StopXrayService: %v", err)
+	}
+	if (&XrayService{}).IsXrayRunning() {
+		t.Fatal("Xray should be stopped before the import")
+	}
+	if !(&ServerService{}).IsManuallyStopped() {
+		t.Fatal("manual-stop flag should be set after a manual stop")
+	}
+
+	// The candidate is a copy of the live database, and the fake
+	// Xray exits right after start, so the import fails at the
+	// readiness check.
+	candidatePath := filepath.Join(t.TempDir(), "candidate.db")
+	if err := database.CloseDB(); err != nil {
+		t.Fatal(err)
+	}
+	copyImportTestFile(t, dbPath, candidatePath)
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("reopen live db: %v", err)
+	}
+	binDir := os.Getenv("XUI_BIN_FOLDER")
+	script := "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then echo \"Xray 99.0-test (test)\"; exit 0; fi\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, xray.GetBinaryName()), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(candidatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := (&ServerService{}).ImportDB(f); err == nil {
+		t.Fatal("ImportDB should fail when Xray exits right after start")
+	}
+	if (&XrayService{}).IsXrayRunning() {
+		t.Fatal("Xray should still be stopped after a failed import")
+	}
+	if !(&ServerService{}).IsManuallyStopped() {
+		t.Fatal("manual-stop flag lost after a failed import, want it restored")
+	}
+	if (&XrayService{}).DidXrayCrash() {
+		t.Fatal("a manually stopped Xray must not be reported as crashed after a failed import")
+	}
+}
+
+// TestImportDBRollsBackCrashedState: when Xray was not running and
+// not manually stopped before the import (it crashed, or never
+// started), a failed import must leave the manual-stop flag clear:
+// DidXrayCrash must stay true so the health check revives it.
+// The rollback's own stop sets the flag unconditionally, so only
+// the explicit restore in restoreXrayState puts it back — removing
+// that restore makes this test fail.
+func TestImportDBRollsBackCrashedState(t *testing.T) {
+	dbPath := setupImportTestEnv(t, true)
+	installNoAPITemplate(t)
+
+	// The manual-stop flag is package-global and shared by every
+	// test in this binary: put it in the state this test needs
+	// instead of assuming what an earlier test left behind.
+	if (&XrayService{}).IsXrayRunning() {
+		if err := (&ServerService{}).StopXrayService(); err != nil {
+			t.Fatalf("StopXrayService: %v", err)
+		}
+	}
+	(&ServerService{}).SetManuallyStopped(false)
+
+	// Xray never started: not running, and not manually stopped.
+	if (&XrayService{}).IsXrayRunning() {
+		t.Fatal("Xray should not be running before the import")
+	}
+	if (&ServerService{}).IsManuallyStopped() {
+		t.Fatal("manual-stop flag should be clear before the import")
+	}
+	if !(&XrayService{}).DidXrayCrash() {
+		t.Fatal("a never-started Xray should count as crashed before the import")
+	}
+
+	// The candidate is a copy of the live database, and the fake
+	// Xray exits right after start, so the import fails at the
+	// readiness check.
+	candidatePath := filepath.Join(t.TempDir(), "candidate.db")
+	if err := database.CloseDB(); err != nil {
+		t.Fatal(err)
+	}
+	copyImportTestFile(t, dbPath, candidatePath)
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("reopen live db: %v", err)
+	}
+	binDir := os.Getenv("XUI_BIN_FOLDER")
+	script := "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then echo \"Xray 99.0-test (test)\"; exit 0; fi\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, xray.GetBinaryName()), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(candidatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := (&ServerService{}).ImportDB(f); err == nil {
+		t.Fatal("ImportDB should fail when Xray exits right after start")
+	}
+	if (&XrayService{}).IsXrayRunning() {
+		t.Fatal("Xray should still be stopped after a failed import")
+	}
+	if (&ServerService{}).IsManuallyStopped() {
+		t.Fatal("manual-stop flag set by a failed import, want it clear")
+	}
+	if !(&XrayService{}).DidXrayCrash() {
+		t.Fatal("a crashed Xray must still count as crashed after a failed import")
+	}
+}
+
 func TestImportDBRollsBackOnXrayStartFailure(t *testing.T) {
 	dbPath := setupImportTestEnv(t, false)
 	insertImportTestSession(t, "session-live")
@@ -217,28 +381,69 @@ func TestImportDBRollsBackOnXrayStartFailure(t *testing.T) {
 	}
 }
 
-// openImportTestCandidate opens a database file with a throw-away
-// connection for test setup (inserting rows into a candidate file).
-func openImportTestCandidate(t *testing.T, path string) *gorm.DB {
-	t.Helper()
-	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{
-		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return db
-}
+// TestImportDBRollsBackWhenXrayExitsAfterStart: cmd.Start() only
+// proves the process was created, so an imported configuration
+// that kills the process right after start (a port conflict, a bad
+// file reference) must not commit. The import must fail, the
+// original database must come back, and the candidate process must
+// not be left running.
+func TestImportDBRollsBackWhenXrayExitsAfterStart(t *testing.T) {
+	dbPath := setupImportTestEnv(t, false)
+	insertImportTestSession(t, "session-live")
 
-// closeImportTestCandidate closes a throw-away candidate connection.
-func closeImportTestCandidate(t *testing.T, db *gorm.DB) {
-	t.Helper()
-	sqlDB, err := db.DB()
+	// The candidate is a copy of the live database plus one extra
+	// user, so a missing rollback is visible in the live data.
+	candidatePath := filepath.Join(t.TempDir(), "candidate.db")
+	if err := database.CloseDB(); err != nil {
+		t.Fatal(err)
+	}
+	copyImportTestFile(t, dbPath, candidatePath)
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("reopen live db: %v", err)
+	}
+	cand := openImportTestCandidate(t, candidatePath)
+	if err := cand.Create(&model.User{Username: "imported", Password: "x"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	closeImportTestCandidate(t, cand)
+
+	// The fake Xray answers -version and then exits immediately:
+	// RestartXray succeeds (the process was created) but the
+	// readiness check must catch the exit.
+	binDir := os.Getenv("XUI_BIN_FOLDER")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then echo \"Xray 99.0-test (test)\"; exit 0; fi\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, xray.GetBinaryName()), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = (&XrayService{}).StopXray() })
+
+	f, err := os.Open(candidatePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sqlDB.Close(); err != nil {
-		t.Fatal(err)
+	defer f.Close()
+	if err := (&ServerService{}).ImportDB(f); err == nil {
+		t.Fatal("ImportDB should fail when Xray exits right after start")
+	}
+
+	var imported int64
+	if err := database.GetDB().Model(&model.User{}).Where("username = ?", "imported").Count(&imported).Error; err != nil {
+		t.Fatalf("live db unusable after rollback: %v", err)
+	}
+	if imported != 0 {
+		t.Fatal("imported user survived a failed import, want the original database restored")
+	}
+	if !session.ValidateSessionID("session-live", 1) {
+		t.Fatal("original session lost after rollback, want it intact")
+	}
+	if (&XrayService{}).IsXrayRunning() {
+		t.Fatal("candidate Xray still running after a failed import, want it stopped")
+	}
+	if _, err := os.Stat(dbPath + ".backup"); !os.IsNotExist(err) {
+		t.Fatalf("fallback file still present after rollback: %v", err)
 	}
 }
 
@@ -264,7 +469,7 @@ func TestRollbackImportRestoresOriginal(t *testing.T) {
 		t.Fatalf("open candidate db: %v", err)
 	}
 
-	(&ServerService{}).rollbackImport(fallbackPath, false, true)
+	(&ServerService{}).rollbackImport(fallbackPath, false, true, false)
 
 	if _, err := os.Stat(fallbackPath); !os.IsNotExist(err) {
 		t.Fatalf("fallback file still present after rollback: %v", err)
@@ -301,7 +506,7 @@ func TestRollbackImportWithoutBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	(&ServerService{}).rollbackImport(fallbackPath, false, false)
+	(&ServerService{}).rollbackImport(fallbackPath, false, false, false)
 
 	if got, err := os.ReadFile(fallbackPath); err != nil || string(got) != string(stale) {
 		t.Fatalf("stale fallback changed by rollback: %q, err %v", got, err)
@@ -321,6 +526,7 @@ func TestRollbackImportWithoutBackup(t *testing.T) {
 // the two candidates and stays usable.
 func TestImportDBConcurrentImports(t *testing.T) {
 	dbPath := setupImportTestEnv(t, true)
+	installNoAPITemplate(t)
 
 	buildCandidate := func(marker string) string {
 		candidatePath := filepath.Join(t.TempDir(), "candidate.db")

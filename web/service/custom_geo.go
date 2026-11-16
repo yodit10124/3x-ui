@@ -18,6 +18,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
+	"github.com/mhsanaei/3x-ui/v2/util/random"
 )
 
 const (
@@ -73,11 +74,12 @@ type CustomGeoUpdateAllResult struct {
 }
 
 type CustomGeoService struct {
-	serverService    *ServerService
-	settingService   *SettingService
-	updateAllGetAll  func() ([]model.CustomGeoResource, error)
-	updateAllApply   func(id int, onStartup bool) (string, error)
-	updateAllRestart func() error
+	serverService      *ServerService
+	settingService     *SettingService
+	updateAllGetAll    func() ([]model.CustomGeoResource, error)
+	updateAllApply     func(id int, onStartup bool) (string, *geoCommit, error)
+	updateAllRestart   func() error
+	updateAllWaitReady func() error
 }
 
 func NewCustomGeoService() *CustomGeoService {
@@ -88,6 +90,7 @@ func NewCustomGeoService() *CustomGeoService {
 	s.updateAllGetAll = s.GetAll
 	s.updateAllApply = s.applyDownloadAndPersist
 	s.updateAllRestart = func() error { return s.serverService.RestartXrayService() }
+	s.updateAllWaitReady = func() error { return s.serverService.WaitReady(10 * time.Second) }
 	return s
 }
 
@@ -383,7 +386,13 @@ func (s *CustomGeoService) EnsureOnStartup() {
 		if err := probeCustomGeoURL(r.Url); err != nil {
 			logger.Warningf("custom geo startup id=%d alias=%s url=%s: probe: %v (attempting download anyway)", r.Id, r.Alias, r.Url, err)
 		}
-		_, _ = s.applyDownloadAndPersist(r.Id, true)
+		// On startup there is no restart to gate on (Xray starts
+		// later): a successful repair commits at once and its
+		// backup is discarded.
+		_, commit, _ := s.applyDownloadAndPersist(r.Id, true)
+		if commit != nil {
+			commit.discard()
+		}
 	}
 }
 
@@ -523,7 +532,7 @@ func (s *CustomGeoService) downloadToPathOnce(resourceURL, destPath string, last
 		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
 	}
 
-	safeTmpPath, err := sanitizeDestPath(safeDestPath + ".tmp")
+	safeTmpPath, err := sanitizeDestPath(safeDestPath + ".tmp-" + random.Seq(8))
 	if err != nil {
 		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
 	}
@@ -597,12 +606,14 @@ func removeSafePathIfExists(path string) error {
 	return nil
 }
 
-// backupGeoFile copies the file at destPath to destPath+".bak" (same
-// directory) so a failed commit can restore the previous content.
-// It returns the backup path, or "" when no file existed to back
-// up. The copy leaves the original in place, so the conditional
-// download (If-Modified-Since from the file mtime) keeps working
-// exactly as before.
+// backupGeoFile copies the file at destPath to a uniquely named
+// backup (same directory) so a failed commit can restore the
+// previous content. It returns the backup path, or "" when no file
+// existed to back up. The copy leaves the original in place, so the
+// conditional download (If-Modified-Since from the file mtime)
+// keeps working exactly as before. The backup name is unique per
+// operation so a concurrent update cannot overwrite another one's
+// only copy of the old file.
 func backupGeoFile(destPath string) (string, error) {
 	if _, err := os.Stat(destPath); err != nil {
 		if os.IsNotExist(err) {
@@ -610,7 +621,7 @@ func backupGeoFile(destPath string) (string, error) {
 		}
 		return "", err
 	}
-	backupPath := destPath + ".bak"
+	backupPath := destPath + ".bak-" + random.Seq(8)
 	data, err := os.ReadFile(destPath)
 	if err != nil {
 		return "", err
@@ -645,7 +656,86 @@ func discardGeoFileBackup(backupPath string) {
 	}
 }
 
+// geoCommit tracks one replaced geo file and its previous database
+// record until the service restart and readiness check pass. Only
+// then is the backup discarded; on any failure the old file and the
+// old record come back. old is nil for a newly created resource,
+// whose rollback deletes the record instead.
+type geoCommit struct {
+	destPath   string
+	backupPath string
+	old        *model.CustomGeoResource
+	recordID   int
+}
+
+func (g *geoCommit) discard() {
+	discardGeoFileBackup(g.backupPath)
+}
+
+func (g *geoCommit) rollback() {
+	rollbackGeoFile(g.backupPath, g.destPath)
+	if g.old != nil {
+		if err := database.GetDB().Save(g.old).Error; err != nil {
+			logger.Errorf("custom geo rollback: failed to restore record %d: %v", g.recordID, err)
+		}
+		return
+	}
+	if err := database.GetDB().Delete(&model.CustomGeoResource{}, g.recordID).Error; err != nil {
+		logger.Errorf("custom geo rollback: failed to delete new record %d: %v", g.recordID, err)
+	}
+}
+
+// restartAndCommit restarts Xray and waits for it to become ready,
+// then discards the geo change's backup. On a restart failure or a
+// new Xray that never becomes ready, it rolls the file and the
+// record back, restores the pre-update running state, and returns
+// the error: a geo update must never report success while Xray runs
+// the new files unready, or leave the panel stopped after a failed
+// update.
+func (s *CustomGeoService) restartAndCommit(commit *geoCommit, wasRunning, wasManuallyStopped bool) error {
+	if err := s.serverService.RestartXrayService(); err != nil {
+		s.rollbackGeoChange(commit, wasRunning, wasManuallyStopped)
+		return err
+	}
+	if err := s.serverService.WaitReady(10 * time.Second); err != nil {
+		s.rollbackGeoChange(commit, wasRunning, wasManuallyStopped)
+		return err
+	}
+	commit.discard()
+	return nil
+}
+
+// rollbackGeoChange stops the candidate process first — it runs
+// the new configuration and must not keep serving the new files —
+// then restores the file and record and the pre-update running
+// state.
+func (s *CustomGeoService) rollbackGeoChange(commit *geoCommit, wasRunning, wasManuallyStopped bool) {
+	// Stop the candidate process first — it runs the new
+	// configuration and must not keep serving the new files — then
+	// restore the file and record and the pre-update running state.
+	if s.serverService.IsXrayRunning() {
+		_ = s.serverService.StopXrayService()
+	}
+	if commit != nil {
+		commit.rollback()
+	}
+	s.serverService.restoreXrayState(wasRunning, wasManuallyStopped)
+}
+
+// preRestartState records the service state before a geo update
+// restarts Xray, so a failed update can restore it.
+func (s *CustomGeoService) preRestartState() (wasRunning, wasManuallyStopped bool) {
+	if s.serverService == nil {
+		return false, false
+	}
+	return s.serverService.IsXrayRunning(), s.serverService.IsManuallyStopped()
+}
+
 func (s *CustomGeoService) Create(r *model.CustomGeoResource) error {
+	// The whole update transaction is serialised with Xray updates,
+	// other geo updates, and imports.
+	updateMu.Lock()
+	defer updateMu.Unlock()
 	if err := s.validateType(r.Type); err != nil {
 		return err
 	}
@@ -686,15 +776,20 @@ func (s *CustomGeoService) Create(r *model.CustomGeoResource) error {
 		rollbackGeoFile(backupPath, r.LocalPath)
 		return err
 	}
-	discardGeoFileBackup(backupPath)
+	// The file and the record are committed, but the backup stays
+	// until the restart and readiness check pass: a new Xray that
+	// never becomes ready rolls the file and the record back.
+	wasRunning, wasManuallyStopped := s.preRestartState()
+	commit := &geoCommit{destPath: r.LocalPath, backupPath: backupPath, recordID: int(r.Id)}
 	logger.Infof("custom geo created id=%d type=%s alias=%s skipped=%v", r.Id, r.Type, r.Alias, skipped)
-	if err = s.serverService.RestartXrayService(); err != nil {
-		logger.Warning("custom geo create: restart xray:", err)
-	}
-	return nil
+	return s.restartAndCommit(commit, wasRunning, wasManuallyStopped)
 }
 
 func (s *CustomGeoService) Update(id int, r *model.CustomGeoResource) error {
+	// The whole update transaction is serialised with Xray updates,
+	// other geo updates, and imports.
+	updateMu.Lock()
+	defer updateMu.Unlock()
 	var cur model.CustomGeoResource
 	if err := database.GetDB().First(&cur, id).Error; err != nil {
 		if database.IsNotFound(err) {
@@ -770,22 +865,32 @@ func (s *CustomGeoService) Update(id int, r *model.CustomGeoResource) error {
 		rollbackGeoFile(backupPath, r.LocalPath)
 		return err
 	}
-	discardGeoFileBackup(backupPath)
-	// Only now, with the download and the record committed, remove
-	// the old file when the path changed.
+	// The file and the record are committed, but the backup stays
+	// until the restart and readiness check pass: a new Xray that
+	// never becomes ready rolls the file and the record back, and
+	// only then is the old file removed when the path changed.
+	wasRunning, wasManuallyStopped := s.preRestartState()
+	commit := &geoCommit{destPath: r.LocalPath, backupPath: backupPath, old: &cur, recordID: id}
+	logger.Infof("custom geo updated id=%d", id)
+	if err := s.restartAndCommit(commit, wasRunning, wasManuallyStopped); err != nil {
+		return err
+	}
+	// Only now, with the download, the record, and the running
+	// service all confirmed, remove the old file when the path
+	// changed.
 	if oldPath != r.LocalPath && oldPath != "" {
 		if err := removeSafePathIfExists(oldPath); err != nil && !errors.Is(err, ErrCustomGeoPathTraversal) {
 			logger.Warningf("custom geo remove old path %s: %v", oldPath, err)
 		}
 	}
-	logger.Infof("custom geo updated id=%d", id)
-	if err = s.serverService.RestartXrayService(); err != nil {
-		logger.Warning("custom geo update: restart xray:", err)
-	}
 	return nil
 }
 
 func (s *CustomGeoService) Delete(id int) (displayName string, err error) {
+	// Serialised with the other update transactions so a delete
+	// cannot interleave another update's file swap.
+	updateMu.Lock()
+	defer updateMu.Unlock()
 	var r model.CustomGeoResource
 	if err := database.GetDB().First(&r, id).Error; err != nil {
 		if database.IsNotFound(err) {
@@ -819,28 +924,30 @@ func (s *CustomGeoService) GetAll() ([]model.CustomGeoResource, error) {
 	return list, err
 }
 
-func (s *CustomGeoService) applyDownloadAndPersist(id int, onStartup bool) (displayName string, err error) {
+func (s *CustomGeoService) applyDownloadAndPersist(id int, onStartup bool) (displayName string, commit *geoCommit, err error) {
 	var r model.CustomGeoResource
 	if err := database.GetDB().First(&r, id).Error; err != nil {
 		if database.IsNotFound(err) {
-			return "", ErrCustomGeoNotFound
+			return "", nil, ErrCustomGeoNotFound
 		}
-		return "", err
+		return "", nil, err
 	}
 	displayName = s.fileNameFor(r.Type, r.Alias)
 	if err := s.syncAndSanitizeLocalPath(&r); err != nil {
-		return displayName, err
+		return displayName, nil, err
 	}
 	sanitizedURL, sanitizeErr := s.sanitizeURL(r.Url)
 	if sanitizeErr != nil {
-		return displayName, sanitizeErr
+		return displayName, nil, sanitizeErr
 	}
 	// Back up the current file before the download replaces it, so
 	// a failed metadata update restores the old content instead of
-	// leaving the file and the record inconsistent.
+	// leaving the file and the record inconsistent. The backup is
+	// returned to the caller, which owns it until the service
+	// restart and readiness check pass.
 	backupPath, err := backupGeoFile(r.LocalPath)
 	if err != nil {
-		return displayName, err
+		return displayName, nil, err
 	}
 	skipped, lm, err := s.downloadToPath(sanitizedURL, r.LocalPath, r.LastModified)
 	if err != nil {
@@ -850,7 +957,7 @@ func (s *CustomGeoService) applyDownloadAndPersist(id int, onStartup bool) (disp
 		} else {
 			logger.Warningf("custom geo manual update id=%d: %v", id, err)
 		}
-		return displayName, err
+		return displayName, nil, err
 	}
 	now := time.Now().Unix()
 	updates := map[string]any{
@@ -865,9 +972,8 @@ func (s *CustomGeoService) applyDownloadAndPersist(id int, onStartup bool) (disp
 		} else {
 			logger.Warningf("custom geo manual update id=%d: persist metadata: %v", id, err)
 		}
-		return displayName, err
+		return displayName, nil, err
 	}
-	discardGeoFileBackup(backupPath)
 	if skipped {
 		if onStartup {
 			logger.Infof("custom geo startup download skipped (not modified) id=%d", id)
@@ -881,21 +987,31 @@ func (s *CustomGeoService) applyDownloadAndPersist(id int, onStartup bool) (disp
 			logger.Infof("custom geo manual update ok id=%d", id)
 		}
 	}
-	return displayName, nil
+	return displayName, &geoCommit{destPath: r.LocalPath, backupPath: backupPath, old: &r, recordID: id}, nil
 }
 
 func (s *CustomGeoService) TriggerUpdate(id int) (string, error) {
-	displayName, err := s.applyDownloadAndPersist(id, false)
+	// The whole update transaction is serialised with Xray updates,
+	// other geo updates, and imports.
+	updateMu.Lock()
+	defer updateMu.Unlock()
+	wasRunning, wasManuallyStopped := s.preRestartState()
+	displayName, commit, err := s.applyDownloadAndPersist(id, false)
 	if err != nil {
 		return displayName, err
 	}
-	if err = s.serverService.RestartXrayService(); err != nil {
-		logger.Warning("custom geo manual update: restart xray:", err)
+	if err := s.restartAndCommit(commit, wasRunning, wasManuallyStopped); err != nil {
+		return displayName, err
 	}
 	return displayName, nil
 }
 
 func (s *CustomGeoService) TriggerUpdateAll() (*CustomGeoUpdateAllResult, error) {
+	// The whole batch is one serialised update transaction: the
+	// per-resource applies, the single restart, and the readiness
+	// check.
+	updateMu.Lock()
+	defer updateMu.Unlock()
 	var list []model.CustomGeoResource
 	var err error
 	if s.updateAllGetAll != nil {
@@ -910,13 +1026,16 @@ func (s *CustomGeoService) TriggerUpdateAll() (*CustomGeoUpdateAllResult, error)
 	if len(list) == 0 {
 		return res, nil
 	}
+	wasRunning, wasManuallyStopped := s.preRestartState()
+	var commits []*geoCommit
 	for _, r := range list {
 		var name string
+		var commit *geoCommit
 		var applyErr error
 		if s.updateAllApply != nil {
-			name, applyErr = s.updateAllApply(r.Id, false)
+			name, commit, applyErr = s.updateAllApply(r.Id, false)
 		} else {
-			name, applyErr = s.applyDownloadAndPersist(r.Id, false)
+			name, commit, applyErr = s.applyDownloadAndPersist(r.Id, false)
 		}
 		if applyErr != nil {
 			res.Failed = append(res.Failed, CustomGeoUpdateAllFailure{
@@ -927,8 +1046,34 @@ func (s *CustomGeoService) TriggerUpdateAll() (*CustomGeoUpdateAllResult, error)
 		res.Succeeded = append(res.Succeeded, CustomGeoUpdateAllItem{
 			Id: r.Id, Alias: r.Alias, FileName: name,
 		})
+		commits = append(commits, commit)
 	}
 	if len(res.Succeeded) > 0 {
+		// The batch commits only when the restart AND the
+		// readiness check pass. On either failure, every item the
+		// batch already applied rolls its file and record back,
+		// the candidate process is stopped, the pre-update running
+		// state is restored, and the error is returned instead of
+		// a success with a half-applied batch.
+		rollBackBatch := func() {
+			if s.serverService != nil && s.serverService.IsXrayRunning() {
+				_ = s.serverService.StopXrayService()
+			}
+			for _, c := range commits {
+				if c != nil {
+					c.rollback()
+				}
+			}
+			if s.serverService != nil {
+				s.serverService.restoreXrayState(wasRunning, wasManuallyStopped)
+			}
+			for _, item := range res.Succeeded {
+				res.Failed = append(res.Failed, CustomGeoUpdateAllFailure{
+					Id: item.Id, Alias: item.Alias, FileName: item.FileName,
+				})
+			}
+			res.Succeeded = nil
+		}
 		var restartErr error
 		if s.updateAllRestart != nil {
 			restartErr = s.updateAllRestart()
@@ -936,7 +1081,33 @@ func (s *CustomGeoService) TriggerUpdateAll() (*CustomGeoUpdateAllResult, error)
 			restartErr = s.serverService.RestartXrayService()
 		}
 		if restartErr != nil {
-			logger.Warning("custom geo update all: restart xray:", restartErr)
+			rollBackBatch()
+			for i := range res.Failed {
+				if res.Failed[i].Err == "" {
+					res.Failed[i].Err = restartErr.Error()
+				}
+			}
+			return res, restartErr
+		}
+		var readyErr error
+		if s.updateAllWaitReady != nil {
+			readyErr = s.updateAllWaitReady()
+		} else if s.serverService != nil {
+			readyErr = s.serverService.WaitReady(10 * time.Second)
+		}
+		if readyErr != nil {
+			rollBackBatch()
+			for i := range res.Failed {
+				if res.Failed[i].Err == "" {
+					res.Failed[i].Err = readyErr.Error()
+				}
+			}
+			return res, readyErr
+		}
+		for _, c := range commits {
+			if c != nil {
+				c.discard()
+			}
 		}
 	}
 	return res, nil

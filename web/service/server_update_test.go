@@ -31,21 +31,25 @@ func TestDownloadGeofile(t *testing.T) {
 		if err := os.WriteFile(dest, oldContent, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if replaced, err := downloadGeofile(ts.URL, dest); err != nil {
+		replaced, backupPath, err := downloadGeofile(ts.URL, dest)
+		if err != nil {
 			t.Fatalf("downloadGeofile: %v", err)
-		} else if !replaced {
+		}
+		if !replaced {
 			t.Fatal("downloadGeofile should report the file replaced")
+		}
+		if backupPath == "" {
+			t.Fatal("downloadGeofile should return a backup path when it replaced a file")
 		}
 		if got, err := os.ReadFile(dest); err != nil || !bytes.Equal(got, newContent) {
 			t.Fatalf("file %q, want the new content", got)
 		}
 		// The old content is backed up next to the file, and the
 		// caller can roll the replacement back from it.
-		backupPath := dest + ".bak"
 		if got, err := os.ReadFile(backupPath); err != nil || !bytes.Equal(got, oldContent) {
 			t.Fatalf("backup %q, want the old content, err %v", got, err)
 		}
-		restoreGeofileBackup(dest)
+		restoreGeofileBackup(backupPath, dest)
 		if got, err := os.ReadFile(dest); err != nil || !bytes.Equal(got, oldContent) {
 			t.Fatalf("file after restore %q, want the old content", got)
 		}
@@ -63,14 +67,14 @@ func TestDownloadGeofile(t *testing.T) {
 		if err := os.WriteFile(dest, oldContent, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := downloadGeofile(ts.URL, dest); err == nil {
+		if _, _, err := downloadGeofile(ts.URL, dest); err == nil {
 			t.Fatal("404 should return an error")
 		}
 		if got, err := os.ReadFile(dest); err != nil || !bytes.Equal(got, oldContent) {
 			t.Fatalf("old file lost or changed on 404: %q, %v", got, err)
 		}
-		if _, err := os.Stat(dest + ".bak"); !os.IsNotExist(err) {
-			t.Fatalf("backup left behind on 404: %v", err)
+		if leftovers, _ := filepath.Glob(dest + ".bak-*"); len(leftovers) != 0 {
+			t.Fatalf("backup left behind on 404: %v", leftovers)
 		}
 	})
 
@@ -87,14 +91,14 @@ func TestDownloadGeofile(t *testing.T) {
 		if err := os.WriteFile(dest, oldContent, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := downloadGeofile(ts.URL, dest); err == nil {
+		if _, _, err := downloadGeofile(ts.URL, dest); err == nil {
 			t.Fatal("truncated body should return an error")
 		}
 		if got, err := os.ReadFile(dest); err != nil || !bytes.Equal(got, oldContent) {
 			t.Fatalf("old file lost or changed on truncated download: %q, %v", got, err)
 		}
-		if _, err := os.Stat(dest + ".bak"); !os.IsNotExist(err) {
-			t.Fatalf("backup left behind on truncated download: %v", err)
+		if leftovers, _ := filepath.Glob(dest + ".bak-*"); len(leftovers) != 0 {
+			t.Fatalf("backup left behind on truncated download: %v", leftovers)
 		}
 	})
 
@@ -110,7 +114,7 @@ func TestDownloadGeofile(t *testing.T) {
 		if err := os.WriteFile(dest, oldContent, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if replaced, err := downloadGeofile(ts.URL, dest); err != nil {
+		if replaced, _, err := downloadGeofile(ts.URL, dest); err != nil {
 			t.Fatalf("downloadGeofile on 304: %v", err)
 		} else if replaced {
 			t.Fatal("downloadGeofile should report no replacement on 304")
@@ -118,8 +122,8 @@ func TestDownloadGeofile(t *testing.T) {
 		if got, err := os.ReadFile(dest); err != nil || !bytes.Equal(got, oldContent) {
 			t.Fatalf("old file changed on 304: %q, %v", got, err)
 		}
-		if _, err := os.Stat(dest + ".bak"); !os.IsNotExist(err) {
-			t.Fatalf("backup left behind on 304: %v", err)
+		if leftovers, _ := filepath.Glob(dest + ".bak-*"); len(leftovers) != 0 {
+			t.Fatalf("backup left behind on 304: %v", leftovers)
 		}
 	})
 }

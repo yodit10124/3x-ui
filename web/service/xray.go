@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"runtime"
 	"sync"
 	"time"
@@ -254,19 +253,29 @@ func (s *XrayService) RestartXray(isForce bool) error {
 }
 
 // WaitReady waits until the Xray process that is running now has
-// proven itself ready — still alive with its management API bound —
-// or the timeout elapses. cmd.Start() only proves the process was
-// created: a binary that exits on a bad config is discovered
-// asynchronously by Wait(), so a caller that deletes the old binary
-// backup as soon as Start succeeds can report success for an update
-// that never actually ran. The process pointer is captured once so
-// the polling loop never races a concurrent restart for the global.
+// proven itself ready — still alive with its management API
+// answering — or the timeout elapses. cmd.Start() only proves the
+// process was created: a binary that exits on a bad config is
+// discovered asynchronously by Wait(), so a caller that deletes
+// the old binary backup as soon as Start succeeds can report
+// success for an update that never actually ran. The process
+// pointer is captured once so the polling loop never races a
+// concurrent restart for the global, and a successful probe is
+// only accepted after re-checking that same process is still
+// alive: with the old process gone (Stop waits for its exit) the
+// API port belongs to this start. When the configuration has no
+// api inbound there is nothing to probe, so readiness is sustained
+// liveness over a short observation window instead of an instant
+// pass.
 func (s *XrayService) WaitReady(timeout time.Duration) error {
 	proc := p
 	if proc == nil {
 		return errors.New("xray is not running")
 	}
 	deadline := time.Now().Add(timeout)
+	// Without a management API, a bad config usually kills the
+	// process within a second or two.
+	noAPIReadyAt := time.Now().Add(2 * time.Second)
 	for {
 		if !proc.IsRunning() {
 			if err := proc.GetErr(); err != nil {
@@ -274,8 +283,16 @@ func (s *XrayService) WaitReady(timeout time.Duration) error {
 			}
 			return errors.New("xray exited during startup")
 		}
-		if s.isAPIReady(proc) {
-			return nil
+		if proc.GetAPIPort() <= 0 {
+			if time.Now().After(noAPIReadyAt) {
+				return nil
+			}
+		} else if s.isAPIReady(proc) {
+			// The API answered: re-check the same process is
+			// still alive before declaring it ready.
+			if proc.IsRunning() {
+				return nil
+			}
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("xray did not become ready within %v", timeout)
@@ -284,24 +301,37 @@ func (s *XrayService) WaitReady(timeout time.Duration) error {
 	}
 }
 
-// isAPIReady reports whether the process's management API is
-// listening. The api inbound binds only after the configuration
-// loaded successfully, so a TCP connect proves the process got past
-// initialisation. A gRPC call is not needed here: the client is
-// lazy, and the dial itself is the readiness signal. When the
-// configuration has no api inbound, process liveness is the only
-// signal available.
+// isAPIReady reports whether the process's management API answers
+// a real request. A TCP dial is not enough: the dokodemo-door
+// accepts the connection as soon as Xray binds the inbound, even
+// when the API server behind it never came up. A fresh API client
+// is used for each probe so this never races the shared client
+// GetTraffic uses.
 func (s *XrayService) isAPIReady(proc *xray.Process) bool {
 	port := proc.GetAPIPort()
 	if port <= 0 {
-		return true
-	}
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 500*time.Millisecond)
-	if err != nil {
 		return false
 	}
-	conn.Close()
-	return true
+	var api xray.XrayAPI
+	if err := api.Init(port); err != nil {
+		return false
+	}
+	defer api.Close()
+	return api.Ping(time.Second) == nil
+}
+
+// IsManuallyStopped reports whether Xray was stopped manually from
+// the panel (as opposed to crashing).
+func (s *XrayService) IsManuallyStopped() bool {
+	return isManuallyStopped.Load()
+}
+
+// SetManuallyStopped restores the manual-stop flag — used by the
+// import and update rollbacks to put back the state a failed
+// operation disturbed (a restart attempt clears the flag even when
+// the operation then fails).
+func (s *XrayService) SetManuallyStopped(stopped bool) {
+	isManuallyStopped.Store(stopped)
 }
 
 // StopXray stops the running Xray process.

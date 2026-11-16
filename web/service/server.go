@@ -25,6 +25,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/util/common"
+	"github.com/mhsanaei/3x-ui/v2/util/random"
 	"github.com/mhsanaei/3x-ui/v2/util/sys"
 	"github.com/mhsanaei/3x-ui/v2/web/websocket"
 	"github.com/mhsanaei/3x-ui/v2/xray"
@@ -594,6 +595,44 @@ func (s *ServerService) RestartXrayService() error {
 	return nil
 }
 
+// IsXrayRunning reports whether Xray is currently running.
+func (s *ServerService) IsXrayRunning() bool {
+	return s.xrayService.IsXrayRunning()
+}
+
+// WaitReady waits until the running Xray has proven itself ready
+// (still alive with its management API answering).
+func (s *ServerService) WaitReady(timeout time.Duration) error {
+	return s.xrayService.WaitReady(timeout)
+}
+
+// IsManuallyStopped reports whether Xray was stopped manually from
+// the panel.
+func (s *ServerService) IsManuallyStopped() bool {
+	return s.xrayService.IsManuallyStopped()
+}
+
+// SetManuallyStopped restores the manual-stop flag.
+func (s *ServerService) SetManuallyStopped(stopped bool) {
+	s.xrayService.SetManuallyStopped(stopped)
+}
+
+// restoreXrayState restores the pre-operation service state after a
+// failed update or import: restart Xray when it was running, or put
+// the manual-stop flag back when it was not. A restart attempt
+// clears the flag even when the operation then fails, so without
+// this a manually stopped Xray would be auto-started by the health
+// check after a failed rollback.
+func (s *ServerService) restoreXrayState(wasRunning, wasManuallyStopped bool) {
+	if wasRunning {
+		if err := s.RestartXrayService(); err != nil {
+			logger.Errorf("failed to restore Xray running state: %v", err)
+		}
+		return
+	}
+	s.SetManuallyStopped(wasManuallyStopped)
+}
+
 func (s *ServerService) downloadXRay(version string) (string, error) {
 	// M4: only allow an official release tag (x.y.z, optionally with a
 	// leading "v"). An unchecked version string was interpolated directly
@@ -709,6 +748,12 @@ func verifyXrayZipSHA256(url, zipPath string) error {
 }
 
 func (s *ServerService) UpdateXray(version string) error {
+	// The whole update transaction is serialised with geo updates
+	// and imports: two concurrent updates would overwrite each
+	// other's staged files and the single backup.
+	updateMu.Lock()
+	defer updateMu.Unlock()
+
 	// 1. Download and verify the zip BEFORE stopping Xray: a failed
 	// download, a bad checksum, or an unreadable zip must leave the
 	// running Xray untouched. (Previously the stop came first, so any
@@ -722,9 +767,10 @@ func (s *ServerService) UpdateXray(version string) error {
 
 	// 2. Extract the new binary to a staged file next to the live
 	// one (same filesystem, so the swap is a rename). The live
-	// binary is not touched yet.
+	// binary is not touched yet. The staged name is unique per
+	// update so a concurrent update cannot overwrite it.
 	targetBinary, zipEntry := xrayUpdateTarget(runtime.GOOS)
-	stagedPath := targetBinary + ".new"
+	stagedPath := targetBinary + ".new-" + random.Seq(8)
 	if err := extractZipEntry(zipFileName, zipEntry, stagedPath); err != nil {
 		return err
 	}
@@ -738,22 +784,34 @@ func (s *ServerService) UpdateXray(version string) error {
 		}
 	}()
 
-	// 3. Only now stop the running Xray.
+	// 3. Only now stop the running Xray. The pre-update running
+	// state and manual-stop flag are recorded first: the stop
+	// overwrites the flag, and a failed update must put it back.
 	xrayWasRunning := s.xrayService.IsXrayRunning()
+	xrayWasManuallyStopped := s.xrayService.IsManuallyStopped()
 	if err := s.StopXrayService(); err != nil {
 		logger.Warning("failed to stop xray before update:", err)
 	}
 
+	// rollBackNewBinary undoes a failed start of the new binary:
+	// stop the candidate process first (it may still be alive but
+	// unready), restore the old binary, then restore the previous
+	// running state.
+	rollBackNewBinary := func(backupPath string, err error) error {
+		_ = s.xrayService.StopXray()
+		if rerr := rollbackBinaryReplace(targetBinary, backupPath); rerr != nil {
+			return common.NewErrorf("Failed to roll back the Xray binary after %v: %v", err, rerr)
+		}
+		s.restoreXrayState(xrayWasRunning, xrayWasManuallyStopped)
+		return err
+	}
+
 	// 4. Swap the binaries, keeping a backup until the new one is
-	// confirmed running. If the swap itself fails, Xray is already
-	// stopped — restore the previous running state first.
+	// confirmed ready. If the swap itself fails, Xray is already
+	// stopped — restore the previous running state.
 	backupPath, err := stageBinaryReplace(targetBinary, stagedPath)
 	if err != nil {
-		if xrayWasRunning {
-			if rerr := s.xrayService.RestartXray(true); rerr != nil {
-				logger.Error("binary replace failed and rollback restart xray failed:", rerr)
-			}
-		}
+		s.restoreXrayState(xrayWasRunning, xrayWasManuallyStopped)
 		return err
 	}
 	staged = false
@@ -762,34 +820,19 @@ func (s *ServerService) UpdateXray(version string) error {
 	// binary back and restore the previous running state.
 	if err := s.xrayService.RestartXray(true); err != nil {
 		logger.Error("start xray failed, rolling back to the previous binary:", err)
-		if rerr := rollbackBinaryReplace(targetBinary, backupPath); rerr != nil {
-			return common.NewErrorf("Failed to start new Xray and failed to roll back the binary: %v (rollback: %v)", err, rerr)
-		}
-		if xrayWasRunning {
-			if rerr := s.xrayService.RestartXray(true); rerr != nil {
-				logger.Error("rollback restart xray failed:", rerr)
-			}
-		}
-		return err
+		return rollBackNewBinary(backupPath, err)
 	}
 
 	// 6. The new binary started, but cmd.Start() only proves the
 	// process was created: a binary that exits on a bad config is
 	// discovered asynchronously by Wait(). Do not delete the backup
 	// until the new Xray has proven itself ready — still running
-	// with its management API bound — within a timeout. Otherwise
-	// roll the old binary back and restore the previous state.
+	// with its management API answering — within a timeout.
+	// Otherwise roll the old binary back and restore the previous
+	// state.
 	if err := s.xrayService.WaitReady(10 * time.Second); err != nil {
 		logger.Error("new xray did not become ready, rolling back to the previous binary:", err)
-		if rerr := rollbackBinaryReplace(targetBinary, backupPath); rerr != nil {
-			return common.NewErrorf("New Xray did not become ready (%v) and failed to roll back the binary: %v", err, rerr)
-		}
-		if xrayWasRunning {
-			if rerr := s.xrayService.RestartXray(true); rerr != nil {
-				logger.Error("rollback restart xray failed:", rerr)
-			}
-		}
-		return common.NewErrorf("New Xray did not become ready: %v", err)
+		return rollBackNewBinary(backupPath, common.NewErrorf("New Xray did not become ready: %v", err))
 	}
 
 	// 7. The new binary is confirmed ready: the backup is no longer needed.
@@ -876,8 +919,10 @@ func extractZipEntry(zipPath, entryName, destPath string) error {
 // rollbackBinaryReplace (swap or start failed).
 func stageBinaryReplace(target, staged string) (backupPath string, err error) {
 	if _, err := os.Stat(target); err == nil {
-		backupPath = target + ".bak"
-		_ = os.Remove(backupPath)
+		// The backup name is unique per update so a concurrent
+		// update cannot overwrite another one's only copy of the
+		// old binary.
+		backupPath = target + ".bak-" + random.Seq(8)
 		if err := os.Rename(target, backupPath); err != nil {
 			return "", fmt.Errorf("failed to back up current binary: %w", err)
 		}
@@ -1117,6 +1162,13 @@ func (s *ServerService) GetDb() ([]byte, error) {
 	return fileContents, nil
 }
 
+// updateMu serialises the full update transactions that replace
+// Xray's binary, its geo files, or the live database and restart
+// it: an Xray update, a geo update, and an import interleaved would
+// overwrite each other's temporary files and backups and race the
+// process they all restart.
+var updateMu sync.Mutex
+
 // importMu serialises database imports: two concurrent imports would
 // interleave the file swap (live db -> fallback, temp -> live) and
 // leave the panel on a half-swapped database.
@@ -1128,6 +1180,11 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 	// and leave the panel on a half-swapped database.
 	importMu.Lock()
 	defer importMu.Unlock()
+	// Imports also hold the update mutex: an Xray or geo update
+	// running at the same time would race the process the import
+	// stops and restarts.
+	updateMu.Lock()
+	defer updateMu.Unlock()
 
 	// Check if the file is a SQLite database
 	isValidDb, err := database.IsSQLiteDB(file)
@@ -1219,8 +1276,13 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 	}
 
 	// Record whether Xray was running before the swap so a failed
-	// import can restore the original service state.
+	// import can restore the original service state. The manual-stop
+	// flag is recorded too, before the stop below overwrites it:
+	// a restart attempt clears the flag even when the import then
+	// fails, so without this a manually stopped Xray would be
+	// auto-started by the health check after a failed rollback.
 	xrayWasRunning := s.xrayService.IsXrayRunning()
+	xrayWasManuallyStopped := s.xrayService.IsManuallyStopped()
 
 	// Stop Xray (ignore error but log)
 	if errStop := s.StopXrayService(); errStop != nil {
@@ -1252,7 +1314,7 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 			}
 			return
 		}
-		s.rollbackImport(fallbackPath, xrayWasRunning, backedUp)
+		s.rollbackImport(fallbackPath, xrayWasRunning, backedUp, xrayWasManuallyStopped)
 	}()
 
 	// Remove the existing fallback file (if any)
@@ -1294,6 +1356,16 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 		return common.NewErrorf("Imported DB but failed to start Xray: %v", err)
 	}
 
+	// The imported configuration passed the database and template
+	// checks, but a runtime error (a port conflict, a bad file
+	// reference) still kills the process after Start returns.
+	// Commit the import only once the new Xray has proven itself
+	// ready; otherwise the deferred rollback restores the original
+	// database and service state.
+	if err = s.WaitReady(10 * time.Second); err != nil {
+		return common.NewErrorf("Imported DB but Xray did not become ready: %v", err)
+	}
+
 	// H-4: the imported database may carry an attacker-known secret (which
 	// can be used to forge session cookies from the imported users table)
 	// and unknown administrator accounts. Rotate the secret now that the
@@ -1314,15 +1386,25 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 }
 
 // rollbackImport restores the pre-import state after a failed database
-// swap: it closes the live handle (which may still point at the failed
-// candidate file), moves the fallback file back when it actually holds
-// the original database, reopens the original database, and restarts
-// Xray if it was running before the import. When backedUp is false
-// the failure happened before the backup was established, so the
-// original file is still at the live path and is simply reopened.
+// swap. It first stops the candidate process — it runs the imported
+// configuration and must not keep serving (or holding ports) while
+// the original database is restored. It then closes the live handle
+// (which may still point at the failed candidate file), moves the
+// fallback file back when it actually holds the original database,
+// reopens the original database, and restores the pre-import running
+// state and manual-stop flag. When backedUp is false the failure
+// happened before the backup was established, so the original file
+// is still at the live path and is simply reopened.
 // Every step is best-effort and logs its failure; the caller still
 // returns the original import error.
-func (s *ServerService) rollbackImport(fallbackPath string, xrayWasRunning bool, backedUp bool) {
+func (s *ServerService) rollbackImport(fallbackPath string, xrayWasRunning bool, backedUp bool, xrayWasManuallyStopped bool) {
+	// Stop the candidate process before touching the database: it
+	// runs the imported configuration, and a rollback that restores
+	// the old database while the new process keeps running would
+	// leave the panel serving the candidate config.
+	if err := s.xrayService.StopXray(); err != nil {
+		logger.Debugf("ImportDB rollback: candidate Xray already stopped: %v", err)
+	}
 	if err := database.CloseDB(); err != nil {
 		logger.Warningf("ImportDB rollback: failed to close candidate db: %v", err)
 	}
@@ -1341,11 +1423,7 @@ func (s *ServerService) rollbackImport(fallbackPath string, xrayWasRunning bool,
 		return
 	}
 	s.inboundService.MigrateDB()
-	if xrayWasRunning {
-		if err := s.RestartXrayService(); err != nil {
-			logger.Errorf("ImportDB rollback: failed to restart Xray: %v", err)
-		}
-	}
+	s.restoreXrayState(xrayWasRunning, xrayWasManuallyStopped)
 }
 
 // IsValidGeofileName validates that the filename is safe for geofile operations.
@@ -1383,11 +1461,11 @@ func (s *ServerService) IsValidGeofileName(filename string) bool {
 // failure mid-download, or a write error must not truncate or replace
 // the old file, which Xray still references. A 304 leaves the old
 // file untouched.
-func downloadGeofile(url, destPath string) (replaced bool, err error) {
+func downloadGeofile(url, destPath string) (replaced bool, backupPath string, err error) {
 	var req *http.Request
 	req, err = http.NewRequest("GET", url, nil)
 	if err != nil {
-		return false, common.NewErrorf("Failed to create HTTP request for %s: %v", url, err)
+		return false, "", common.NewErrorf("Failed to create HTTP request for %s: %v", url, err)
 	}
 
 	var localFileModTime time.Time
@@ -1401,7 +1479,7 @@ func downloadGeofile(url, destPath string) (replaced bool, err error) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, common.NewErrorf("Failed to download Geofile from %s: %v", url, err)
+		return false, "", common.NewErrorf("Failed to download Geofile from %s: %v", url, err)
 	}
 	defer resp.Body.Close()
 
@@ -1429,58 +1507,65 @@ func downloadGeofile(url, destPath string) (replaced bool, err error) {
 	// Handle 304 Not Modified
 	if resp.StatusCode == http.StatusNotModified {
 		updateFileModTime()
-		return false, nil
+		return false, "", nil
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return false, common.NewErrorf("Failed to download Geofile from %s: received status code %d", url, resp.StatusCode)
+		return false, "", common.NewErrorf("Failed to download Geofile from %s: received status code %d", url, resp.StatusCode)
 	}
 
-	tmpPath := destPath + ".tmp"
+	// The temporary file name is unique per download so a
+	// concurrent update cannot overwrite another one's download.
+	tmpPath := destPath + ".tmp-" + random.Seq(8)
 	file, err := os.Create(tmpPath)
 	if err != nil {
-		return false, common.NewErrorf("Failed to create Geofile %s: %v", destPath, err)
+		return false, "", common.NewErrorf("Failed to create Geofile %s: %v", destPath, err)
 	}
 	_, err = io.Copy(file, resp.Body)
 	closeErr := file.Close()
 	if err != nil {
 		_ = os.Remove(tmpPath)
-		return false, common.NewErrorf("Failed to save Geofile %s: %v", destPath, err)
+		return false, "", common.NewErrorf("Failed to save Geofile %s: %v", destPath, err)
 	}
 	if closeErr != nil {
 		_ = os.Remove(tmpPath)
-		return false, common.NewErrorf("Failed to save Geofile %s: %v", destPath, closeErr)
+		return false, "", common.NewErrorf("Failed to save Geofile %s: %v", destPath, closeErr)
 	}
 	// Back up the old file before the rename so the caller can roll
 	// the replacement back when the update fails later (another file
-	// failed, or the restart failed). The backup is the caller's
-	// once this function returns replaced=true; on any failure here
-	// it is removed and the old file is untouched.
-	backupPath := destPath + ".bak"
+	// failed, or the restart failed). The backup name is unique per
+	// download; the backup is the caller's once this function
+	// returns replaced=true. On any failure here it is removed and
+	// the old file is untouched.
+	backupPath = destPath + ".bak-" + random.Seq(8)
 	if data, readErr := os.ReadFile(destPath); readErr == nil {
 		if writeErr := os.WriteFile(backupPath, data, 0644); writeErr != nil {
 			_ = os.Remove(tmpPath)
-			return false, common.NewErrorf("Failed to back up Geofile %s: %v", destPath, writeErr)
+			return false, "", common.NewErrorf("Failed to back up Geofile %s: %v", destPath, writeErr)
 		}
 	} else if !os.IsNotExist(readErr) {
 		_ = os.Remove(tmpPath)
-		return false, common.NewErrorf("Failed to back up Geofile %s: %v", destPath, readErr)
+		return false, "", common.NewErrorf("Failed to back up Geofile %s: %v", destPath, readErr)
+	} else {
+		backupPath = ""
 	}
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		_ = os.Remove(tmpPath)
 		_ = os.Remove(backupPath)
-		return false, common.NewErrorf("Failed to save Geofile %s: %v", destPath, err)
+		return false, "", common.NewErrorf("Failed to save Geofile %s: %v", destPath, err)
 	}
 
 	updateFileModTime()
-	return true, nil
+	return true, backupPath, nil
 }
 
 // restoreGeofileBackup puts the backed-up content back at destPath
 // and removes the backup. A missing backup is a no-op; a failed
 // rename is only logged.
-func restoreGeofileBackup(destPath string) {
-	backupPath := destPath + ".bak"
+func restoreGeofileBackup(backupPath, destPath string) {
+	if backupPath == "" {
+		return
+	}
 	if _, err := os.Stat(backupPath); err != nil {
 		return
 	}
@@ -1491,8 +1576,11 @@ func restoreGeofileBackup(destPath string) {
 
 // discardGeofileBackup removes a backup that is no longer needed
 // (the update succeeded and the new files are live).
-func discardGeofileBackup(destPath string) {
-	_ = os.Remove(destPath + ".bak")
+func discardGeofileBackup(backupPath string) {
+	if backupPath == "" {
+		return
+	}
+	_ = os.Remove(backupPath)
 }
 
 func (s *ServerService) UpdateGeofile(fileName string) error {
@@ -1516,18 +1604,27 @@ func (s *ServerService) UpdateGeofile(fileName string) error {
 		}
 	}
 
+	// The whole update transaction is serialised with Xray updates,
+	// custom geo updates, and imports.
+	updateMu.Lock()
+	defer updateMu.Unlock()
+
 	var errorMessages []string
-	var replaced []string // dest paths whose content was replaced
+	type geofileReplacement struct {
+		destPath   string
+		backupPath string
+	}
+	var replaced []geofileReplacement
 
 	download := func(entry geofileEntry) {
 		destPath := filepath.Join(config.GetBinFolderPath(), entry.FileName)
-		ok, err := downloadGeofile(entry.URL, destPath)
+		ok, backupPath, err := downloadGeofile(entry.URL, destPath)
 		if err != nil {
 			errorMessages = append(errorMessages, fmt.Sprintf("Error downloading Geofile '%s': %v", entry.FileName, err))
 			return
 		}
 		if ok {
-			replaced = append(replaced, destPath)
+			replaced = append(replaced, geofileReplacement{destPath: destPath, backupPath: backupPath})
 		}
 	}
 
@@ -1544,25 +1641,47 @@ func (s *ServerService) UpdateGeofile(fileName string) error {
 	// a half-updated set of files. Restore every file that was
 	// already replaced and return the errors without touching Xray.
 	if len(errorMessages) > 0 {
-		for _, destPath := range replaced {
-			restoreGeofileBackup(destPath)
+		for _, r := range replaced {
+			restoreGeofileBackup(r.backupPath, r.destPath)
 		}
 		return common.NewErrorf("%s", strings.Join(errorMessages, "\r\n"))
 	}
 
-	// Every file is up to date; restart Xray to load them. If the
-	// restart fails, roll the files back as well — the running Xray
-	// must not be left on files it never loaded.
-	if err := s.RestartXrayService(); err != nil {
-		for _, destPath := range replaced {
-			restoreGeofileBackup(destPath)
+	// The pre-update running state, recorded before the restart
+	// below overwrites the manual-stop flag.
+	wasRunning := s.xrayService.IsXrayRunning()
+	wasManuallyStopped := s.xrayService.IsManuallyStopped()
+
+	// rollBackFilesAndState restores the replaced files and the
+	// pre-update running state after a failed restart or a new
+	// Xray that never became ready. The candidate process is
+	// stopped first so it does not keep serving the new files.
+	rollBack := func() {
+		_ = s.xrayService.StopXray()
+		for _, r := range replaced {
+			restoreGeofileBackup(r.backupPath, r.destPath)
 		}
+		s.restoreXrayState(wasRunning, wasManuallyStopped)
+	}
+
+	// Every file is up to date; restart Xray to load them.
+	if err := s.RestartXrayService(); err != nil {
+		rollBack()
 		return common.NewErrorf("Updated Geofile '%s' but Failed to start Xray: %v", fileName, err)
 	}
 
+	// A restart that returns success only proves the process was
+	// created: new data can still kill it right after start. The
+	// old files stay backed up until the new Xray has proven
+	// itself ready.
+	if err := s.WaitReady(10 * time.Second); err != nil {
+		rollBack()
+		return common.NewErrorf("Updated Geofile '%s' but Xray did not become ready: %v", fileName, err)
+	}
+
 	// The new files are live: the backups are no longer needed.
-	for _, destPath := range replaced {
-		discardGeofileBackup(destPath)
+	for _, r := range replaced {
+		discardGeofileBackup(r.backupPath)
 	}
 	return nil
 }

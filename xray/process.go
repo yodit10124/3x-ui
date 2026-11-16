@@ -17,6 +17,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/config"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/util/common"
+	"github.com/mhsanaei/3x-ui/v2/util/random"
 )
 
 // GetBinaryName returns the Xray binary filename for the current OS and architecture.
@@ -309,8 +310,10 @@ func (p *process) Start() (err error) {
 	}
 	// The config is written to a temporary file and renamed into
 	// place: a crash or disk failure mid-write must not leave a
-	// truncated config.json behind for the next start to load.
-	tmpPath := configPath + ".tmp"
+	// truncated config.json behind for the next start to load. The
+	// temporary name is unique per write so a concurrent start
+	// cannot overwrite another one's config.
+	tmpPath := configPath + ".tmp-" + random.Seq(8)
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 		return common.NewErrorf("Failed to write configuration file: %v", err)
 	}
@@ -359,7 +362,12 @@ func (p *process) Start() (err error) {
 	return nil
 }
 
-// Stop terminates the running Xray process.
+// Stop terminates the running Xray process and waits for it to
+// exit, so a caller that starts a replacement right after Stop
+// never races the old process for its ports (a slow exit used to
+// let the readiness probe connect to the OLD api and declare the
+// new process ready early). The process gets a grace period to
+// exit on SIGTERM, then is killed.
 func (p *process) Stop() error {
 	if !p.IsRunning() {
 		return errors.New("xray is not running")
@@ -376,9 +384,36 @@ func (p *process) Stop() error {
 	}
 
 	if runtime.GOOS == "windows" {
-		return p.cmd.Process.Kill()
+		if err := p.cmd.Process.Kill(); err != nil {
+			return err
+		}
 	} else {
-		return p.cmd.Process.Signal(syscall.SIGTERM)
+		if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			return err
+		}
+	}
+	return p.waitExit(10 * time.Second)
+}
+
+// waitExit waits until the process has exited, killing it once the
+// grace period expires.
+func (p *process) waitExit(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !p.IsRunning() {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			_ = p.cmd.Process.Kill()
+			for i := 0; i < 50; i++ {
+				if !p.IsRunning() {
+					return nil
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			return errors.New("xray did not exit after kill")
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 

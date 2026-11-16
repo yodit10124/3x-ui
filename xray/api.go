@@ -26,7 +26,9 @@ import (
 	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/proxy/vmess"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // XrayAPI is a gRPC client for managing Xray core configuration, inbounds, outbounds, and statistics.
@@ -97,6 +99,30 @@ func (x *XrayAPI) Close() {
 	x.HandlerServiceClient = nil
 	x.StatsServiceClient = nil
 	x.isConnected = false
+}
+
+// Ping checks that the management API answers: it issues a stats
+// query with a short timeout and reports only whether the API
+// responded, not the stats themselves. A query that reaches a
+// server without the stats service registered (Unimplemented) still
+// proves the API is serving.
+func (x *XrayAPI) Ping(timeout time.Duration) error {
+	if x.grpcClient == nil {
+		return common.NewError("xray api is not initialized")
+	}
+	if x.StatsServiceClient == nil {
+		return common.NewError("xray StatusServiceClient is not initialized")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_, err := (*x.StatsServiceClient).QueryStats(ctx, &statsService.QueryStatsRequest{})
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // AddInbound adds a new inbound configuration to the Xray core via gRPC.

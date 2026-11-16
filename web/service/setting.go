@@ -229,6 +229,14 @@ func (s *SettingService) ResetSettings() error {
 
 func (s *SettingService) getSetting(key string) (*model.Setting, error) {
 	db := database.GetDB()
+	if db == nil {
+		// No database is open (a fresh process before InitDB, or a
+		// zero-value service in tests): report it instead of
+		// dereferencing a nil *gorm.DB. Callers that have a
+		// fallback (geoMaxFileSizeBytes) treat any error as
+		// "use the default".
+		return nil, common.NewError("database is not initialized")
+	}
 	setting := &model.Setting{}
 	err := db.Model(model.Setting{}).Where("key = ?", key).First(setting).Error
 	if err != nil {

@@ -27,6 +27,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
+	"github.com/mhsanaei/3x-ui/v2/xray"
 
 	"github.com/op/go-logging"
 )
@@ -82,12 +83,15 @@ func TestTriggerUpdateAllAllSuccess(t *testing.T) {
 			{Id: 2, Alias: "b"},
 		}, nil
 	}
-	s.updateAllApply = func(id int, onStartup bool) (string, error) {
-		return fmt.Sprintf("geo_%d.dat", id), nil
+	s.updateAllApply = func(id int, onStartup bool) (string, *geoCommit, error) {
+		return fmt.Sprintf("geo_%d.dat", id), nil, nil
 	}
 	restartCalls := 0
 	s.updateAllRestart = func() error {
 		restartCalls++
+		return nil
+	}
+	s.updateAllWaitReady = func() error {
 		return nil
 	}
 
@@ -111,15 +115,18 @@ func TestTriggerUpdateAllPartialSuccess(t *testing.T) {
 			{Id: 2, Alias: "bad"},
 		}, nil
 	}
-	s.updateAllApply = func(id int, onStartup bool) (string, error) {
+	s.updateAllApply = func(id int, onStartup bool) (string, *geoCommit, error) {
 		if id == 2 {
-			return "geo_2.dat", ErrCustomGeoDownload
+			return "geo_2.dat", nil, ErrCustomGeoDownload
 		}
-		return "geo_1.dat", nil
+		return "geo_1.dat", nil, nil
 	}
 	restartCalls := 0
 	s.updateAllRestart = func() error {
 		restartCalls++
+		return nil
+	}
+	s.updateAllWaitReady = func() error {
 		return nil
 	}
 
@@ -143,12 +150,15 @@ func TestTriggerUpdateAllAllFailure(t *testing.T) {
 			{Id: 2, Alias: "b"},
 		}, nil
 	}
-	s.updateAllApply = func(id int, onStartup bool) (string, error) {
-		return fmt.Sprintf("geo_%d.dat", id), ErrCustomGeoDownload
+	s.updateAllApply = func(id int, onStartup bool) (string, *geoCommit, error) {
+		return fmt.Sprintf("geo_%d.dat", id), nil, ErrCustomGeoDownload
 	}
 	restartCalls := 0
 	s.updateAllRestart = func() error {
 		restartCalls++
+		return nil
+	}
+	s.updateAllWaitReady = func() error {
 		return nil
 	}
 
@@ -902,7 +912,10 @@ func TestGeoMaxFileSizeBytesFallback(t *testing.T) {
 }
 
 // setupCustomGeoTestDB builds a throw-away panel database and points
-// the bin and log folders at temp directories.
+// the bin and log folders at temp directories. It also installs the
+// sleeping fake Xray and a template without the api inbound: geo
+// updates restart Xray and wait for readiness, and the fake can
+// only prove readiness by sustained liveness.
 func setupCustomGeoTestDB(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
@@ -913,6 +926,12 @@ func setupCustomGeoTestDB(t *testing.T) {
 		t.Fatalf("InitDB: %v", err)
 	}
 	t.Cleanup(func() { database.CloseDB() })
+	script := "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then echo \"Xray 99.0-test (test)\"; exit 0; fi\nexec sleep 60\n"
+	if err := os.WriteFile(filepath.Join(dir, xray.GetBinaryName()), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = (&XrayService{}).StopXray() })
+	installNoAPITemplate(t)
 }
 
 // TestCustomGeoUpdateDownloadFailureKeepsOldFile: when an update
@@ -1078,7 +1097,176 @@ func TestCustomGeoUpdateDBFailureRestoresOldFile(t *testing.T) {
 	if after.Url != good.URL || after.LocalPath != cur.LocalPath {
 		t.Fatalf("record changed after failed update: %+v", after)
 	}
-	if _, err := os.Stat(cur.LocalPath + ".bak"); !os.IsNotExist(err) {
-		t.Fatalf("backup left behind after rollback: %v", err)
+	if leftovers, _ := filepath.Glob(cur.LocalPath + ".bak-*"); len(leftovers) != 0 {
+		t.Fatalf("backup left behind after rollback: %v", leftovers)
+	}
+}
+
+// TestCustomGeoUpdateRestartFailureRestoresOldFile: when the
+// restart after a successful download and metadata update fails,
+// the update must return the error and roll the file and the record
+// back — a restart failure used to be only logged while the update
+// reported success.
+func TestCustomGeoUpdateRestartFailureRestoresOldFile(t *testing.T) {
+	disableSSRFCheck(t)
+	setupCustomGeoTestDB(t)
+	s := NewCustomGeoService()
+
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, minDatBytes+1))
+	}))
+	defer good.Close()
+	r := &model.CustomGeoResource{Type: "geoip", Alias: "keep", Url: good.URL}
+	if err := s.Create(r); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	var cur model.CustomGeoResource
+	if err := database.GetDB().First(&cur, r.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldContent, err := os.ReadFile(cur.LocalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A new source with different content, and a restart that
+	// cannot succeed: the config file path is a directory, so
+	// writing the runtime config fails synchronously.
+	newer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(bytes.Repeat([]byte{0x7f}, minDatBytes+1))
+	}))
+	defer newer.Close()
+	binDir := os.Getenv("XUI_BIN_FOLDER")
+	// The running fake wrote its config to config.json; remove the
+	// file first so the directory can take its place.
+	if err := os.Remove(filepath.Join(binDir, "config.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(binDir, "config.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	upd := &model.CustomGeoResource{Type: "geoip", Alias: "keep", Url: newer.URL}
+	if err := s.Update(cur.Id, upd); err == nil {
+		t.Fatal("Update should fail when the restart fails")
+	}
+	if got, err := os.ReadFile(cur.LocalPath); err != nil || !bytes.Equal(got, oldContent) {
+		t.Fatalf("old file not restored after failed restart: %q, %v", got, err)
+	}
+	var after model.CustomGeoResource
+	if err := database.GetDB().First(&after, cur.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Url != good.URL || after.LocalPath != cur.LocalPath {
+		t.Fatalf("record changed after failed restart: %+v", after)
+	}
+	if leftovers, _ := filepath.Glob(cur.LocalPath + ".bak-*"); len(leftovers) != 0 {
+		t.Fatalf("backup left behind after rollback: %v", leftovers)
+	}
+
+	// The restored record still produces a working configuration:
+	// with the sabotage removed, Xray starts again.
+	if err := os.Remove(filepath.Join(binDir, "config.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&ServerService{}).RestartXrayService(); err != nil {
+		t.Fatalf("restart with the restored record: %v", err)
+	}
+	if !(&XrayService{}).IsXrayRunning() {
+		t.Fatal("Xray should be running after the restored restart")
+	}
+}
+
+// TestTriggerUpdateAllRestartFailureRollsBack: the batch commits
+// only when the restart and the readiness check pass. A restart
+// failure rolls every applied item back and returns the error
+// instead of a success with a half-applied batch.
+func TestTriggerUpdateAllRestartFailureRollsBack(t *testing.T) {
+	disableSSRFCheck(t)
+	setupCustomGeoTestDB(t)
+	s := NewCustomGeoService()
+
+	mkServer := func(content *[]byte) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(*content)
+		}))
+	}
+	contentA := bytes.Repeat([]byte{0x41}, minDatBytes+1)
+	contentB := bytes.Repeat([]byte{0x42}, minDatBytes+1)
+	srvA := mkServer(&contentA)
+	defer srvA.Close()
+	srvB := mkServer(&contentB)
+	defer srvB.Close()
+	ra := &model.CustomGeoResource{Type: "geoip", Alias: "a", Url: srvA.URL}
+	rb := &model.CustomGeoResource{Type: "geosite", Alias: "b", Url: srvB.URL}
+	if err := s.Create(ra); err != nil {
+		t.Fatalf("Create a: %v", err)
+	}
+	if err := s.Create(rb); err != nil {
+		t.Fatalf("Create b: %v", err)
+	}
+	var curA, curB model.CustomGeoResource
+	if err := database.GetDB().First(&curA, ra.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.GetDB().First(&curB, rb.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldA, err := os.ReadFile(curA.LocalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldB, err := os.ReadFile(curB.LocalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// New content on both sources, and a restart that cannot
+	// succeed.
+	contentA = bytes.Repeat([]byte{0x61}, minDatBytes+1)
+	contentB = bytes.Repeat([]byte{0x62}, minDatBytes+1)
+	binDir := os.Getenv("XUI_BIN_FOLDER")
+	// The running fake wrote its config to config.json; remove the
+	// file first so the directory can take its place.
+	if err := os.Remove(filepath.Join(binDir, "config.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(binDir, "config.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.TriggerUpdateAll()
+	if err == nil {
+		t.Fatal("TriggerUpdateAll should fail when the restart fails")
+	}
+	if len(res.Succeeded) != 0 || len(res.Failed) != 2 {
+		t.Fatalf("unexpected result after rollback: %+v", res)
+	}
+	if got, err := os.ReadFile(curA.LocalPath); err != nil || !bytes.Equal(got, oldA) {
+		t.Fatalf("file a not restored after failed batch restart: %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(curB.LocalPath); err != nil || !bytes.Equal(got, oldB) {
+		t.Fatalf("file b not restored after failed batch restart: %q, %v", got, err)
+	}
+	var afterA, afterB model.CustomGeoResource
+	if err := database.GetDB().First(&afterA, ra.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.GetDB().First(&afterB, rb.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	if afterA.Url != srvA.URL || afterB.Url != srvB.URL {
+		t.Fatalf("record URLs changed after failed batch restart: %+v %+v", afterA, afterB)
+	}
+	if afterA.LastUpdatedAt != curA.LastUpdatedAt || afterB.LastUpdatedAt != curB.LastUpdatedAt {
+		t.Fatalf("record timestamps not restored after failed batch restart: %+v %+v", afterA, afterB)
+	}
+	for _, p := range []string{curA.LocalPath, curB.LocalPath} {
+		if leftovers, _ := filepath.Glob(p + ".bak-*"); len(leftovers) != 0 {
+			t.Fatalf("backup left behind after batch rollback: %v", leftovers)
+		}
 	}
 }
