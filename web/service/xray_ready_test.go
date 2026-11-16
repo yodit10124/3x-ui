@@ -1,6 +1,9 @@
 package service
 
 import (
+	"context"
+	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +11,8 @@ import (
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/xray"
+	statsService "github.com/xtls/xray-core/app/stats/command"
+	"google.golang.org/grpc"
 )
 
 // TestWaitReadyExitsImmediately: a binary that starts but exits at
@@ -42,16 +47,78 @@ func TestWaitReadyExitsImmediately(t *testing.T) {
 	}
 }
 
+// foreignStatsServer answers QueryStats the way a real Xray
+// would. It stands in for the foreign service the auditor found
+// listening on the default API port: a probe aimed at that port
+// would take its answer for our Xray's.
+type foreignStatsServer struct {
+	statsService.UnimplementedStatsServiceServer
+}
+
+func (foreignStatsServer) QueryStats(context.Context, *statsService.QueryStatsRequest) (*statsService.QueryStatsResponse, error) {
+	return &statsService.QueryStatsResponse{}, nil
+}
+
+// plantForeignAPIServer puts a foreign gRPC stats server on the
+// default API port 127.0.0.1:62789. If the port is already taken
+// on this machine, the environment already provides the foreign
+// service the test is about, so there is nothing left to plant.
+func plantForeignAPIServer(t *testing.T) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:62789")
+	if err != nil {
+		t.Logf("could not plant a foreign API server on 62789: %v", err)
+		return
+	}
+	srv := grpc.NewServer()
+	statsService.RegisterStatsServiceServer(srv, foreignStatsServer{})
+	go srv.Serve(ln)
+	t.Cleanup(srv.Stop)
+}
+
 // TestWaitReadyNeverReady: a process that stays alive but never
 // binds its management API must fail the readiness check on
-// timeout, not pass on liveness alone.
+// timeout, not pass on liveness alone — even when a foreign
+// service answers QueryStats on the default API port. The probe
+// must go to this start's own ephemeral port, never to 62789.
 func TestWaitReadyNeverReady(t *testing.T) {
 	setupImportTestEnv(t, true)
+	plantForeignAPIServer(t)
 	if err := (&XrayService{}).RestartXray(true); err != nil {
 		t.Fatalf("RestartXray: %v", err)
 	}
+	if port := p.GetAPIPort(); port <= 0 || port == 62789 {
+		t.Fatalf("API port %d, want a fresh ephemeral port, not the default 62789", port)
+	}
+	// The on-disk config is what the process really runs with:
+	// its api port must be the same ephemeral one.
+	configData, err := os.ReadFile(filepath.Join(os.Getenv("XUI_BIN_FOLDER"), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var written struct {
+		Inbounds []struct {
+			Tag  string `json:"tag"`
+			Port int    `json:"port"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(configData, &written); err != nil {
+		t.Fatal(err)
+	}
+	foundAPI := false
+	for _, inbound := range written.Inbounds {
+		if inbound.Tag == "api" {
+			foundAPI = true
+			if inbound.Port != p.GetAPIPort() {
+				t.Fatalf("config.json api port %d, want the process port %d", inbound.Port, p.GetAPIPort())
+			}
+		}
+	}
+	if !foundAPI {
+		t.Fatal("config.json has no api inbound, want one")
+	}
 	start := time.Now()
-	err := (&XrayService{}).WaitReady(2 * time.Second)
+	err = (&XrayService{}).WaitReady(2 * time.Second)
 	if err == nil {
 		t.Fatal("WaitReady should fail when the process never binds its API")
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -241,14 +242,67 @@ func (p *Process) GetUptime() uint64 {
 	return uint64(time.Since(p.startTime).Seconds())
 }
 
-// refreshAPIPort updates the API port from the inbound configs.
-func (p *process) refreshAPIPort() {
-	for _, inbound := range p.config.InboundConfigs {
-		if inbound.Tag == "api" {
-			p.apiPort = inbound.Port
+// allocateAPIPort reserves a fresh loopback port for this Xray
+// instance's management API. The port is taken by binding :0 and
+// closing it again, so nothing else can be listening on it yet.
+// The small window between the close and Xray's own bind is safe
+// in the failing direction: if another process grabs the port
+// first, Xray fails to bind its api inbound and exits, and the
+// readiness check sees a dead process instead of a foreign
+// answer.
+func allocateAPIPort() (int, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer ln.Close()
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, errors.New("unexpected listener address type")
+	}
+	return addr.Port, nil
+}
+
+// effectiveConfig returns the configuration bytes Xray will
+// actually run with, plus the API port it will listen on (0 when
+// the config has no api inbound). The api inbound gets a fresh
+// ephemeral port on every start, so the readiness probe can only
+// ever talk to THIS instance: probing the fixed, well-known
+// template port lets any other service on the machine — another
+// panel's Xray, a stray process — answer the probe and be
+// mistaken for our Xray. p.config itself is left untouched, so
+// the restart-skipping comparison in RestartXray still sees the
+// template port, and the on-disk config.json carries the port the
+// running process really uses (the IP-limit job reads it from
+// there).
+func (p *process) effectiveConfig() ([]byte, int, error) {
+	cfg := *p.config
+	apiPort := 0
+	for i, inbound := range p.config.InboundConfigs {
+		if inbound.Tag != "api" {
+			continue
+		}
+		port, err := allocateAPIPort()
+		if err != nil {
+			// Allocation failure is not a reason to refuse a
+			// start: keep the configured port (the old
+			// behaviour) and let the probe do its best.
+			logger.Warningf("Failed to allocate a private API port, keeping %d: %s", inbound.Port, err)
+			apiPort = inbound.Port
 			break
 		}
+		// Copy the slice before rewriting: the caller's config
+		// must keep the template port.
+		cfg.InboundConfigs = append([]InboundConfig(nil), p.config.InboundConfigs...)
+		cfg.InboundConfigs[i].Port = port
+		apiPort = port
+		break
 	}
+	data, err := json.MarshalIndent(&cfg, "", "  ")
+	if err != nil {
+		return nil, 0, common.NewErrorf("Failed to generate XRAY configuration files: %v", err)
+	}
+	return data, apiPort, nil
 }
 
 // refreshVersion updates the version string by running the Xray binary with -version.
@@ -291,9 +345,9 @@ func (p *process) Start() (err error) {
 	// config, instead of only unmarshalling the log section, also closes
 	// the old gap where a JSON unmarshal failure silently skipped all
 	// validation and the config was started unchecked.
-	data, err := json.MarshalIndent(p.config, "", "  ")
+	data, apiPort, err := p.effectiveConfig()
 	if err != nil {
-		return common.NewErrorf("Failed to generate XRAY configuration files: %v", err)
+		return err
 	}
 	if err := config.ValidateXrayRuntimeConfig(string(data)); err != nil {
 		return err
@@ -357,7 +411,9 @@ func (p *process) Start() (err error) {
 	}()
 
 	p.refreshVersion()
-	p.refreshAPIPort()
+	// The API port comes from the effective config written to
+	// disk above, not from the template port in p.config.
+	p.apiPort = apiPort
 
 	return nil
 }

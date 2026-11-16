@@ -262,9 +262,11 @@ func (s *XrayService) RestartXray(isForce bool) error {
 // pointer is captured once so the polling loop never races a
 // concurrent restart for the global, and a successful probe is
 // only accepted after re-checking that same process is still
-// alive: with the old process gone (Stop waits for its exit) the
-// API port belongs to this start. When the configuration has no
-// api inbound there is nothing to probe, so readiness is sustained
+// alive. The probe target belongs to this start because every
+// start gets a fresh ephemeral API port (see effectiveConfig):
+// with the old process gone (Stop waits for its exit) nothing
+// else can be answering on it. When the configuration has no api
+// inbound there is nothing to probe, so readiness is sustained
 // liveness over a short observation window instead of an instant
 // pass.
 func (s *XrayService) WaitReady(timeout time.Duration) error {
