@@ -295,6 +295,26 @@ func (h *Hub) CloseUserClients(userID int) {
 	}
 }
 
+// CloseAllClients closes every connection, e.g. on a database import
+// that invalidates all sessions at once. Like the other revocation
+// calls it bumps the revocation epoch first, so a registration racing
+// the close re-validates instead of joining.
+func (h *Hub) CloseAllClients() {
+	if h == nil {
+		return
+	}
+	h.bumpRevocationEpoch()
+	h.mu.RLock()
+	clients := make([]*Client, 0, len(h.clients))
+	for c := range h.clients {
+		clients = append(clients, c)
+	}
+	h.mu.RUnlock()
+	for _, c := range clients {
+		h.removeClient(c)
+	}
+}
+
 // sweepSessions re-validates every live connection against its login
 // session and closes the ones whose session is gone: expired, revoked
 // by a password change, or belonging to a deleted user. It runs on the

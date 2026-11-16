@@ -300,13 +300,56 @@ var allowedImportTables = map[string]bool{
 	// login). A backup taken by a version that has the table must
 	// import: without this entry the import is rejected as an
 	// unexpected table and the backup cannot be restored at all.
-	// Restored rows are inert on their own — the cookie-signing
-	// secret rotates on import, so old cookies fail validation, and
-	// expired rows are ignored by auth anyway.
+	// Restored rows are purged from the candidate file before the
+	// swap (see PurgeLoginSessionsFromFile): the running process
+	// keeps the secret it loaded at startup, so secret rotation
+	// alone cannot stop a replayed cookie from re-authenticating
+	// against a restored row. Expired rows are ignored by auth anyway.
 	"login_sessions":  true,
 	"sqlite_sequence": true,
 	"sqlite_stat1":    true,
 	"sqlite_stat4":    true,
+}
+
+// PurgeLoginSessionsFromFile deletes every row from login_sessions in
+// the database file at dbPath, without touching any other table. It is
+// used by import: a backup must never resurrect sessions that were
+// already logged out, so the rows are removed from the candidate file
+// before it ever becomes the live database. The running process keeps
+// the cookie-signing secret it loaded at startup, so rotating the
+// secret in the database alone cannot stop a replayed old cookie from
+// re-authenticating against a restored row until the next restart.
+// A file without the table (an old-version backup) is a no-op. The
+// connection is closed before returning so the file can be renamed
+// afterwards.
+func PurgeLoginSessionsFromFile(dbPath string) error {
+	gdb, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		return err
+	}
+	sqlDB, err := gdb.DB()
+	if err != nil {
+		return err
+	}
+	defer sqlDB.Close()
+
+	var count int64
+	if err := gdb.Raw("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'login_sessions'").Scan(&count).Error; err != nil {
+		return err
+	}
+	if count == 0 {
+		return nil
+	}
+	if err := gdb.Exec("DELETE FROM login_sessions").Error; err != nil {
+		return err
+	}
+	// Make sure the delete reaches the main file: a WAL-mode source
+	// database would otherwise keep it in the -wal sidecar, which is
+	// never imported.
+	_ = gdb.Exec("PRAGMA wal_checkpoint(TRUNCATE)").Error
+	return nil
 }
 
 // ValidateImportedDBObjects enumerates sqlite_master of the candidate

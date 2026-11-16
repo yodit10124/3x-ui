@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -135,6 +136,13 @@ func NewTestProcess(xrayConfig *Config, configPath string) *Process {
 type process struct {
 	cmd *exec.Cmd
 
+	// running tracks liveness atomically. IsRunning must not read the
+	// exec.Cmd fields: cmd.Start() initialises them, and cmd.Wait()
+	// writes ProcessState on exit, so any concurrent reader of
+	// cmd.Process / cmd.ProcessState races with them. Only Start
+	// (synchronous) and the Wait goroutine touch cmd internals now.
+	running atomic.Bool
+
 	version string
 	apiPort int
 
@@ -165,14 +173,11 @@ func newTestProcess(config *Config, configPath string) *process {
 }
 
 // IsRunning returns true if the Xray process is currently running.
+// Liveness is tracked with an atomic flag, not the exec.Cmd fields
+// (see the running field): reading cmd.ProcessState here used to race
+// with cmd.Start()/cmd.Wait() running in another goroutine.
 func (p *process) IsRunning() bool {
-	if p.cmd == nil || p.cmd.Process == nil {
-		return false
-	}
-	if p.cmd.ProcessState == nil {
-		return true
-	}
-	return false
+	return p.running.Load()
 }
 
 // GetErr returns the last error encountered by the Xray process.
@@ -296,8 +301,19 @@ func (p *process) Start() (err error) {
 	cmd.Stdout = p.logWriter
 	cmd.Stderr = p.logWriter
 
+	// Start the process synchronously: exec.Cmd is not safe for
+	// concurrent use, and the old code ran cmd.Run() in a goroutine,
+	// so cmd.Start() (which initialises cmd.Process) raced with
+	// IsRunning/Stop reading the cmd fields. Only Wait runs in the
+	// background now; a missing binary also fails here, synchronously,
+	// instead of silently never starting.
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	p.running.Store(true)
 	go func() {
-		err := cmd.Run()
+		err := cmd.Wait()
+		p.running.Store(false)
 		if err != nil {
 			// On Windows, killing the process results in "exit status 1" which isn't an error for us
 			if runtime.GOOS == "windows" {

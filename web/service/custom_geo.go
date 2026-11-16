@@ -435,6 +435,18 @@ func sanitizeDestPath(destPath string) (string, error) {
 	return destPathAbs, nil
 }
 
+// downloadToPathFull downloads without a conditional request: used
+// when the source URL changed, so the old source's Last-Modified is
+// never sent to the new source — a 304 there would keep the old
+// source's data under the new URL.
+func (s *CustomGeoService) downloadToPathFull(resourceURL, destPath string) (skipped bool, newLastModified string, err error) {
+	safeDestPath, err := sanitizeDestPath(destPath)
+	if err != nil {
+		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
+	}
+	return s.downloadToPathOnce(resourceURL, safeDestPath, "", true)
+}
+
 func (s *CustomGeoService) downloadToPathOnce(resourceURL, destPath string, lastModifiedHeader string, forceFull bool) (skipped bool, newLastModified string, err error) {
 	safeDestPath, err := sanitizeDestPath(destPath)
 	if err != nil {
@@ -657,12 +669,20 @@ func (s *CustomGeoService) Update(id int, r *model.CustomGeoResource) error {
 	if err := s.syncAndSanitizeLocalPath(r); err != nil {
 		return err
 	}
-	if oldPath != r.LocalPath && oldPath != "" {
-		if err := removeSafePathIfExists(oldPath); err != nil && !errors.Is(err, ErrCustomGeoPathTraversal) {
-			logger.Warningf("custom geo remove old path %s: %v", oldPath, err)
-		}
+	// Download first, commit last. The old file is deleted only after
+	// the download AND the database update succeed: if the new source
+	// answers 404, is oversized, or the network drops, the old file
+	// and the old record stay untouched, so Xray keeps working.
+	// When the source URL changed, the old source's Last-Modified
+	// must not be sent to the new source: a 304 there would keep the
+	// old source's data while the record is updated to the new URL.
+	// Force a full download in that case.
+	var lm string
+	if r.Url != cur.Url {
+		_, lm, err = s.downloadToPathFull(r.Url, r.LocalPath)
+	} else {
+		_, lm, err = s.downloadToPath(r.Url, r.LocalPath, cur.LastModified)
 	}
-	_, lm, err := s.downloadToPath(r.Url, r.LocalPath, cur.LastModified)
 	if err != nil {
 		return err
 	}
@@ -677,7 +697,20 @@ func (s *CustomGeoService) Update(id int, r *model.CustomGeoResource) error {
 		"last_modified":   r.LastModified,
 	}).Error
 	if err != nil {
+		// The new file was just downloaded to a path the database
+		// does not reference; remove it so a failed update leaves no
+		// orphan behind. The old file is untouched.
+		if r.LocalPath != oldPath {
+			_ = removeSafePathIfExists(r.LocalPath)
+		}
 		return err
+	}
+	// Only now, with the download and the record committed, remove
+	// the old file when the path changed.
+	if oldPath != r.LocalPath && oldPath != "" {
+		if err := removeSafePathIfExists(oldPath); err != nil && !errors.Is(err, ErrCustomGeoPathTraversal) {
+			logger.Warningf("custom geo remove old path %s: %v", oldPath, err)
+		}
 	}
 	logger.Infof("custom geo updated id=%d", id)
 	if err = s.serverService.RestartXrayService(); err != nil {

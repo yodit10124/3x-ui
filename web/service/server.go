@@ -26,6 +26,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/util/common"
 	"github.com/mhsanaei/3x-ui/v2/util/sys"
+	"github.com/mhsanaei/3x-ui/v2/web/websocket"
 	"github.com/mhsanaei/3x-ui/v2/xray"
 
 	"github.com/google/uuid"
@@ -708,24 +709,89 @@ func verifyXrayZipSHA256(url, zipPath string) error {
 }
 
 func (s *ServerService) UpdateXray(version string) error {
-	// 1. Stop xray before doing anything
-	if err := s.StopXrayService(); err != nil {
-		logger.Warning("failed to stop xray before update:", err)
-	}
-
-	// 2. Download the zip
+	// 1. Download and verify the zip BEFORE stopping Xray: a failed
+	// download, a bad checksum, or an unreadable zip must leave the
+	// running Xray untouched. (Previously the stop came first, so any
+	// of these left the panel without a running Xray — and the stop
+	// is marked manual, so the health check never revived it.)
 	zipFileName, err := s.downloadXRay(version)
 	if err != nil {
 		return err
 	}
 	defer os.Remove(zipFileName)
 
-	zipFile, err := os.Open(zipFileName)
+	// 2. Extract the new binary to a staged file next to the live
+	// one (same filesystem, so the swap is a rename). The live
+	// binary is not touched yet.
+	var targetBinary, zipEntry string
+	if runtime.GOOS == "windows" {
+		targetBinary = filepath.Join("bin", "xray-windows-amd64.exe")
+		zipEntry = "xray.exe"
+	} else {
+		targetBinary = xray.GetBinaryPath()
+		zipEntry = "xray"
+	}
+	stagedPath := targetBinary + ".new"
+	if err := extractZipEntry(zipFileName, zipEntry, stagedPath); err != nil {
+		return err
+	}
+	// The staged file only exists until the swap; remove it on any
+	// failure before the swap. After a successful swap it no longer
+	// exists (it was renamed into place).
+	staged := true
+	defer func() {
+		if staged {
+			_ = os.Remove(stagedPath)
+		}
+	}()
+
+	// 3. Only now stop the running Xray.
+	xrayWasRunning := s.xrayService.IsXrayRunning()
+	if err := s.StopXrayService(); err != nil {
+		logger.Warning("failed to stop xray before update:", err)
+	}
+
+	// 4. Swap the binaries, keeping a backup until the new one is
+	// confirmed running.
+	backupPath, err := stageBinaryReplace(targetBinary, stagedPath)
+	if err != nil {
+		return err
+	}
+	staged = false
+
+	// 5. Restart xray with the new binary. On failure, roll the old
+	// binary back and restore the previous running state.
+	if err := s.xrayService.RestartXray(true); err != nil {
+		logger.Error("start xray failed, rolling back to the previous binary:", err)
+		if rerr := rollbackBinaryReplace(targetBinary, backupPath); rerr != nil {
+			return common.NewErrorf("Failed to start new Xray and failed to roll back the binary: %v (rollback: %v)", err, rerr)
+		}
+		if xrayWasRunning {
+			if rerr := s.xrayService.RestartXray(true); rerr != nil {
+				logger.Error("rollback restart xray failed:", rerr)
+			}
+		}
+		return err
+	}
+
+	// 6. The new binary runs: the backup is no longer needed.
+	if err := commitBinaryReplace(backupPath); err != nil {
+		logger.Warningf("Failed to remove Xray backup binary %s: %v", backupPath, err)
+	}
+
+	return nil
+}
+
+// extractZipEntry extracts one entry from a zip archive to destPath
+// (0755), refusing an empty result. The destination is written to a
+// temporary file and renamed into place, so a corrupt or truncated
+// archive never leaves a partial binary behind.
+func extractZipEntry(zipPath, entryName, destPath string) error {
+	zipFile, err := os.Open(zipPath)
 	if err != nil {
 		return err
 	}
 	defer zipFile.Close()
-
 	stat, err := zipFile.Stat()
 	if err != nil {
 		return err
@@ -734,43 +800,89 @@ func (s *ServerService) UpdateXray(version string) error {
 	if err != nil {
 		return err
 	}
-
-	// 3. Helper to extract files
-	copyZipFile := func(zipName string, fileName string) error {
-		zipFile, err := reader.Open(zipName)
-		if err != nil {
-			return err
-		}
-		defer zipFile.Close()
-		os.MkdirAll(filepath.Dir(fileName), 0755)
-		os.Remove(fileName)
-		file, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0755)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		_, err = io.Copy(file, zipFile)
-		return err
-	}
-
-	// 4. Extract correct binary
-	if runtime.GOOS == "windows" {
-		targetBinary := filepath.Join("bin", "xray-windows-amd64.exe")
-		err = copyZipFile("xray.exe", targetBinary)
-	} else {
-		err = copyZipFile("xray", xray.GetBinaryPath())
-	}
+	entry, err := reader.Open(entryName)
 	if err != nil {
 		return err
 	}
-
-	// 5. Restart xray
-	if err := s.xrayService.RestartXray(true); err != nil {
-		logger.Error("start xray failed:", err)
+	defer entry.Close()
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 		return err
 	}
-
+	tmpPath := destPath + ".tmp"
+	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	n, err := io.Copy(out, entry)
+	closeErr := out.Close()
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return closeErr
+	}
+	if n == 0 {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("empty entry %q in %s", entryName, zipPath)
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
 	return nil
+}
+
+// stageBinaryReplace moves the live binary at target aside (to
+// target+".bak") and puts the staged new binary in its place. When
+// there is no live binary, only the rename happens. It returns the
+// backup path, or "" when there was nothing to back up. The caller
+// must either commitBinaryReplace (new binary confirmed) or
+// rollbackBinaryReplace (swap or start failed).
+func stageBinaryReplace(target, staged string) (backupPath string, err error) {
+	if _, err := os.Stat(target); err == nil {
+		backupPath = target + ".bak"
+		_ = os.Remove(backupPath)
+		if err := os.Rename(target, backupPath); err != nil {
+			return "", fmt.Errorf("failed to back up current binary: %w", err)
+		}
+	}
+	if err := os.Rename(staged, target); err != nil {
+		if backupPath != "" {
+			_ = os.Rename(backupPath, target)
+		}
+		return "", fmt.Errorf("failed to install new binary: %w", err)
+	}
+	return backupPath, nil
+}
+
+// rollbackBinaryReplace restores the backup over the new binary.
+// With no backup (there was no live binary before), it removes the
+// new binary instead, restoring the previous "no binary" state.
+func rollbackBinaryReplace(target, backupPath string) error {
+	if backupPath == "" {
+		if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to remove new binary: %w", err)
+		}
+		return nil
+	}
+	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove new binary: %w", err)
+	}
+	if err := os.Rename(backupPath, target); err != nil {
+		return fmt.Errorf("failed to restore backed-up binary: %w", err)
+	}
+	return nil
+}
+
+// commitBinaryReplace removes the backup after the new binary is
+// confirmed running.
+func commitBinaryReplace(backupPath string) error {
+	if backupPath == "" {
+		return nil
+	}
+	return os.Remove(backupPath)
 }
 
 func (s *ServerService) GetLogs(count string, level string, syslog string) []string {
@@ -1051,6 +1163,21 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 		return common.NewErrorf("Imported db has unsafe xray config: %v", err)
 	}
 
+	// A backup must never resurrect sessions that were already logged
+	// out. The running process keeps the secret it loaded at startup,
+	// so rotating the secret in the database alone cannot stop a
+	// replayed old cookie from re-authenticating against a restored
+	// row until the next restart. Purge every restored login session
+	// from the candidate file before it ever becomes the live
+	// database; the import fails closed if the purge fails.
+	if err = database.PurgeLoginSessionsFromFile(tempPath); err != nil {
+		return common.NewErrorf("Error discarding imported login sessions: %v", err)
+	}
+
+	// Record whether Xray was running before the swap so a failed
+	// import can restore the original service state.
+	xrayWasRunning := s.xrayService.IsXrayRunning()
+
 	// Stop Xray (ignore error but log)
 	if errStop := s.StopXrayService(); errStop != nil {
 		logger.Warningf("Failed to stop Xray before DB import: %v", errStop)
@@ -1076,30 +1203,41 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 		return common.NewErrorf("Error backing up current db file: %v", err)
 	}
 
-	// Defer fallback cleanup ONLY if everything goes well
+	// From here on the import either commits or rolls back. The
+	// deferred rollback closes whatever database handle is live (it
+	// may still point at the failed candidate), restores the original
+	// file, reopens it, and restores Xray to its pre-import state.
+	// The fallback file is deleted only on success — never on a
+	// failed import, where the file was already moved back and there
+	// is nothing left to delete.
+	committed := false
 	defer func() {
-		if _, err := os.Stat(fallbackPath); err == nil {
-			if rerr := os.Remove(fallbackPath); rerr != nil {
-				logger.Warningf("Warning: failed to remove fallback file: %v", rerr)
+		if committed {
+			if err := os.Remove(fallbackPath); err != nil && !os.IsNotExist(err) {
+				logger.Warningf("Warning: failed to remove fallback file: %v", err)
 			}
+			return
 		}
+		s.rollbackImport(fallbackPath, xrayWasRunning)
 	}()
 
 	// Move temp to DB path
 	if err = os.Rename(tempPath, config.GetDBPath()); err != nil {
-		// Restore from fallback
-		if errRename := os.Rename(fallbackPath, config.GetDBPath()); errRename != nil {
-			return common.NewErrorf("Error moving db file and restoring fallback: %v", errRename)
-		}
 		return common.NewErrorf("Error moving db file: %v", err)
 	}
 
 	// Open & migrate new DB
 	if err = database.InitDB(config.GetDBPath()); err != nil {
-		if errRename := os.Rename(fallbackPath, config.GetDBPath()); errRename != nil {
-			return common.NewErrorf("Error migrating db and restoring fallback: %v", errRename)
-		}
 		return common.NewErrorf("Error migrating db: %v", err)
+	}
+
+	// The import invalidates every pre-import session (their rows
+	// were purged from the candidate, and the old database is gone),
+	// so close every live WebSocket now: a connection bound to a dead
+	// session must not keep receiving pushes. Clients reconnect
+	// automatically once the operator logs in again.
+	if hub := websocket.GetHub(); hub != nil {
+		hub.CloseAllClients()
 	}
 
 	s.inboundService.MigrateDB()
@@ -1117,13 +1255,45 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 	// panel restart (the running process keeps the secret it loaded at
 	// startup, see SettingService.RotateSecret); the success message tells
 	// the operator to review the admin accounts.
-	// A rotation failure is reported loudly instead of silently skipped:
-	// the import itself already happened, so the message says so.
+	// A rotation failure is reported loudly instead of silently skipped,
+	// and the deferred rollback restores the original database, like
+	// any other post-swap failure.
 	if err := (&SettingService{}).RotateSecret(); err != nil {
 		return common.NewErrorf("Imported DB but failed to rotate secret: %v", err)
 	}
 
+	committed = true
 	return nil
+}
+
+// rollbackImport restores the pre-import state after a failed database
+// swap: it closes the live handle (which may still point at the failed
+// candidate file), moves the fallback file back, reopens the original
+// database, and restarts Xray if it was running before the import.
+// Every step is best-effort and logs its failure; the caller still
+// returns the original import error.
+func (s *ServerService) rollbackImport(fallbackPath string, xrayWasRunning bool) {
+	if err := database.CloseDB(); err != nil {
+		logger.Warningf("ImportDB rollback: failed to close candidate db: %v", err)
+	}
+	if _, err := os.Stat(fallbackPath); err != nil {
+		logger.Errorf("ImportDB rollback: fallback db is missing (%s): %v", fallbackPath, err)
+		return
+	}
+	if err := os.Rename(fallbackPath, config.GetDBPath()); err != nil {
+		logger.Errorf("ImportDB rollback: failed to restore original db: %v", err)
+		return
+	}
+	if err := database.InitDB(config.GetDBPath()); err != nil {
+		logger.Errorf("ImportDB rollback: failed to reopen original db: %v", err)
+		return
+	}
+	s.inboundService.MigrateDB()
+	if xrayWasRunning {
+		if err := s.RestartXrayService(); err != nil {
+			logger.Errorf("ImportDB rollback: failed to restart Xray: %v", err)
+		}
+	}
 }
 
 // IsValidGeofileName validates that the filename is safe for geofile operations.
@@ -1155,6 +1325,89 @@ func (s *ServerService) IsValidGeofileName(filename string) bool {
 	return matched
 }
 
+// downloadGeofile downloads one geofile to destPath. The download
+// goes to a temporary file in the same directory and is renamed into
+// place only after the full body is received: a 404, a network
+// failure mid-download, or a write error must not truncate or replace
+// the old file, which Xray still references. A 304 leaves the old
+// file untouched.
+func downloadGeofile(url, destPath string) error {
+	var req *http.Request
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return common.NewErrorf("Failed to create HTTP request for %s: %v", url, err)
+	}
+
+	var localFileModTime time.Time
+	if fileInfo, err := os.Stat(destPath); err == nil {
+		localFileModTime = fileInfo.ModTime()
+		if !localFileModTime.IsZero() {
+			req.Header.Set("If-Modified-Since", localFileModTime.UTC().Format(http.TimeFormat))
+		}
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return common.NewErrorf("Failed to download Geofile from %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+
+	// Parse Last-Modified header from server
+	var serverModTime time.Time
+	serverModTimeStr := resp.Header.Get("Last-Modified")
+	if serverModTimeStr != "" {
+		parsedTime, err := time.Parse(http.TimeFormat, serverModTimeStr)
+		if err != nil {
+			logger.Warningf("Failed to parse Last-Modified header for %s: %v", url, err)
+		} else {
+			serverModTime = parsedTime
+		}
+	}
+
+	// Function to update local file's modification time
+	updateFileModTime := func() {
+		if !serverModTime.IsZero() {
+			if err := os.Chtimes(destPath, serverModTime, serverModTime); err != nil {
+				logger.Warningf("Failed to update modification time for %s: %v", destPath, err)
+			}
+		}
+	}
+
+	// Handle 304 Not Modified
+	if resp.StatusCode == http.StatusNotModified {
+		updateFileModTime()
+		return nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return common.NewErrorf("Failed to download Geofile from %s: received status code %d", url, resp.StatusCode)
+	}
+
+	tmpPath := destPath + ".tmp"
+	file, err := os.Create(tmpPath)
+	if err != nil {
+		return common.NewErrorf("Failed to create Geofile %s: %v", destPath, err)
+	}
+	_, err = io.Copy(file, resp.Body)
+	closeErr := file.Close()
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return common.NewErrorf("Failed to save Geofile %s: %v", destPath, err)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return common.NewErrorf("Failed to save Geofile %s: %v", destPath, closeErr)
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return common.NewErrorf("Failed to save Geofile %s: %v", destPath, err)
+	}
+
+	updateFileModTime()
+	return nil
+}
+
 func (s *ServerService) UpdateGeofile(fileName string) error {
 	type geofileEntry struct {
 		URL      string
@@ -1176,88 +1429,20 @@ func (s *ServerService) UpdateGeofile(fileName string) error {
 		}
 	}
 
-	downloadFile := func(url, destPath string) error {
-		var req *http.Request
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return common.NewErrorf("Failed to create HTTP request for %s: %v", url, err)
-		}
-
-		var localFileModTime time.Time
-		if fileInfo, err := os.Stat(destPath); err == nil {
-			localFileModTime = fileInfo.ModTime()
-			if !localFileModTime.IsZero() {
-				req.Header.Set("If-Modified-Since", localFileModTime.UTC().Format(http.TimeFormat))
-			}
-		}
-
-		client := &http.Client{}
-		resp, err := client.Do(req)
-		if err != nil {
-			return common.NewErrorf("Failed to download Geofile from %s: %v", url, err)
-		}
-		defer resp.Body.Close()
-
-		// Parse Last-Modified header from server
-		var serverModTime time.Time
-		serverModTimeStr := resp.Header.Get("Last-Modified")
-		if serverModTimeStr != "" {
-			parsedTime, err := time.Parse(http.TimeFormat, serverModTimeStr)
-			if err != nil {
-				logger.Warningf("Failed to parse Last-Modified header for %s: %v", url, err)
-			} else {
-				serverModTime = parsedTime
-			}
-		}
-
-		// Function to update local file's modification time
-		updateFileModTime := func() {
-			if !serverModTime.IsZero() {
-				if err := os.Chtimes(destPath, serverModTime, serverModTime); err != nil {
-					logger.Warningf("Failed to update modification time for %s: %v", destPath, err)
-				}
-			}
-		}
-
-		// Handle 304 Not Modified
-		if resp.StatusCode == http.StatusNotModified {
-			updateFileModTime()
-			return nil
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return common.NewErrorf("Failed to download Geofile from %s: received status code %d", url, resp.StatusCode)
-		}
-
-		file, err := os.Create(destPath)
-		if err != nil {
-			return common.NewErrorf("Failed to create Geofile %s: %v", destPath, err)
-		}
-		defer file.Close()
-
-		_, err = io.Copy(file, resp.Body)
-		if err != nil {
-			return common.NewErrorf("Failed to save Geofile %s: %v", destPath, err)
-		}
-
-		updateFileModTime()
-		return nil
-	}
-
 	var errorMessages []string
 
 	if fileName == "" {
 		// Download all geofiles
 		for _, entry := range geofileAllowlist {
 			destPath := filepath.Join(config.GetBinFolderPath(), entry.FileName)
-			if err := downloadFile(entry.URL, destPath); err != nil {
+			if err := downloadGeofile(entry.URL, destPath); err != nil {
 				errorMessages = append(errorMessages, fmt.Sprintf("Error downloading Geofile '%s': %v", entry.FileName, err))
 			}
 		}
 	} else {
 		entry := geofileAllowlist[fileName]
 		destPath := filepath.Join(config.GetBinFolderPath(), entry.FileName)
-		if err := downloadFile(entry.URL, destPath); err != nil {
+		if err := downloadGeofile(entry.URL, destPath); err != nil {
 			errorMessages = append(errorMessages, fmt.Sprintf("Error downloading Geofile '%s': %v", entry.FileName, err))
 		}
 	}

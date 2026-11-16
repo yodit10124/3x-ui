@@ -402,6 +402,27 @@ func TestHubStopWaitsForPumps(t *testing.T) {
 	}
 }
 
+// TestHubCloseAllClients: CloseAllClients closes every connection
+// at once, e.g. on a database import that invalidates all sessions.
+func TestHubCloseAllClients(t *testing.T) {
+	initTestLogger(t)
+	h := NewHub()
+	h.Start()
+	defer h.Stop()
+
+	a := NewClient("a", "session-a", 1)
+	b := NewClient("b", "session-b", 2)
+	h.Register(a)
+	h.Register(b)
+	waitForCount(t, h, 2, 5*time.Second)
+
+	h.CloseAllClients()
+	waitForCount(t, h, 0, 5*time.Second)
+	if !sendClosed(a) || !sendClosed(b) {
+		t.Fatal("clients not closed by CloseAllClients")
+	}
+}
+
 func TestHubRegisterThenUnregisterImmediately(t *testing.T) {
 	initTestLogger(t)
 	h := NewHub()

@@ -26,6 +26,9 @@ import (
 
 	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
+	"github.com/mhsanaei/3x-ui/v2/logger"
+
+	"github.com/op/go-logging"
 )
 
 // disableSSRFCheck disables the SSRF guard for the duration of a test,
@@ -895,5 +898,133 @@ func TestGeoMaxFileSizeBytesFallback(t *testing.T) {
 	}
 	if got := NewCustomGeoService().geoMaxFileSizeBytes(); got != want {
 		t.Fatalf("service without a database limit = %d, want %d", got, want)
+	}
+}
+
+// setupCustomGeoTestDB builds a throw-away panel database and points
+// the bin and log folders at temp directories.
+func setupCustomGeoTestDB(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("XUI_BIN_FOLDER", dir)
+	t.Setenv("XUI_LOG_FOLDER", dir)
+	logger.InitLogger(logging.ERROR)
+	if err := database.InitDB(filepath.Join(dir, "x-ui.db")); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+	t.Cleanup(func() { database.CloseDB() })
+}
+
+// TestCustomGeoUpdateDownloadFailureKeepsOldFile: when an update
+// changes the local path and the new download fails, the old file and
+// the old database record must stay untouched — deleting the old file
+// before downloading would leave Xray pointing at a missing .dat.
+func TestCustomGeoUpdateDownloadFailureKeepsOldFile(t *testing.T) {
+	disableSSRFCheck(t)
+	setupCustomGeoTestDB(t)
+	s := NewCustomGeoService()
+
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, minDatBytes+1))
+	}))
+	defer good.Close()
+	r := &model.CustomGeoResource{Type: "geoip", Alias: "keep", Url: good.URL}
+	if err := s.Create(r); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	var cur model.CustomGeoResource
+	if err := database.GetDB().First(&cur, r.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldContent, err := os.ReadFile(cur.LocalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer bad.Close()
+	// Change the alias (new local path) and point at the failing source.
+	upd := &model.CustomGeoResource{Type: "geoip", Alias: "keep2", Url: bad.URL}
+	if err := s.Update(cur.Id, upd); err == nil {
+		t.Fatal("Update with a failing download should return an error")
+	}
+	if got, err := os.ReadFile(cur.LocalPath); err != nil || !bytes.Equal(got, oldContent) {
+		t.Fatalf("old file lost or changed after failed update: %v", err)
+	}
+	var after model.CustomGeoResource
+	if err := database.GetDB().First(&after, cur.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Alias != "keep" || after.Url != good.URL || after.LocalPath != cur.LocalPath {
+		t.Fatalf("record changed after failed update: %+v", after)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(cur.LocalPath), s.fileNameFor("geoip", "keep2"))); !os.IsNotExist(err) {
+		t.Fatalf("new-path file exists after failed update: %v", err)
+	}
+}
+
+// TestCustomGeoUpdateURLChangeForcesFullDownload: when the source URL
+// changes, the old source's Last-Modified must not be sent to the new
+// source — a 304 there would keep the old source's data while the
+// record is updated to the new URL.
+func TestCustomGeoUpdateURLChangeForcesFullDownload(t *testing.T) {
+	disableSSRFCheck(t)
+	setupCustomGeoTestDB(t)
+	s := NewCustomGeoService()
+
+	oldLM := "Wed, 21 Oct 2015 07:28:00 GMT"
+	newLM := "Wed, 21 Oct 2020 07:28:00 GMT"
+	contentA := bytes.Repeat([]byte("A"), minDatBytes+1)
+	contentB := bytes.Repeat([]byte("B"), minDatBytes+1)
+	serverA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Last-Modified", oldLM)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(contentA)
+	}))
+	defer serverA.Close()
+	serverB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-Modified-Since") != "" {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Last-Modified", newLM)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(contentB)
+	}))
+	defer serverB.Close()
+
+	r := &model.CustomGeoResource{Type: "geoip", Alias: "src", Url: serverA.URL}
+	if err := s.Create(r); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	var cur model.CustomGeoResource
+	if err := database.GetDB().First(&cur, r.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(cur.LocalPath); err != nil || !bytes.Equal(got, contentA) {
+		t.Fatalf("initial file is not source A content: %v", err)
+	}
+
+	// Same alias (same path), new URL: the update must download
+	// source B in full instead of sending source A's Last-Modified.
+	upd := &model.CustomGeoResource{Type: "geoip", Alias: "src", Url: serverB.URL}
+	if err := s.Update(cur.Id, upd); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got, err := os.ReadFile(cur.LocalPath); err != nil || !bytes.Equal(got, contentB) {
+		t.Fatalf("file after URL change is not source B content")
+	}
+	var after model.CustomGeoResource
+	if err := database.GetDB().First(&after, cur.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Url != serverB.URL {
+		t.Fatalf("record URL %q, want %q", after.Url, serverB.URL)
+	}
+	if after.LastModified != newLM {
+		t.Fatalf("record Last-Modified %q, want %q", after.LastModified, newLM)
 	}
 }

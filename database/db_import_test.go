@@ -2,9 +2,13 @@ package database
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/mhsanaei/3x-ui/v2/database/model"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -40,9 +44,87 @@ func makeImportDB(t *testing.T, xrayTemplate string) string {
 	return path
 }
 
-// H1 / CVE-2026-55477: a database import whose xrayTemplateConfig points
-// log.access / log.error outside the panel log folder must be rejected
-// before the imported database replaces the live one.
+// A backup must never resurrect logged-out sessions: purging the
+// candidate file removes every login_sessions row while leaving all
+// other tables untouched. A file without the table (an old-version
+// backup) is a no-op, and purging twice is safe.
+func TestPurgeLoginSessionsFromFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "purge.db")
+	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.User{}, &model.LoginSession{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.User{Username: "admin", Password: "hash"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"aaa", "bbb"} {
+		sum := sha256.Sum256([]byte("session-" + id))
+		row := model.LoginSession{
+			Id:           hex.EncodeToString(sum[:]),
+			UserId:       1,
+			Username:     "admin",
+			PasswordHash: "hash",
+			ExpiresAt:    time.Now().Add(time.Hour),
+		}
+		if err := db.Create(&row).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := PurgeLoginSessionsFromFile(path); err != nil {
+		t.Fatalf("PurgeLoginSessionsFromFile: %v", err)
+	}
+	if err := PurgeLoginSessionsFromFile(path); err != nil {
+		t.Fatalf("second purge: %v", err)
+	}
+	check, err := gorm.Open(sqlite.Open(path), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		sdb, _ := check.DB()
+		if sdb != nil {
+			_ = sdb.Close()
+		}
+	}()
+	var sessions int64
+	if err := check.Model(&model.LoginSession{}).Count(&sessions).Error; err != nil {
+		t.Fatal(err)
+	}
+	if sessions != 0 {
+		t.Fatalf("login_sessions rows %d, want 0 after purge", sessions)
+	}
+	var users int64
+	if err := check.Model(&model.User{}).Count(&users).Error; err != nil {
+		t.Fatal(err)
+	}
+	if users != 1 {
+		t.Fatalf("users rows %d, want 1 (purge must not touch other tables)", users)
+	}
+}
+
+// A file without a login_sessions table (an old-version backup) must
+// purge cleanly instead of failing the import.
+func TestPurgeLoginSessionsFromFileNoTable(t *testing.T) {
+	path := makeImportDB(t, "")
+	if err := PurgeLoginSessionsFromFile(path); err != nil {
+		t.Fatalf("PurgeLoginSessionsFromFile on a file without the table: %v", err)
+	}
+}
 func TestValidateImportedXrayConfig(t *testing.T) {
 	logDir := t.TempDir()
 	t.Setenv("XUI_LOG_FOLDER", logDir)
