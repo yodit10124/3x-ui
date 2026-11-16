@@ -312,6 +312,118 @@ func TestSelfSignedCertFixtureLoads(t *testing.T) {
 	}
 }
 
+// getServerStatus calls the protected server-status API with the given
+// cookies, the way the panel frontend does. Authenticated it answers
+// 200; without a valid session checkAPIAuth answers 404 to hide the
+// endpoint.
+func getServerStatus(t *testing.T, engine *gin.Engine, cookies []*http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/server/status", nil)
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	return rec
+}
+
+// logout posts to /logout with the given cookies and expects the
+// 307 redirect to the login page.
+func logout(t *testing.T, engine *gin.Engine, cookies []*http.Cookie) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("logout: status %d, want 307", rec.Code)
+	}
+}
+
+// TestLogoutRevokesSession is the auditor's scenario: log in, confirm
+// the protected API answers, log out, then replay the pre-logout cookie.
+// Logout must revoke the session server-side — clearing the browser
+// cookie alone cannot stop a stolen copy — so the replay is refused.
+func TestLogoutRevokesSession(t *testing.T) {
+	engine := setupSecureCookieEngine(t, nil)
+	cookies := loginAsAdmin(t, engine)
+	if rec := getServerStatus(t, engine, cookies); rec.Code != http.StatusOK {
+		t.Fatalf("status before logout: %d, want 200", rec.Code)
+	}
+	logout(t, engine, cookies)
+	if rec := getServerStatus(t, engine, cookies); rec.Code != http.StatusNotFound {
+		t.Fatalf("status after logout with replayed cookie: %d, want 404", rec.Code)
+	}
+}
+
+// TestLogoutKeepsOtherSessions: logout revokes only the current session.
+// Product policy: another browser (or tab) logged in as the same user
+// keeps working until it logs out itself or the password changes.
+func TestLogoutKeepsOtherSessions(t *testing.T) {
+	engine := setupSecureCookieEngine(t, nil)
+	first := loginAsAdmin(t, engine)
+	second := loginAsAdmin(t, engine)
+	if sessionCookie(t, first).Value == sessionCookie(t, second).Value {
+		t.Fatal("two logins produced identical session cookies, want distinct sessions")
+	}
+	logout(t, engine, first)
+	if rec := getServerStatus(t, engine, first); rec.Code != http.StatusNotFound {
+		t.Fatalf("logged-out session still works: status %d, want 404", rec.Code)
+	}
+	if rec := getServerStatus(t, engine, second); rec.Code != http.StatusOK {
+		t.Fatalf("other session after logout: status %d, want 200", rec.Code)
+	}
+}
+
+// TestPasswordChangeRevokesOtherSessions: changing the password ends
+// every other session at once. The browser that changed the password
+// gets a fresh session and keeps working.
+func TestPasswordChangeRevokesOtherSessions(t *testing.T) {
+	engine := setupSecureCookieEngine(t, nil)
+	current := loginAsAdmin(t, engine)
+	other := loginAsAdmin(t, engine)
+
+	body := strings.NewReader(`{"oldUsername":"admin","oldPassword":"admin","newUsername":"admin","newPassword":"newpass123"}`)
+	req := httptest.NewRequest(http.MethodPost, "/panel/setting/updateUser", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	for _, c := range current {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"success":true`) {
+		t.Fatalf("updateUser: status %d, body %s", rec.Code, rec.Body.String())
+	}
+	// The password change refreshes the current browser's session: the
+	// response carries a new cookie, which must keep working.
+	refreshed := rec.Result().Cookies()
+	if len(refreshed) == 0 {
+		t.Fatal("updateUser: no Set-Cookie in response")
+	}
+	if r := getServerStatus(t, engine, refreshed); r.Code != http.StatusOK {
+		t.Fatalf("current session after password change: status %d, want 200", r.Code)
+	}
+	// The other session is revoked.
+	if r := getServerStatus(t, engine, other); r.Code != http.StatusNotFound {
+		t.Fatalf("other session after password change: status %d, want 404", r.Code)
+	}
+	// And the new password logs in.
+	body = strings.NewReader(`{"username":"admin","password":"newpass123"}`)
+	req = httptest.NewRequest(http.MethodPost, "/login", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	rec = httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login with new password: status %d, body %s", rec.Code, rec.Body.String())
+	}
+}
+
 // startPanelBehindProxy fronts the real panel router with a reverse proxy
 // that preserves the external Host, like a production TLS-terminating
 // proxy (nginx proxy_set_header Host $http_host, or ProxyPreserveHost).

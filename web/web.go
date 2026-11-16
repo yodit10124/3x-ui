@@ -258,6 +258,9 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	session.SetSecureCookie(https)
 	if sessionMaxAge, err := s.settingService.GetSessionMaxAge(); err == nil && sessionMaxAge > 0 {
 		sessionOptions.MaxAge = sessionMaxAge * 60 // minutes -> seconds
+		// The server-side session rows expire with the cookie, so a
+		// stolen cookie cannot outlive the lifetime the operator set.
+		session.SetSessionMaxAge(sessionMaxAge)
 	}
 	store.Options(sessionOptions)
 	engine.Use(sessions.Sessions("3x-ui", store))

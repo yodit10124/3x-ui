@@ -102,17 +102,22 @@ func (s *UserService) CheckUser(username string, password string, twoFactorCode 
 	return user, nil
 }
 
-func (s *UserService) UpdateUser(id int, username string, password string) error {
+// UpdateUser updates the username and password of a user and returns the
+// bcrypt hash it stored, so the caller can refresh the current session
+// with the exact hash GetLoginUser compares against. A freshly computed
+// hash of the same password has a different salt and would fail that
+// string comparison, logging the user out right after the change.
+func (s *UserService) UpdateUser(id int, username string, password string) (string, error) {
 	db := database.GetDB()
 	hashedPassword, err := crypto.HashPasswordAsBcrypt(password)
 
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	twoFactorEnable, err := s.settingService.GetTwoFactorEnable()
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if twoFactorEnable {
@@ -124,12 +129,15 @@ func (s *UserService) UpdateUser(id int, username string, password string) error
 		Where("id = ?", id).
 		Updates(map[string]any{"username": username, "password": hashedPassword}).
 		Error; err != nil {
-		return err
+		return "", err
 	}
 	// M1: rotate the cookie-signing secret so old session cookies stop
 	// validating after the next restart (session revalidation in
 	// web/session/session.go invalidates them immediately).
-	return s.settingService.RotateSecret()
+	if err := s.settingService.RotateSecret(); err != nil {
+		return "", err
+	}
+	return hashedPassword, nil
 }
 
 func (s *UserService) UpdateFirstUser(username string, password string) error {

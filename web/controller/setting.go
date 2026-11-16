@@ -4,6 +4,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/util/crypto"
 	"github.com/mhsanaei/3x-ui/v2/web/entity"
 	"github.com/mhsanaei/3x-ui/v2/web/service"
@@ -95,10 +96,23 @@ func (a *SettingController) updateUser(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifyUserError"), errors.New(I18nWeb(c, "pages.settings.toasts.userPassMustBeNotEmpty")))
 		return
 	}
-	err = a.userService.UpdateUser(user.Id, form.NewUsername, form.NewPassword)
+	hashedPassword, err := a.userService.UpdateUser(user.Id, form.NewUsername, form.NewPassword)
 	if err == nil {
+		// A password change ends every other session: revoke all
+		// server-side rows first, then issue a fresh session for this
+		// browser below. (The password-hash check would reject the old
+		// sessions anyway; revoking the rows makes it immediate and
+		// cleans them up. A failed revoke only logs: the hash check
+		// still protects, and the password change itself must not be
+		// reported as failed.)
+		if revErr := session.RevokeAllSessions(user.Id); revErr != nil {
+			logger.Warning("Failed to revoke other sessions on password change:", revErr)
+		}
 		user.Username = form.NewUsername
-		user.Password, _ = crypto.HashPasswordAsBcrypt(form.NewPassword)
+		// Store the exact hash UpdateUser wrote to the database: a
+		// freshly computed hash of the same password has a different
+		// salt and would fail GetLoginUser's comparison.
+		user.Password = hashedPassword
 		if saveErr := session.SetLoginUser(c, user); saveErr != nil {
 			err = saveErr
 		}

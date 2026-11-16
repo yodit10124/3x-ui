@@ -3,6 +3,7 @@ package model
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/util/json_util"
 	"github.com/mhsanaei/3x-ui/v2/xray"
@@ -41,6 +42,22 @@ type User struct {
 	Id       int    `json:"id" gorm:"primaryKey;autoIncrement"`
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+// LoginSession is one revocable login session. Each login generates an
+// unpredictable random session ID; only its SHA-256 is stored here, so a
+// database dump alone yields no usable session cookie. Logout deletes
+// the row, so replaying the old cookie stops working even though the
+// cookie signature itself is still valid. A password change revokes all
+// rows of the user (the password-hash check in web/session would reject
+// them anyway); a plain logout revokes only the current session, other
+// sessions of the same user keep working.
+type LoginSession struct {
+	Id        string    `gorm:"primaryKey;size:64"`
+	UserId    int       `gorm:"index"`
+	Username  string    `gorm:"size:64"`
+	ExpiresAt time.Time `gorm:"index"`
+	CreatedAt time.Time
 }
 
 // Inbound represents an Xray inbound configuration with traffic statistics and settings.
