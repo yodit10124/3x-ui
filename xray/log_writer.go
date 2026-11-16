@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/mhsanaei/3x-ui/v2/logger"
 )
@@ -15,7 +16,24 @@ func NewLogWriter() *LogWriter {
 
 // LogWriter processes and filters log output from the Xray process, handling crash detection and message filtering.
 type LogWriter struct {
+	// mu guards lastLine: Write runs on the process's stdout/stderr
+	// goroutines while GetResult reads it from request goroutines.
+	mu       sync.RWMutex
 	lastLine string
+}
+
+// setLastLine records the latest log line.
+func (lw *LogWriter) setLastLine(s string) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	lw.lastLine = s
+}
+
+// LastLine returns the latest log line.
+func (lw *LogWriter) LastLine() string {
+	lw.mu.RLock()
+	defer lw.mu.RUnlock()
+	return lw.lastLine
 }
 
 // Write processes and filters log output from the Xray process, handling crash detection and message filtering.
@@ -34,7 +52,7 @@ func (lw *LogWriter) Write(m []byte) (n int, err error) {
 	// Check if the message contains a crash
 	if crashRegex.MatchString(message) {
 		logger.Debug("Core crash detected:\n", message)
-		lw.lastLine = message
+		lw.setLastLine(message)
 		err1 := writeCrashReport(m)
 		if err1 != nil {
 			logger.Error("Unable to write crash report:", err1)
@@ -56,7 +74,7 @@ func (lw *LogWriter) Write(m []byte) (n int, err error) {
 			if strings.Contains(msgBodyLower, "tls handshake error") ||
 				strings.Contains(msgBodyLower, "connection ends") {
 				logger.Debug("XRAY: " + msgBody)
-				lw.lastLine = ""
+				lw.setLastLine("")
 				continue
 			}
 
@@ -76,14 +94,14 @@ func (lw *LogWriter) Write(m []byte) (n int, err error) {
 					logger.Debug("XRAY: " + msg)
 				}
 			}
-			lw.lastLine = ""
+			lw.setLastLine("")
 		} else if msg != "" {
 			msgLower := strings.ToLower(msg)
 
 			if strings.Contains(msgLower, "tls handshake error") ||
 				strings.Contains(msgLower, "connection ends") {
 				logger.Debug("XRAY: " + msg)
-				lw.lastLine = msg
+				lw.setLastLine(msg)
 				continue
 			}
 
@@ -92,7 +110,7 @@ func (lw *LogWriter) Write(m []byte) (n int, err error) {
 			} else {
 				logger.Debug("XRAY: " + msg)
 			}
-			lw.lastLine = msg
+			lw.setLastLine(msg)
 		}
 	}
 

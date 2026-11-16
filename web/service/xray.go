@@ -3,8 +3,11 @@ package service
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/xray"
@@ -248,6 +251,57 @@ func (s *XrayService) RestartXray(isForce bool) error {
 	}
 
 	return nil
+}
+
+// WaitReady waits until the Xray process that is running now has
+// proven itself ready — still alive with its management API bound —
+// or the timeout elapses. cmd.Start() only proves the process was
+// created: a binary that exits on a bad config is discovered
+// asynchronously by Wait(), so a caller that deletes the old binary
+// backup as soon as Start succeeds can report success for an update
+// that never actually ran. The process pointer is captured once so
+// the polling loop never races a concurrent restart for the global.
+func (s *XrayService) WaitReady(timeout time.Duration) error {
+	proc := p
+	if proc == nil {
+		return errors.New("xray is not running")
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if !proc.IsRunning() {
+			if err := proc.GetErr(); err != nil {
+				return fmt.Errorf("xray exited during startup: %w", err)
+			}
+			return errors.New("xray exited during startup")
+		}
+		if s.isAPIReady(proc) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("xray did not become ready within %v", timeout)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// isAPIReady reports whether the process's management API is
+// listening. The api inbound binds only after the configuration
+// loaded successfully, so a TCP connect proves the process got past
+// initialisation. A gRPC call is not needed here: the client is
+// lazy, and the dial itself is the readiness signal. When the
+// configuration has no api inbound, process liveness is the only
+// signal available.
+func (s *XrayService) isAPIReady(proc *xray.Process) bool {
+	port := proc.GetAPIPort()
+	if port <= 0 {
+		return true
+	}
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 // StopXray stops the running Xray process.

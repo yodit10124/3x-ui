@@ -298,7 +298,13 @@ func isValidFilename(filename string) bool {
 	return filenameRegex.MatchString(filename)
 }
 
-// importDB imports a database file and restarts the Xray service.
+// importDB imports a database file. Xray's running state is managed
+// by the restore flow itself (ImportDB stops it before the swap,
+// restarts it on success, and restores it on failure), so the
+// controller must not restart it unconditionally here: that would
+// also restart Xray after a failed import that just rolled the
+// original database back, and start it even when it was stopped
+// before the import.
 func (a *ServerController) importDB(c *gin.Context) {
 	// Get the file from the request body
 	file, _, err := c.Request.FormFile("db")
@@ -307,8 +313,6 @@ func (a *ServerController) importDB(c *gin.Context) {
 		return
 	}
 	defer file.Close()
-	// Always restart Xray before return
-	defer a.serverService.RestartXrayService()
 	// lastGetStatusTime removed; no longer needed
 	// Import it
 	err = a.serverService.ImportDB(file)

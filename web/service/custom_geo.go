@@ -597,6 +597,54 @@ func removeSafePathIfExists(path string) error {
 	return nil
 }
 
+// backupGeoFile copies the file at destPath to destPath+".bak" (same
+// directory) so a failed commit can restore the previous content.
+// It returns the backup path, or "" when no file existed to back
+// up. The copy leaves the original in place, so the conditional
+// download (If-Modified-Since from the file mtime) keeps working
+// exactly as before.
+func backupGeoFile(destPath string) (string, error) {
+	if _, err := os.Stat(destPath); err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	backupPath := destPath + ".bak"
+	data, err := os.ReadFile(destPath)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(backupPath, data, 0644); err != nil {
+		return "", err
+	}
+	return backupPath, nil
+}
+
+// rollbackGeoFile undoes a download the database refused: it
+// restores the backed-up content when one was kept, or removes the
+// just-downloaded file when the destination was empty before.
+func rollbackGeoFile(backupPath, destPath string) {
+	if backupPath == "" {
+		_ = removeSafePathIfExists(destPath)
+		return
+	}
+	if err := os.Rename(backupPath, destPath); err != nil {
+		logger.Errorf("custom geo rollback: failed to restore %s from backup: %v", destPath, err)
+	}
+}
+
+// discardGeoFileBackup removes a backup that is no longer needed
+// (the commit succeeded). Failures are only logged.
+func discardGeoFileBackup(backupPath string) {
+	if backupPath == "" {
+		return
+	}
+	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
+		logger.Warningf("custom geo remove backup %s: %v", backupPath, err)
+	}
+}
+
 func (s *CustomGeoService) Create(r *model.CustomGeoResource) error {
 	if err := s.validateType(r.Type); err != nil {
 		return err
@@ -618,17 +666,27 @@ func (s *CustomGeoService) Create(r *model.CustomGeoResource) error {
 	if err := s.syncAndSanitizeLocalPath(r); err != nil {
 		return err
 	}
+	// Back up any file already at the destination before the
+	// download replaces it, so a failed database insert restores
+	// the old content instead of deleting a file the record never
+	// owned.
+	backupPath, err := backupGeoFile(r.LocalPath)
+	if err != nil {
+		return err
+	}
 	skipped, lm, err := s.downloadToPath(r.Url, r.LocalPath, r.LastModified)
 	if err != nil {
+		discardGeoFileBackup(backupPath)
 		return err
 	}
 	now := time.Now().Unix()
 	r.LastUpdatedAt = now
 	r.LastModified = lm
 	if err = database.GetDB().Create(r).Error; err != nil {
-		_ = removeSafePathIfExists(r.LocalPath)
+		rollbackGeoFile(backupPath, r.LocalPath)
 		return err
 	}
+	discardGeoFileBackup(backupPath)
 	logger.Infof("custom geo created id=%d type=%s alias=%s skipped=%v", r.Id, r.Type, r.Alias, skipped)
 	if err = s.serverService.RestartXrayService(); err != nil {
 		logger.Warning("custom geo create: restart xray:", err)
@@ -669,14 +727,23 @@ func (s *CustomGeoService) Update(id int, r *model.CustomGeoResource) error {
 	if err := s.syncAndSanitizeLocalPath(r); err != nil {
 		return err
 	}
-	// Download first, commit last. The old file is deleted only after
-	// the download AND the database update succeed: if the new source
+	// Download first, commit last. Before the download, back up
+	// whatever file already sits at the destination: if the
+	// database update fails after the file was replaced, the old
+	// content is restored instead of leaving the file and the
+	// record inconsistent (the new content under the old URL and
+	// Last-Modified). The old file is deleted only after the
+	// download AND the database update succeed: if the new source
 	// answers 404, is oversized, or the network drops, the old file
 	// and the old record stay untouched, so Xray keeps working.
 	// When the source URL changed, the old source's Last-Modified
 	// must not be sent to the new source: a 304 there would keep the
 	// old source's data while the record is updated to the new URL.
 	// Force a full download in that case.
+	backupPath, err := backupGeoFile(r.LocalPath)
+	if err != nil {
+		return err
+	}
 	var lm string
 	if r.Url != cur.Url {
 		_, lm, err = s.downloadToPathFull(r.Url, r.LocalPath)
@@ -684,6 +751,9 @@ func (s *CustomGeoService) Update(id int, r *model.CustomGeoResource) error {
 		_, lm, err = s.downloadToPath(r.Url, r.LocalPath, cur.LastModified)
 	}
 	if err != nil {
+		// The download failed before replacing anything; the
+		// backup is a redundant copy now.
+		discardGeoFileBackup(backupPath)
 		return err
 	}
 	r.LastUpdatedAt = time.Now().Unix()
@@ -697,14 +767,10 @@ func (s *CustomGeoService) Update(id int, r *model.CustomGeoResource) error {
 		"last_modified":   r.LastModified,
 	}).Error
 	if err != nil {
-		// The new file was just downloaded to a path the database
-		// does not reference; remove it so a failed update leaves no
-		// orphan behind. The old file is untouched.
-		if r.LocalPath != oldPath {
-			_ = removeSafePathIfExists(r.LocalPath)
-		}
+		rollbackGeoFile(backupPath, r.LocalPath)
 		return err
 	}
+	discardGeoFileBackup(backupPath)
 	// Only now, with the download and the record committed, remove
 	// the old file when the path changed.
 	if oldPath != r.LocalPath && oldPath != "" {
@@ -769,8 +835,16 @@ func (s *CustomGeoService) applyDownloadAndPersist(id int, onStartup bool) (disp
 	if sanitizeErr != nil {
 		return displayName, sanitizeErr
 	}
+	// Back up the current file before the download replaces it, so
+	// a failed metadata update restores the old content instead of
+	// leaving the file and the record inconsistent.
+	backupPath, err := backupGeoFile(r.LocalPath)
+	if err != nil {
+		return displayName, err
+	}
 	skipped, lm, err := s.downloadToPath(sanitizedURL, r.LocalPath, r.LastModified)
 	if err != nil {
+		discardGeoFileBackup(backupPath)
 		if onStartup {
 			logger.Warningf("custom geo startup download id=%d: %v", id, err)
 		} else {
@@ -785,6 +859,7 @@ func (s *CustomGeoService) applyDownloadAndPersist(id int, onStartup bool) (disp
 		"last_updated_at": now,
 	}
 	if err = database.GetDB().Model(&model.CustomGeoResource{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+		rollbackGeoFile(backupPath, r.LocalPath)
 		if onStartup {
 			logger.Warningf("custom geo startup id=%d: persist metadata: %v", id, err)
 		} else {
@@ -792,6 +867,7 @@ func (s *CustomGeoService) applyDownloadAndPersist(id int, onStartup bool) (disp
 		}
 		return displayName, err
 	}
+	discardGeoFileBackup(backupPath)
 	if skipped {
 		if onStartup {
 			logger.Infof("custom geo startup download skipped (not modified) id=%d", id)

@@ -1028,3 +1028,57 @@ func TestCustomGeoUpdateURLChangeForcesFullDownload(t *testing.T) {
 		t.Fatalf("record Last-Modified %q, want %q", after.LastModified, newLM)
 	}
 }
+
+// TestCustomGeoUpdateDBFailureRestoresOldFile: when the metadata
+// update fails after the file was replaced, the old content must
+// come back instead of leaving the file and the record inconsistent
+// (new content under the old URL and Last-Modified).
+func TestCustomGeoUpdateDBFailureRestoresOldFile(t *testing.T) {
+	disableSSRFCheck(t)
+	setupCustomGeoTestDB(t)
+	s := NewCustomGeoService()
+
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, minDatBytes+1))
+	}))
+	defer good.Close()
+	r := &model.CustomGeoResource{Type: "geoip", Alias: "keep", Url: good.URL}
+	if err := s.Create(r); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	var cur model.CustomGeoResource
+	if err := database.GetDB().First(&cur, r.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldContent, err := os.ReadFile(cur.LocalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fail the metadata write only: a trigger that aborts every
+	// UPDATE on the resources table. The download still succeeds,
+	// so the rollback path is the only thing standing between the
+	// new file content and the old record.
+	if err := database.GetDB().Exec("CREATE TRIGGER fail_update BEFORE UPDATE ON custom_geo_resources BEGIN SELECT RAISE(ABORT, 'forced db failure'); END").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	upd := &model.CustomGeoResource{Type: "geoip", Alias: "keep", Url: good.URL}
+	if err := s.Update(cur.Id, upd); err == nil {
+		t.Fatal("Update should fail when the metadata write fails")
+	}
+	if got, err := os.ReadFile(cur.LocalPath); err != nil || !bytes.Equal(got, oldContent) {
+		t.Fatalf("old file not restored after failed metadata update: %q, %v", got, err)
+	}
+	var after model.CustomGeoResource
+	if err := database.GetDB().First(&after, cur.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Url != good.URL || after.LocalPath != cur.LocalPath {
+		t.Fatalf("record changed after failed update: %+v", after)
+	}
+	if _, err := os.Stat(cur.LocalPath + ".bak"); !os.IsNotExist(err) {
+		t.Fatalf("backup left behind after rollback: %v", err)
+	}
+}

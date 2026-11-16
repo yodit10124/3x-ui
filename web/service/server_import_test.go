@@ -264,7 +264,7 @@ func TestRollbackImportRestoresOriginal(t *testing.T) {
 		t.Fatalf("open candidate db: %v", err)
 	}
 
-	(&ServerService{}).rollbackImport(fallbackPath, false)
+	(&ServerService{}).rollbackImport(fallbackPath, false, true)
 
 	if _, err := os.Stat(fallbackPath); !os.IsNotExist(err) {
 		t.Fatalf("fallback file still present after rollback: %v", err)
@@ -275,5 +275,88 @@ func TestRollbackImportRestoresOriginal(t *testing.T) {
 	}
 	if admin.Password != "marker-pw" {
 		t.Fatalf("admin password %q after rollback, want the original %q", admin.Password, "marker-pw")
+	}
+}
+
+// TestRollbackImportWithoutBackup: a failure before the backup move
+// (removing a stale fallback, or the backup rename itself) leaves
+// the original database in place with its handle closed. The
+// rollback must reopen it instead of looking for a fallback file
+// that was never created — and must never rename a stale fallback
+// over the live database.
+func TestRollbackImportWithoutBackup(t *testing.T) {
+	dbPath := setupImportTestEnv(t, false)
+	if err := database.GetDB().Model(&model.User{}).Where("id = ?", 1).Update("password", "marker-pw").Error; err != nil {
+		t.Fatal(err)
+	}
+	// A stale fallback left behind by an earlier failed import: it
+	// must survive the rollback untouched, never restored over the
+	// live database.
+	fallbackPath := dbPath + ".backup"
+	stale := []byte("stale fallback, not the live database")
+	if err := os.WriteFile(fallbackPath, stale, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CloseDB(); err != nil {
+		t.Fatal(err)
+	}
+
+	(&ServerService{}).rollbackImport(fallbackPath, false, false)
+
+	if got, err := os.ReadFile(fallbackPath); err != nil || string(got) != string(stale) {
+		t.Fatalf("stale fallback changed by rollback: %q, err %v", got, err)
+	}
+	var admin model.User
+	if err := database.GetDB().First(&admin, 1).Error; err != nil {
+		t.Fatalf("live db unusable after rollback: %v", err)
+	}
+	if admin.Password != "marker-pw" {
+		t.Fatalf("admin password %q after rollback, want the original %q", admin.Password, "marker-pw")
+	}
+}
+
+// TestImportDBConcurrentImports: two imports racing each other must
+// not interleave the file swap. With the import mutex both run to
+// completion in some order; the live database afterwards is one of
+// the two candidates and stays usable.
+func TestImportDBConcurrentImports(t *testing.T) {
+	dbPath := setupImportTestEnv(t, true)
+
+	buildCandidate := func(marker string) string {
+		candidatePath := filepath.Join(t.TempDir(), "candidate.db")
+		copyImportTestFile(t, dbPath, candidatePath)
+		cand := openImportTestCandidate(t, candidatePath)
+		if err := cand.Model(&model.User{}).Where("id = ?", 1).Update("username", marker).Error; err != nil {
+			t.Fatal(err)
+		}
+		closeImportTestCandidate(t, cand)
+		return candidatePath
+	}
+	pathA := buildCandidate("import-a")
+	pathB := buildCandidate("import-b")
+
+	open := func(path string) *os.File {
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	errs := make(chan error, 2)
+	go func() { f := open(pathA); defer f.Close(); errs <- (&ServerService{}).ImportDB(f) }()
+	go func() { f := open(pathB); defer f.Close(); errs <- (&ServerService{}).ImportDB(f) }()
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent import failed: %v", err)
+		}
+	}
+
+	var admin model.User
+	if err := database.GetDB().First(&admin, 1).Error; err != nil {
+		t.Fatalf("live db unusable after concurrent imports: %v", err)
+	}
+	if admin.Username != "import-a" && admin.Username != "import-b" {
+		t.Fatalf("live db holds unexpected username %q after concurrent imports", admin.Username)
 	}
 }

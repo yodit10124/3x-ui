@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -152,7 +153,11 @@ type process struct {
 	configPath string // if set, use this path instead of GetConfigPath() and remove on Stop
 	logWriter  *LogWriter
 	exitErr    error
-	startTime  time.Time
+	// errMu guards exitErr: the Wait goroutine writes it when the
+	// process exits while GetErr/GetResult (and the readiness
+	// check) read it from other goroutines.
+	errMu     sync.RWMutex
+	startTime time.Time
 }
 
 // newProcess creates a new internal process struct for Xray.
@@ -180,17 +185,29 @@ func (p *process) IsRunning() bool {
 	return p.running.Load()
 }
 
+// setExitErr records the last process error.
+func (p *process) setExitErr(err error) {
+	p.errMu.Lock()
+	defer p.errMu.Unlock()
+	p.exitErr = err
+}
+
 // GetErr returns the last error encountered by the Xray process.
 func (p *process) GetErr() error {
+	p.errMu.RLock()
+	defer p.errMu.RUnlock()
 	return p.exitErr
 }
 
 // GetResult returns the last log line or error from the Xray process.
 func (p *process) GetResult() string {
-	if len(p.logWriter.lastLine) == 0 && p.exitErr != nil {
-		return p.exitErr.Error()
+	if line := p.logWriter.LastLine(); line != "" {
+		return line
 	}
-	return p.logWriter.lastLine
+	if err := p.GetErr(); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 // GetVersion returns the version string of the Xray process.
@@ -258,7 +275,7 @@ func (p *process) Start() (err error) {
 	defer func() {
 		if err != nil {
 			logger.Error("Failure in running xray-core process: ", err)
-			p.exitErr = err
+			p.setExitErr(err)
 		}
 	}()
 
@@ -290,8 +307,15 @@ func (p *process) Start() (err error) {
 	if p.configPath != "" {
 		configPath = p.configPath
 	}
-	err = os.WriteFile(configPath, data, 0644)
-	if err != nil {
+	// The config is written to a temporary file and renamed into
+	// place: a crash or disk failure mid-write must not leave a
+	// truncated config.json behind for the next start to load.
+	tmpPath := configPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return common.NewErrorf("Failed to write configuration file: %v", err)
+	}
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		_ = os.Remove(tmpPath)
 		return common.NewErrorf("Failed to write configuration file: %v", err)
 	}
 
@@ -320,12 +344,12 @@ func (p *process) Start() (err error) {
 				errStr := strings.ToLower(err.Error())
 				if strings.Contains(errStr, "exit status 1") {
 					// Suppress noisy log on graceful stop
-					p.exitErr = err
+					p.setExitErr(err)
 					return
 				}
 			}
 			logger.Error("Failure in running xray-core:", err)
-			p.exitErr = err
+			p.setExitErr(err)
 		}
 	}()
 
