@@ -199,7 +199,8 @@ func (w *WebSocketController) checkOrigin(r *http.Request) bool {
 
 // HandleWebSocket upgrades the HTTP connection and starts the read/write pumps.
 func (w *WebSocketController) HandleWebSocket(c *gin.Context) {
-	if !session.IsLogin(c) {
+	user := session.GetLoginUser(c)
+	if user == nil {
 		logger.Warningf("Unauthorized WebSocket connection attempt from %s", getRemoteIp(c))
 		c.AbortWithStatus(http.StatusUnauthorized)
 		return
@@ -211,7 +212,11 @@ func (w *WebSocketController) HandleWebSocket(c *gin.Context) {
 		return
 	}
 
-	client := websocket.NewClient(uuid.New().String())
+	// Bind the connection to the login session that established it:
+	// when that session is revoked (logout, password change, expiry)
+	// the hub can close exactly this connection. A logged-out cookie
+	// fails GetLoginUser above, so it cannot reconnect either.
+	client := websocket.NewClient(uuid.New().String(), session.GetSessionID(c), user.Id)
 	w.hub.Register(client)
 	logger.Debugf("WebSocket client %s registered from %s", client.ID, getRemoteIp(c))
 

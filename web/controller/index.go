@@ -10,6 +10,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/web/service"
 	"github.com/mhsanaei/3x-ui/v2/web/session"
+	"github.com/mhsanaei/3x-ui/v2/web/websocket"
 
 	"github.com/gin-gonic/gin"
 )
@@ -195,11 +196,22 @@ func (a *IndexController) login(c *gin.Context) {
 // logout handles user logout by clearing the session and redirecting to the login page.
 func (a *IndexController) logout(c *gin.Context) {
 	user := session.GetLoginUser(c)
+	sessionID := session.GetSessionID(c)
 	if user != nil {
 		logger.Infof("%s logged out successfully", user.Username)
 	}
 	if err := session.ClearSession(c); err != nil {
 		logger.Warning("Unable to clear session on logout:", err)
+	}
+	// The HTTP cookie is dead, but an already-established WebSocket
+	// would otherwise keep receiving panel pushes. Close this
+	// session's connections now; other sessions of the same user are
+	// untouched. (The hub is reached through the global server the
+	// same way the broadcast notifier reaches it.)
+	if sessionID != "" {
+		if hub := websocket.GetHub(); hub != nil {
+			hub.CloseSessionClients(sessionID)
+		}
 	}
 	c.Redirect(http.StatusTemporaryRedirect, c.GetString("base_path"))
 }

@@ -315,6 +315,11 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	engine.Use(middleware.RedirectMiddleware(basePath))
 
 	g := engine.Group(basePath)
+	// Login, logout, management pages and sensitive APIs must never
+	// be cached by browsers or intermediate proxies (see
+	// middleware.NoStoreMiddleware). Static assets are served outside
+	// this group and keep their own caching.
+	g.Use(middleware.NoStoreMiddleware())
 
 	s.index = controller.NewIndexController(g)
 	s.panel = controller.NewXUIController(g)
@@ -322,6 +327,11 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 
 	// Initialize WebSocket hub
 	s.wsHub = websocket.NewHub()
+	// The hub sweeps live connections against their server-side
+	// sessions, so a connection outlives neither its login session
+	// (expiry) nor a password change or user deletion by more than one
+	// sweep interval. Logout closes its connections immediately instead.
+	s.wsHub.SetSessionValidator(session.ValidateSessionID)
 	go s.wsHub.Run()
 
 	// Initialize WebSocket controller

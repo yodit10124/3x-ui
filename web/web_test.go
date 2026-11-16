@@ -1,15 +1,18 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -25,8 +28,10 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/web/global"
 	"github.com/mhsanaei/3x-ui/v2/web/service"
+	panelws "github.com/mhsanaei/3x-ui/v2/web/websocket"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/securecookie"
 	"github.com/gorilla/websocket"
 	"github.com/op/go-logging"
 	"github.com/robfig/cron/v3"
@@ -34,13 +39,17 @@ import (
 
 // testWebServer is the minimal global.WebServer stub the API controller's
 // background status task needs (it registers a cron func at startup).
+// The hub is the real one initRouter builds, so websocket.GetHub() —
+// used by logout/password-change to close live connections — resolves
+// to the same hub the engine serves.
 type testWebServer struct {
 	cron *cron.Cron
+	hub  *panelws.Hub
 }
 
 func (w *testWebServer) GetCron() *cron.Cron     { return w.cron }
 func (w *testWebServer) GetCtx() context.Context { return context.Background() }
-func (w *testWebServer) GetWSHub() any           { return nil }
+func (w *testWebServer) GetWSHub() any           { return w.hub }
 
 func TestUseSecureCookie(t *testing.T) {
 	cases := []struct {
@@ -95,7 +104,8 @@ func setupSecureCookieEngine(t *testing.T, settings map[string]string) *gin.Engi
 
 	// The API controller starts a background status task against the
 	// global web server; give it a stub so initRouter does not panic.
-	global.SetWebServer(&testWebServer{cron: cron.New()})
+	stub := &testWebServer{cron: cron.New()}
+	global.SetWebServer(stub)
 	t.Cleanup(func() { global.SetWebServer(nil) })
 
 	srv := &Server{}
@@ -103,6 +113,9 @@ func setupSecureCookieEngine(t *testing.T, settings map[string]string) *gin.Engi
 	if err != nil {
 		t.Fatalf("initRouter: %v", err)
 	}
+	// Expose the real hub through the stub so websocket.GetHub()
+	// resolves to the hub this engine serves.
+	stub.hub = srv.wsHub
 	return engine
 }
 
@@ -330,6 +343,44 @@ func getServerStatus(t *testing.T, engine *gin.Engine, cookies []*http.Cookie) *
 
 // logout posts to /logout with the given cookies and expects the
 // 307 redirect to the login page.
+// TestSessionPasswordHashBackfill: a session row created before the
+// password-hash column existed (empty hash) self-heals on its first
+// authenticated request, so the WebSocket sweeper does not keep
+// dropping its connections after an upgrade.
+func TestSessionPasswordHashBackfill(t *testing.T) {
+	engine := setupSecureCookieEngine(t, nil)
+	cookies := loginAsAdmin(t, engine)
+
+	db := database.GetDB()
+	if err := db.Model(&model.LoginSession{}).Where("1 = 1").Update("password_hash", "").Error; err != nil {
+		t.Fatalf("clear password_hash: %v", err)
+	}
+	// The next authenticated request must still succeed (the cookie's
+	// hash is current) and backfill the row.
+	if rec := getServerStatus(t, engine, cookies); rec.Code != http.StatusOK {
+		t.Fatalf("status with pre-hash-column session: %d, want 200", rec.Code)
+	}
+	var rows []model.LoginSession
+	if err := db.Find(&rows).Error; err != nil {
+		t.Fatalf("read sessions: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("sessions %d, want 1", len(rows))
+	}
+	if rows[0].PasswordHash == "" {
+		t.Fatal("password_hash not backfilled")
+	}
+	// The backfilled hash must be the admin's current hash, so the
+	// WebSocket sweeper accepts the session.
+	var admin model.User
+	if err := db.Model(model.User{}).Where("username = ?", "admin").First(&admin).Error; err != nil {
+		t.Fatalf("read admin: %v", err)
+	}
+	if rows[0].PasswordHash != admin.Password {
+		t.Fatal("backfilled password_hash is not the current hash")
+	}
+}
+
 func logout(t *testing.T, engine *gin.Engine, cookies []*http.Cookie) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
@@ -421,6 +472,292 @@ func TestPasswordChangeRevokesOtherSessions(t *testing.T) {
 	engine.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("login with new password: status %d, body %s", rec.Code, rec.Body.String())
+	}
+}
+
+// decodeCookiePayload reverses the two base64 layers of a signed (not
+// encrypted) gorilla/securecookie value, the way anyone holding the
+// cookie can: the outer layer is base64("timestamp|base64(gob)|mac")
+// and the inner layer is the raw gob payload. No secret is needed —
+// the signature only proves the cookie was not tampered with, it never
+// hid its contents.
+func decodeCookiePayload(t *testing.T, value string) []byte {
+	t.Helper()
+	outer, err := base64.URLEncoding.DecodeString(value)
+	if err != nil {
+		t.Fatalf("decode cookie outer layer: %v", err)
+	}
+	parts := bytes.SplitN(outer, []byte("|"), 3)
+	if len(parts) != 3 {
+		t.Fatalf("cookie outer layer has %d parts, want 3", len(parts))
+	}
+	gob, err := base64.URLEncoding.DecodeString(string(parts[1]))
+	if err != nil {
+		t.Fatalf("decode cookie gob layer: %v", err)
+	}
+	return gob
+}
+
+// TestLoginCookieHoldsNoPasswordHash: the login cookie must hold only
+// the random session ID. Its decodable contents must not contain the
+// password, the bcrypt hash, or a user object.
+func TestLoginCookieHoldsNoPasswordHash(t *testing.T) {
+	engine := setupSecureCookieEngine(t, nil)
+	cookies := loginAsAdmin(t, engine)
+
+	var admin model.User
+	if err := database.GetDB().Where("username = ?", "admin").First(&admin).Error; err != nil {
+		t.Fatalf("read admin: %v", err)
+	}
+	var payload []byte
+	for _, c := range cookies {
+		payload = append(payload, decodeCookiePayload(t, c.Value)...)
+	}
+	if bytes.Contains(payload, []byte(admin.Password)) {
+		t.Fatal("login cookie decodes to the bcrypt password hash")
+	}
+	if bytes.Contains(payload, []byte("LOGIN_USER")) {
+		t.Fatal("login cookie decodes to a user object (LOGIN_USER)")
+	}
+	if bytes.Contains(payload, []byte("Password")) {
+		t.Fatal("login cookie decodes to a password field")
+	}
+	if bytes.Contains(payload, []byte("admin")) {
+		t.Fatal("login cookie decodes to the username (no user data belongs in it)")
+	}
+	if !bytes.Contains(payload, []byte("LOGIN_SESSION_ID")) {
+		t.Fatal("login cookie does not decode to a session ID (wrong payload?)")
+	}
+	// The ID-only cookie must still authenticate.
+	if rec := getServerStatus(t, engine, cookies); rec.Code != http.StatusOK {
+		t.Fatalf("status with ID-only cookie: %d, want 200", rec.Code)
+	}
+}
+
+// TestOldFormatCookieIsRevoked: a cookie carrying the old format (the
+// session ID plus the full user object, including the bcrypt hash) is
+// rejected and its server-side session revoked, forcing a fresh login.
+func TestOldFormatCookieIsRevoked(t *testing.T) {
+	engine := setupSecureCookieEngine(t, nil)
+	cookies := loginAsAdmin(t, engine)
+
+	// Rebuild the cookie the old way, signed with the panel's own
+	// secret: the same session ID plus the full user object.
+	secret, err := (&service.SettingService{}).GetSecret()
+	if err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	var admin model.User
+	if err := database.GetDB().Where("username = ?", "admin").First(&admin).Error; err != nil {
+		t.Fatalf("read admin: %v", err)
+	}
+	sc := securecookie.New(secret, nil)
+	// The sessions store serializes the session as
+	// map[interface{}]interface{}.
+	var session map[interface{}]interface{}
+	var cookieValue string
+	for _, c := range cookies {
+		if c.Name != "3x-ui" {
+			continue
+		}
+		cookieValue = c.Value
+		if err := sc.Decode("3x-ui", c.Value, &session); err != nil {
+			t.Fatalf("decode session cookie: %v", err)
+		}
+	}
+	if cookieValue == "" || session == nil {
+		t.Fatal("no 3x-ui cookie from login")
+	}
+	session["LOGIN_USER"] = admin
+	oldValue, err := sc.Encode("3x-ui", session)
+	if err != nil {
+		t.Fatalf("encode old-format cookie: %v", err)
+	}
+	oldCookies := []*http.Cookie{{Name: "3x-ui", Value: oldValue}}
+
+	// Rejected, and the server-side session is gone: the row is
+	// deleted, so the original cookie dies with it.
+	if rec := getServerStatus(t, engine, oldCookies); rec.Code != http.StatusNotFound {
+		t.Fatalf("status with old-format cookie: %d, want 404", rec.Code)
+	}
+	var rows []model.LoginSession
+	if err := database.GetDB().Find(&rows).Error; err != nil {
+		t.Fatalf("read sessions: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("sessions %d after old-format rejection, want 0 (revoked)", len(rows))
+	}
+	if rec := getServerStatus(t, engine, cookies); rec.Code != http.StatusNotFound {
+		t.Fatalf("status with original cookie after revocation: %d, want 404", rec.Code)
+	}
+	// A fresh login still works and issues the new format.
+	cookies = loginAsAdmin(t, engine)
+	if rec := getServerStatus(t, engine, cookies); rec.Code != http.StatusOK {
+		t.Fatalf("status after re-login: %d, want 200", rec.Code)
+	}
+}
+
+func assertNoStore(t *testing.T, what string, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("%s: Cache-Control %q, want \"no-store\"", what, cc)
+	}
+}
+
+// TestSensitiveResponsesAreNoStore: login, logout, management pages and
+// sensitive APIs must all carry Cache-Control: no-store, while static
+// assets keep their own caching.
+func TestSensitiveResponsesAreNoStore(t *testing.T) {
+	engine := setupSecureCookieEngine(t, nil)
+
+	// Login response.
+	body := strings.NewReader(`{"username":"admin","password":"admin"}`)
+	req := httptest.NewRequest(http.MethodPost, "/login", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login: %d, want 200", rec.Code)
+	}
+	assertNoStore(t, "login", rec)
+	cookies := rec.Result().Cookies()
+
+	// Management page (the login page HTML).
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	rec = httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("index page: %d, want 200", rec.Code)
+	}
+	assertNoStore(t, "index page", rec)
+
+	// Sensitive APIs (authenticated).
+	for _, path := range []string{"/panel/api/server/status", "/panel/api/inbounds/list"} {
+		req = httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		rec = httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s: %d, want 200", path, rec.Code)
+		}
+		assertNoStore(t, path, rec)
+	}
+
+	// Logout response.
+	req = httptest.NewRequest(http.MethodPost, "/logout", nil)
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec = httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("logout: %d, want 307", rec.Code)
+	}
+	assertNoStore(t, "logout", rec)
+
+	// Static assets keep their own caching: no no-store forced on them.
+	req = httptest.NewRequest(http.MethodGet, "/assets/js/axios-init.js", nil)
+	rec = httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("asset: %d, want 200", rec.Code)
+	}
+	if cc := rec.Header().Get("Cache-Control"); strings.Contains(cc, "no-store") {
+		t.Fatalf("static asset has Cache-Control %q, want no no-store", cc)
+	}
+}
+
+// dialWS opens a real WebSocket to the panel backend with the given
+// session cookies, the way a browser does (same-origin Origin).
+func dialWS(t *testing.T, backendURL string, cookies []*http.Cookie) (*websocket.Conn, *http.Response, error) {
+	t.Helper()
+	wsURL := "ws://" + strings.TrimPrefix(backendURL, "http://") + "/ws"
+	header := http.Header{}
+	header.Set("Origin", backendURL)
+	for _, c := range cookies {
+		header.Add("Cookie", c.Name+"="+c.Value)
+	}
+	return (&websocket.Dialer{HandshakeTimeout: 5 * time.Second}).Dial(wsURL, header)
+}
+
+// readWSUntil reads data messages until one contains marker or the
+// deadline passes. Other messages — e.g. the status broadcast the
+// server sends every 2s — are skipped.
+func readWSUntil(t *testing.T, conn *websocket.Conn, marker string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(deadline)
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read websocket: %v (want message containing %q)", err, marker)
+		}
+		if strings.Contains(string(msg), marker) {
+			return
+		}
+	}
+	t.Fatalf("timed out waiting for websocket message containing %q", marker)
+}
+
+// TestLogoutClosesWebSocket is the auditor's scenario with two
+// independent sessions: A and B log in and connect; A logs out; A's
+// connection must close promptly and stop receiving pushes, B must keep
+// working, and A's old cookie must not reconnect.
+func TestLogoutClosesWebSocket(t *testing.T) {
+	engine := setupSecureCookieEngine(t, nil)
+	backend := httptest.NewServer(engine)
+	t.Cleanup(backend.Close)
+
+	aCookies := loginAsAdmin(t, engine)
+	bCookies := loginAsAdmin(t, engine)
+
+	aConn, _, err := dialWS(t, backend.URL, aCookies)
+	if err != nil {
+		t.Fatalf("dial A: %v", err)
+	}
+	defer aConn.Close()
+	bConn, _, err := dialWS(t, backend.URL, bCookies)
+	if err != nil {
+		t.Fatalf("dial B: %v", err)
+	}
+	defer bConn.Close()
+
+	// Both connections receive pushes.
+	panelws.BroadcastStatus(map[string]any{"probe": "ws-before-logout"})
+	readWSUntil(t, aConn, "ws-before-logout", 5*time.Second)
+	readWSUntil(t, bConn, "ws-before-logout", 5*time.Second)
+
+	// A logs out: the HTTP session is revoked and A's connection must
+	// close promptly (the server sends a close frame when the hub
+	// removes the client). A read timeout means the connection is
+	// still open — that is the failure the auditor found — while a
+	// close frame or EOF means it is dead.
+	logout(t, engine, aCookies)
+	_ = aConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, _, err := aConn.ReadMessage(); err == nil {
+		t.Fatal("A's websocket stayed open after logout, want it closed")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("A's websocket still open after logout (read timed out): %v", err)
+	}
+
+	// B is untouched: still connected and still receiving pushes.
+	panelws.BroadcastStatus(map[string]any{"probe": "ws-after-logout"})
+	readWSUntil(t, bConn, "ws-after-logout", 5*time.Second)
+
+	// A's old cookie cannot reconnect: its session row is gone.
+	if _, resp, err := dialWS(t, backend.URL, aCookies); err == nil {
+		t.Fatal("websocket dial with logged-out cookie succeeded, want rejection")
+	} else if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("websocket dial with logged-out cookie: err=%v status=%d, want 401", err, status)
 	}
 }
 

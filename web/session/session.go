@@ -17,13 +17,25 @@ import (
 
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 const (
+	// loginUserKey is retained ONLY to detect cookies issued before
+	// the user object was removed from the cookie (see GetLoginUser):
+	// an old-format cookie still carries the full user, including the
+	// bcrypt password hash. It is revoked on sight and the caller must
+	// log in again for a cookie that holds only the session ID. New
+	// cookies never contain this key.
 	loginUserKey = "LOGIN_USER"
 	// loginSessionKey holds the random session ID of the current login
-	// inside the signed session cookie. The matching server-side row in
-	// the login_sessions table is what makes a session revocable: logout
+	// inside the signed session cookie. It is the ONLY thing the cookie
+	// carries: the user record, password hash and permissions live
+	// server-side (the login_sessions row plus the users table) and are
+	// looked up on every request. The signature only proves the cookie
+	// was not tampered with — anyone holding it could still read its
+	// contents — so nothing sensitive may be stored in it. The matching
+	// server-side row is what makes a session revocable: logout
 	// deletes the row, so replaying the cookie afterwards fails even
 	// though the cookie signature is still valid.
 	loginSessionKey = "LOGIN_SESSION_ID"
@@ -107,13 +119,73 @@ func RevokeAllSessions(userID int) error {
 	return database.GetDB().Delete(&model.LoginSession{}, "user_id = ?", userID).Error
 }
 
+// GetSessionID returns the random session ID of the current login, as
+// stored in the signed session cookie. Empty when the request carries no
+// server-side session (anonymous, or a cookie issued before sessions
+// became server-side). The WebSocket upgrade binds the connection to
+// this ID so logout can close it.
+func GetSessionID(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	id, _ := sessions.Default(c).Get(loginSessionKey).(string)
+	return id
+}
+
+// lookupSessionRow returns the server-side record for a session ID.
+func lookupSessionRow(id string) (model.LoginSession, error) {
+	var row model.LoginSession
+	err := database.GetDB().Where("id = ?", hashSessionID(id)).First(&row).Error
+	return row, err
+}
+
+// ValidateSessionID checks a session without a gin context, for the
+// WebSocket hub sweeper: the row must exist, belong to the user, be
+// unexpired, the user must still exist, and the password hash must be
+// unchanged since the session was created. It enforces exactly the same
+// validity as HTTP auth (see GetLoginUser), so a live connection dies on
+// logout, expiry, password change or user deletion — at most one sweep
+// interval after the event. A database error is NOT proof of revocation:
+// it keeps the connection (and logs), because a transient DB hiccup must
+// not drop every live WebSocket at once.
+func ValidateSessionID(sessionID string, userID int) bool {
+	if sessionID == "" || userID == 0 {
+		return false
+	}
+	row, err := lookupSessionRow(sessionID)
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return false
+		}
+		logger.Warning("session: failed to validate session:", err)
+		return true
+	}
+	if row.UserId != userID || !row.ExpiresAt.After(time.Now()) {
+		return false
+	}
+	fresh := &model.User{}
+	if err := database.GetDB().Model(model.User{}).Where("id = ?", userID).First(fresh).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return false
+		}
+		logger.Warning("session: failed to validate session user:", err)
+		return true
+	}
+	return fresh.Password == row.PasswordHash
+}
+
 func init() {
+	// Kept so cookies issued before the user object was removed from
+	// the cookie still decode: GetLoginUser must be able to recognise
+	// (and revoke) them instead of failing the whole session load.
 	gob.Register(model.User{})
 }
 
-// SetLoginUser stores the authenticated user in the session and persists it.
-// gin-contrib/sessions does not auto-save; callers that forget Save() leave
-// the cookie out of sync with server state — this helper avoids that pitfall.
+// SetLoginUser creates a server-side session for the authenticated user
+// and stores only its random session ID in the cookie.
+// gin-contrib/sessions does not auto-save; callers that forget Save()
+// leave the cookie out of sync with server state — this helper avoids
+// that pitfall.
 //
 // A fresh random session ID is generated on every call and recorded
 // server-side with its expiry, so the session can later be revoked
@@ -139,71 +211,80 @@ func SetLoginUser(c *gin.Context, user *model.User) error {
 	// Best-effort cleanup of expired rows keeps the table small.
 	db.Where("expires_at < ?", time.Now()).Delete(&model.LoginSession{})
 	row := &model.LoginSession{
-		Id:        hashSessionID(id),
-		UserId:    user.Id,
-		Username:  user.Username,
-		ExpiresAt: time.Now().Add(sessionTTL()),
+		Id:           hashSessionID(id),
+		UserId:       user.Id,
+		Username:     user.Username,
+		PasswordHash: user.Password,
+		ExpiresAt:    time.Now().Add(sessionTTL()),
 	}
 	if err := db.Create(row).Error; err != nil {
 		return err
 	}
-	s.Set(loginUserKey, *user)
 	s.Set(loginSessionKey, id)
 	return s.Save()
 }
 
-// GetLoginUser retrieves the authenticated user from the session.
-// Returns nil if no user is logged in or if the session data is invalid.
+// GetLoginUser retrieves the authenticated user for the request.
+//
+// The cookie holds only the unpredictable random session ID. The user
+// record, password hash and permissions live server-side — the
+// login_sessions row plus the users table — and are looked up on every
+// request, so a stolen cookie yields no password hash for offline
+// guessing (the signature only proves the cookie was not tampered with;
+// it never hid its contents). Returns nil when the request carries no
+// session, the row is missing or expired, the user is gone, or the
+// password hash changed since the session was created (password
+// change revokes the row; see RevokeAllSessions).
 func GetLoginUser(c *gin.Context) *model.User {
 	s := sessions.Default(c)
-	obj := s.Get(loginUserKey)
-	if obj == nil {
-		return nil
-	}
-	user, ok := obj.(model.User)
-	if !ok {
-		// Stale or incompatible session payload — wipe and persist immediately
-		// so subsequent requests don't keep hitting the same broken cookie.
-		s.Delete(loginUserKey)
-		if err := s.Save(); err != nil {
-			logger.Warning("session: failed to drop stale user payload:", err)
+	// Old-format cookies carry the full user object, including the
+	// bcrypt hash. Revoke the session on sight and force a fresh login,
+	// which issues a cookie holding only the session ID.
+	if s.Get(loginUserKey) != nil {
+		if id, ok := s.Get(loginSessionKey).(string); ok && id != "" {
+			_ = revokeSessionRow(id)
 		}
 		return nil
 	}
-	// M1: the session only proves who logged in, not that the credentials
-	// are still current. Re-validate against the database on every request:
-	// if the user was deleted or the password hash changed (password change),
-	// the old cookie stops working immediately.
-	if user.Id == 0 {
-		return nil
-	}
-	fresh := &model.User{}
-	if err := database.GetDB().Model(model.User{}).Where("id = ?", user.Id).First(fresh).Error; err != nil {
-		return nil
-	}
-	if fresh.Password != user.Password {
-		return nil
-	}
-	// The session must also exist server-side and not be expired.
-	// Logout deletes the row, so a replayed cookie stops working even
-	// though its signature is still valid — clearing the browser cookie
-	// alone cannot stop a stolen copy. Cookies issued before
-	// server-side sessions existed carry no session ID and are rejected
-	// here, so users log in once after the upgrade.
+	// The session must exist server-side and not be expired. Logout
+	// deletes the row, so a replayed cookie stops working even though
+	// its signature is still valid — clearing the browser cookie alone
+	// cannot stop a stolen copy. Cookies issued before server-side
+	// sessions existed carry no session ID and are rejected here, so
+	// users log in once after the upgrade.
 	id, ok := s.Get(loginSessionKey).(string)
 	if !ok || id == "" {
 		return nil
 	}
-	var row model.LoginSession
-	if err := database.GetDB().Where("id = ?", hashSessionID(id)).First(&row).Error; err != nil {
-		return nil
-	}
-	if row.UserId != user.Id {
+	row, err := lookupSessionRow(id)
+	if err != nil {
 		return nil
 	}
 	if !row.ExpiresAt.After(time.Now()) {
 		database.GetDB().Delete(&model.LoginSession{}, "id = ?", row.Id)
 		return nil
+	}
+	// The session only proves who logged in, not that the credentials
+	// are still current. Re-validate against the database on every
+	// request: if the user was deleted or the password hash changed
+	// (password change), the old cookie stops working immediately.
+	// The hash comparison uses the row's recorded hash, not anything
+	// from the cookie.
+	fresh := &model.User{}
+	if err := database.GetDB().Model(model.User{}).Where("id = ?", row.UserId).First(fresh).Error; err != nil {
+		return nil
+	}
+	if row.PasswordHash != "" && fresh.Password != row.PasswordHash {
+		return nil
+	}
+	// Sessions created before the password-hash column existed carry an
+	// empty hash; backfill once from the current hash so the WebSocket
+	// sweeper accepts them. (The WebSocket upgrade request backfills
+	// too, before the connection is registered.)
+	if row.PasswordHash == "" {
+		if err := database.GetDB().Model(&model.LoginSession{}).Where("id = ?", row.Id).Update("password_hash", fresh.Password).Error; err != nil {
+			logger.Warning("session: failed to backfill session password hash:", err)
+		}
 	}
 	return fresh
 }

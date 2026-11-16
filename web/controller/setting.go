@@ -9,6 +9,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v2/web/entity"
 	"github.com/mhsanaei/3x-ui/v2/web/service"
 	"github.com/mhsanaei/3x-ui/v2/web/session"
+	"github.com/mhsanaei/3x-ui/v2/web/websocket"
 
 	"github.com/gin-gonic/gin"
 )
@@ -107,6 +108,15 @@ func (a *SettingController) updateUser(c *gin.Context) {
 		// reported as failed.)
 		if revErr := session.RevokeAllSessions(user.Id); revErr != nil {
 			logger.Warning("Failed to revoke other sessions on password change:", revErr)
+		}
+		// All of the user's sessions are revoked, so their live
+		// WebSocket connections must close too — otherwise an old
+		// connection would keep receiving pushes after the password
+		// change. This browser's connection drops as well, but the
+		// frontend reconnects automatically with the fresh session
+		// issued below.
+		if hub := websocket.GetHub(); hub != nil {
+			hub.CloseUserClients(user.Id)
 		}
 		user.Username = form.NewUsername
 		// Store the exact hash UpdateUser wrote to the database: a

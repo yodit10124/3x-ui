@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/logger"
@@ -46,17 +47,30 @@ const (
 	// notification, xray_state, invalidate) bypass this so they are never delayed.
 	minBroadcastInterval = 250 * time.Millisecond
 
+	// defaultSessionSweepInterval is how often the hub re-validates live
+	// connections against their server-side sessions. A connection must
+	// not outlive its login session (expiry), a password change or a user
+	// deletion by more than this. Logout closes its connections
+	// immediately (see CloseSessionClients); the sweep is the backstop
+	// for the paths without an explicit close call.
+	defaultSessionSweepInterval = 30 * time.Second
+
 	// hubRestartAttempts caps panic-recovery restarts. After this many
 	// consecutive failures we stop trying and log; the panel keeps running
 	// (frontend falls back to REST polling) and the operator can investigate.
 	hubRestartAttempts = 3
 )
 
-// NewClient builds a Client ready for hub registration.
-func NewClient(id string) *Client {
+// NewClient builds a Client ready for hub registration. sessionID/userID
+// bind the connection to the login session that established it, so the
+// session's revocation (logout, password change, expiry) can close
+// exactly this connection without touching the user's other sessions.
+func NewClient(id, sessionID string, userID int) *Client {
 	return &Client{
-		ID:   id,
-		Send: make(chan []byte, clientSendQueue),
+		ID:        id,
+		SessionID: sessionID,
+		UserID:    userID,
+		Send:      make(chan []byte, clientSendQueue),
 	}
 }
 
@@ -69,7 +83,12 @@ type Message struct {
 
 // Client represents a single WebSocket connection.
 type Client struct {
-	ID        string
+	ID string
+	// SessionID/UserID bind the connection to the login session that
+	// established it (see NewClient). Empty SessionID means the
+	// connection predates session binding and is swept as invalid.
+	SessionID string
+	UserID    int
 	Send      chan []byte
 	closeOnce sync.Once
 }
@@ -86,12 +105,23 @@ type Hub struct {
 
 	throttleMu    sync.Mutex
 	lastBroadcast map[MessageType]time.Time
+
+	// sessionValidator reports whether a (sessionID, userID) pair is
+	// still valid. Injected by the web server (it is the same
+	// server-side session check HTTP auth uses); nil disables sweeping.
+	// Kept behind a mutex because it is set once at startup while the
+	// hub loop reads it on every sweep.
+	validatorMu      sync.RWMutex
+	sessionValidator func(sessionID string, userID int) bool
+	// sweepIntervalNs is the session-sweep period in nanoseconds
+	// (atomic: set at startup or by tests, read by the hub loop).
+	sweepIntervalNs atomic.Int64
 }
 
 // NewHub creates a hub. Call Run in a goroutine to start its event loop.
 func NewHub() *Hub {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Hub{
+	h := &Hub{
 		clients:       make(map[*Client]struct{}),
 		broadcast:     make(chan []byte, hubBroadcastQueue),
 		register:      make(chan *Client, hubControlQueue),
@@ -99,6 +129,120 @@ func NewHub() *Hub {
 		ctx:           ctx,
 		cancel:        cancel,
 		lastBroadcast: make(map[MessageType]time.Time),
+	}
+	h.sweepIntervalNs.Store(int64(defaultSessionSweepInterval))
+	return h
+}
+
+// SetSessionValidator injects the function the hub sweeper uses to decide
+// whether a connection's login session is still valid. Called once by
+// the web server at startup; nil disables sweeping.
+func (h *Hub) SetSessionValidator(fn func(sessionID string, userID int) bool) {
+	if h == nil {
+		return
+	}
+	h.validatorMu.Lock()
+	h.sessionValidator = fn
+	h.validatorMu.Unlock()
+}
+
+// SetSessionSweepInterval overrides the session-sweep period (tests use
+// a short interval so the sweep fires promptly). Non-positive values
+// restore the default.
+func (h *Hub) SetSessionSweepInterval(d time.Duration) {
+	if h == nil {
+		return
+	}
+	if d <= 0 {
+		d = defaultSessionSweepInterval
+	}
+	h.sweepIntervalNs.Store(int64(d))
+}
+
+func (h *Hub) getSessionValidator() func(sessionID string, userID int) bool {
+	if h == nil {
+		return nil
+	}
+	h.validatorMu.RLock()
+	defer h.validatorMu.RUnlock()
+	return h.sessionValidator
+}
+
+func (h *Hub) getSweepInterval() time.Duration {
+	if h == nil {
+		return defaultSessionSweepInterval
+	}
+	d := time.Duration(h.sweepIntervalNs.Load())
+	if d <= 0 {
+		return defaultSessionSweepInterval
+	}
+	return d
+}
+
+// CloseSessionClients closes every connection bound to one login
+// session, e.g. on logout. The hub removes each client (closing its
+// Send channel makes the write pump send a close frame and drop the
+// TCP connection), so no further broadcasts reach it. Other sessions —
+// including other sessions of the same user — are untouched.
+func (h *Hub) CloseSessionClients(sessionID string) {
+	if h == nil || sessionID == "" {
+		return
+	}
+	h.mu.RLock()
+	var targets []*Client
+	for c := range h.clients {
+		if c.SessionID == sessionID {
+			targets = append(targets, c)
+		}
+	}
+	h.mu.RUnlock()
+	for _, c := range targets {
+		h.removeClient(c)
+	}
+}
+
+// CloseUserClients closes every connection of one user, e.g. on a
+// password change, when all of the user's sessions are revoked at once.
+func (h *Hub) CloseUserClients(userID int) {
+	if h == nil || userID == 0 {
+		return
+	}
+	h.mu.RLock()
+	var targets []*Client
+	for c := range h.clients {
+		if c.UserID == userID {
+			targets = append(targets, c)
+		}
+	}
+	h.mu.RUnlock()
+	for _, c := range targets {
+		h.removeClient(c)
+	}
+}
+
+// sweepSessions re-validates every live connection against its login
+// session and closes the ones whose session is gone: expired, revoked
+// by a password change, or belonging to a deleted user. It runs on the
+// sweep ticker; logout closes its connections immediately instead, so
+// the sweep is only the backstop for paths without an explicit close.
+// Validation happens without holding the hub lock, so a slow check
+// cannot stall broadcasts.
+func (h *Hub) sweepSessions() {
+	validate := h.getSessionValidator()
+	if validate == nil {
+		return
+	}
+	h.mu.RLock()
+	clients := make([]*Client, 0, len(h.clients))
+	for c := range h.clients {
+		clients = append(clients, c)
+	}
+	h.mu.RUnlock()
+	for _, c := range clients {
+		if !validate(c.SessionID, c.UserID) {
+			h.removeClient(c)
+			logger.Debugf("WebSocket client %s closed: session no longer valid", c.ID)
+		}
 	}
 }
 
@@ -163,11 +307,17 @@ func (h *Hub) runOnce() (stopped bool) {
 		}
 	}()
 
+	sweepTicker := time.NewTicker(h.getSweepInterval())
+	defer sweepTicker.Stop()
+
 	for {
 		select {
 		case <-h.ctx.Done():
 			h.shutdown()
 			return true
+
+		case <-sweepTicker.C:
+			h.sweepSessions()
 
 		case c := <-h.register:
 			if c == nil {

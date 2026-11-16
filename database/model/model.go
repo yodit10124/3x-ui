@@ -52,12 +52,19 @@ type User struct {
 // rows of the user (the password-hash check in web/session would reject
 // them anyway); a plain logout revokes only the current session, other
 // sessions of the same user keep working.
+//
+// PasswordHash is the bcrypt hash that was current when the session was
+// created. The WebSocket hub sweeper compares it with the user's current
+// hash, so a live connection dies on password change even if the row
+// revocation failed: the sweeper enforces exactly the same validity as
+// HTTP auth (row + hash + user existence + expiry).
 type LoginSession struct {
-	Id        string    `gorm:"primaryKey;size:64"`
-	UserId    int       `gorm:"index"`
-	Username  string    `gorm:"size:64"`
-	ExpiresAt time.Time `gorm:"index"`
-	CreatedAt time.Time
+	Id           string    `gorm:"primaryKey;size:64"`
+	UserId       int       `gorm:"index"`
+	Username     string    `gorm:"size:64"`
+	PasswordHash string    `gorm:"size:128"`
+	ExpiresAt    time.Time `gorm:"index"`
+	CreatedAt    time.Time
 }
 
 // Inbound represents an Xray inbound configuration with traffic statistics and settings.
