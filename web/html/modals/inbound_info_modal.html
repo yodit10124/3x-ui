@@ -318,17 +318,6 @@
           </td>
         </tr>
       </table>
-      <template v-if="app.tgBotEnable && infoModal.clientSettings.tgId">
-        <a-divider>Telegram ChatID</a-divider>
-        <tr-info-row class="tr-info-row">
-          <tr-info-title class="tr-info-title">
-            <a-tag color="blue">[[ infoModal.clientSettings.tgId ]]</a-tag>
-            <a-tooltip title='{{ i18n "copy" }}'>
-              <a-button size="small" icon="snippets" @click="copy(infoModal.clientSettings.tgId)"></a-button>
-            </a-tooltip>
-          </tr-info-title>
-        </tr-info-row>
-      </template>
       <template v-if="dbInbound.hasLink()">
         <a-divider>URL</a-divider>
         <tr-info-row v-for="(link,index) in infoModal.links" class="tr-info-row">

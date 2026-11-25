@@ -1475,11 +1475,11 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 		return common.NewErrorf("Imported DB but failed to rotate secret: %v", err)
 	}
 
-	// L-6: the imported settings are not all trustworthy — clear the
-	// Telegram channel, switch off external traffic reporting, and
-	// clamp the Geo download cap. A sanitisation failure is reported
-	// loudly, and the deferred rollback restores the original
-	// database, like any other post-swap failure.
+	// L-6: the imported settings are not all trustworthy — switch off
+	// external traffic reporting and clamp the Geo download cap.
+	// A sanitisation failure is reported loudly, and the deferred
+	// rollback restores the original database, like any other
+	// post-swap failure.
 	if err := (&SettingService{}).SanitizeImportedSettings(); err != nil {
 		return common.NewErrorf("Imported DB but failed to sanitize settings: %v", err)
 	}

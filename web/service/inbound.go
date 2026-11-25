@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -1912,67 +1911,6 @@ func (s *InboundService) GetClientByEmail(clientEmail string) (*xray.ClientTraff
 	return nil, nil, common.NewError("Client Not Found In Inbound For Email:", clientEmail)
 }
 
-func (s *InboundService) SetClientTelegramUserID(trafficId int, tgId int64) (bool, error) {
-	traffic, inbound, err := s.GetClientInboundByTrafficID(trafficId)
-	if err != nil {
-		return false, err
-	}
-	if inbound == nil {
-		return false, common.NewError("Inbound Not Found For Traffic ID:", trafficId)
-	}
-
-	clientEmail := traffic.Email
-
-	oldClients, err := s.GetClients(inbound)
-	if err != nil {
-		return false, err
-	}
-
-	clientId := ""
-
-	for _, oldClient := range oldClients {
-		if oldClient.Email == clientEmail {
-			switch inbound.Protocol {
-			case "trojan":
-				clientId = oldClient.Password
-			case "shadowsocks":
-				clientId = oldClient.Email
-			default:
-				clientId = oldClient.ID
-			}
-			break
-		}
-	}
-
-	if len(clientId) == 0 {
-		return false, common.NewError("Client Not Found For Email:", clientEmail)
-	}
-
-	var settings map[string]any
-	err = json.Unmarshal([]byte(inbound.Settings), &settings)
-	if err != nil {
-		return false, err
-	}
-	clients := settings["clients"].([]any)
-	var newClients []any
-	for client_index := range clients {
-		c := clients[client_index].(map[string]any)
-		if c["email"] == clientEmail {
-			c["tgId"] = tgId
-			c["updated_at"] = time.Now().Unix() * 1000
-			newClients = append(newClients, any(c))
-		}
-	}
-	settings["clients"] = newClients
-	modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return false, err
-	}
-	inbound.Settings = string(modifiedSettings)
-	needRestart, err := s.UpdateInboundClient(inbound, clientId)
-	return needRestart, err
-}
-
 func (s *InboundService) checkIsEnabledByEmail(clientEmail string) (bool, error) {
 	_, inbound, err := s.GetClientInboundByEmail(clientEmail)
 	if err != nil {
@@ -2483,95 +2421,6 @@ func (s *InboundService) DelDepletedClients(id int) (err error) {
 	return nil
 }
 
-func (s *InboundService) GetClientTrafficTgBot(tgId int64) ([]*xray.ClientTraffic, error) {
-	db := database.GetDB()
-	var inbounds []*model.Inbound
-
-	// L-16: no LIKE pre-filter on the settings JSON. The old filter
-	// matched only the spaced number form `"tgId": 999`, so inbounds
-	// whose settings store the id compactly ("tgId":999) or as a
-	// string ("tgId": "999", as the Telegram flow used to emit) were
-	// never scanned and their clients' traffic came back empty. The
-	// inbound count is small, so scan all of them and match the id in
-	// Go, where both stored forms are understood.
-	err := db.Model(model.Inbound{}).Find(&inbounds).Error
-	if err != nil && err != gorm.ErrRecordNotFound {
-		logger.Errorf("Error retrieving inbounds: %v", err)
-		return nil, err
-	}
-
-	var emails []string
-	for _, inbound := range inbounds {
-		emails = append(emails, clientEmailsForTgID(inbound.Settings, tgId)...)
-	}
-
-	// Chunked to stay under SQLite's bind-variable limit when a single Telegram
-	// account owns thousands of clients across inbounds.
-	uniqEmails := uniqueNonEmptyStrings(emails)
-	traffics := make([]*xray.ClientTraffic, 0, len(uniqEmails))
-	for _, batch := range chunkStrings(uniqEmails, sqliteMaxVars) {
-		var page []*xray.ClientTraffic
-		if err = db.Model(xray.ClientTraffic{}).Where("email IN ?", batch).Find(&page).Error; err != nil {
-			if err == gorm.ErrRecordNotFound {
-				continue
-			}
-			logger.Errorf("Error retrieving ClientTraffic for emails %v: %v", batch, err)
-			return nil, err
-		}
-		traffics = append(traffics, page...)
-	}
-	if len(traffics) == 0 {
-		logger.Warning("No ClientTraffic records found for emails:", emails)
-		return nil, nil
-	}
-
-	// Populate UUID and other client data for each traffic record
-	for i := range traffics {
-		if ct, client, e := s.GetClientByEmail(traffics[i].Email); e == nil && ct != nil && client != nil {
-			traffics[i].Enable = client.Enable
-			traffics[i].UUID = client.ID
-		}
-	}
-
-	return traffics, nil
-}
-
-// clientEmailsForTgID returns the emails of clients in a raw inbound
-// settings JSON whose tgId equals tgId (L-16). The id may be stored as
-// a JSON number ("tgId": 999, with or without a space) or as a string
-// ("tgId": "999", as the Telegram flow used to emit); both forms
-// match. An absent or unparsable tgId means the client has no
-// Telegram user. It parses the raw JSON instead of going through
-// model.Client, whose int64 TgID decodes a string-form id as 0.
-func clientEmailsForTgID(settings string, tgId int64) []string {
-	var raw struct {
-		Clients []struct {
-			Email string `json:"email"`
-			TgID  any    `json:"tgId"`
-		} `json:"clients"`
-	}
-	if err := json.Unmarshal([]byte(settings), &raw); err != nil {
-		return nil
-	}
-	var emails []string
-	for _, c := range raw.Clients {
-		var id int64
-		var ok bool
-		switch v := c.TgID.(type) {
-		case float64:
-			id, ok = int64(v), true
-		case string:
-			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-				id, ok = n, true
-			}
-		}
-		if ok && id == tgId && c.Email != "" {
-			emails = append(emails, c.Email)
-		}
-	}
-	return emails
-}
-
 // sqliteMaxVars is a safe ceiling for the number of bind parameters in a
 // single SQL statement. SQLite's SQLITE_MAX_VARIABLE_NUMBER is 999 on builds
 // before 3.32 and 32766 after; staying under 999 keeps queries portable
@@ -2937,17 +2786,6 @@ func (s *InboundService) MigrationRequirements() {
 				// Add email='' if it is not exists
 				if _, ok := c["email"]; !ok {
 					c["email"] = ""
-				}
-
-				// Convert string tgId to int64
-				if _, ok := c["tgId"]; ok {
-					var tgId any = c["tgId"]
-					if tgIdStr, ok2 := tgId.(string); ok2 {
-						tgIdInt64, err := strconv.ParseInt(strings.ReplaceAll(tgIdStr, " ", ""), 10, 64)
-						if err == nil {
-							c["tgId"] = tgIdInt64
-						}
-					}
 				}
 
 				// Remove "flow": "xtls-rprx-direct"

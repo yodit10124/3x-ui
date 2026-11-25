@@ -203,7 +203,6 @@ type Client struct {
 	TotalGB    int64          `json:"totalGB" form:"totalGB"`       // Total traffic limit in GB
 	ExpiryTime int64          `json:"expiryTime" form:"expiryTime"` // Expiration timestamp
 	Enable     bool           `json:"enable" form:"enable"`         // Whether the client is enabled
-	TgID       int64          `json:"tgId" form:"tgId"`             // Telegram user ID for notifications
 	Comment    string         `json:"comment" form:"comment"`       // Client comment
 	Reset      int            `json:"reset" form:"reset"`           // Reset period in days
 	CreatedAt  int64          `json:"created_at,omitempty"`         // Creation timestamp

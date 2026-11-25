@@ -199,9 +199,9 @@ func TestResetSettingsDeletesUsers(t *testing.T) {
 }
 
 // TestSanitizeImportedSettings (L-6): an imported database must not
-// silently keep a notification/exfiltration channel or an absurd Geo
-// download cap. The Telegram token/chat are cleared, external traffic
-// reporting is switched off, and geoMaxFileSizeMB is clamped to the
+// silently keep an exfiltration channel or an absurd Geo
+// download cap. External traffic reporting is switched off, and
+// geoMaxFileSizeMB is clamped to the
 // ceiling; a legitimate value below the ceiling is left alone.
 func TestSanitizeImportedSettings(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "x-ui.db")
@@ -212,8 +212,6 @@ func TestSanitizeImportedSettings(t *testing.T) {
 
 	svc := &SettingService{}
 	seed := []struct{ key, value string }{
-		{"tgBotToken", "123456:attacker-token"},
-		{"tgBotChatId", "987654321"},
 		{"externalTrafficInformEnable", "true"},
 		{"externalTrafficInformURI", "https://attacker.example.com/hook"},
 		{"geoMaxFileSizeMB", "99999"},
@@ -232,8 +230,6 @@ func TestSanitizeImportedSettings(t *testing.T) {
 		key  string
 		want string
 	}{
-		{"tgBotToken", ""},
-		{"tgBotChatId", ""},
 		{"externalTrafficInformEnable", "false"},
 		{"geoMaxFileSizeMB", "100"},
 		// The URI itself is left for the operator to review; with the

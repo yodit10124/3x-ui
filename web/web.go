@@ -104,7 +104,6 @@ type Server struct {
 
 	xrayService      service.XrayService
 	settingService   service.SettingService
-	tgbotService     service.Tgbot
 	customGeoService *service.CustomGeoService
 
 	wsHub *websocket.Hub
@@ -275,7 +274,7 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	})
 
 	// init i18n
-	err = locale.InitLocalizer(i18nFS, &s.settingService)
+	err = locale.InitLocalizer(i18nFS)
 	if err != nil {
 		return nil, err
 	}
@@ -411,36 +410,6 @@ func (s *Server) startTask() {
 		s.cron.AddJob(runtime, j)
 	}
 
-	// Make a traffic condition every day, 8:30
-	var entry cron.EntryID
-	isTgbotenabled, err := s.settingService.GetTgbotEnabled()
-	if (err == nil) && (isTgbotenabled) {
-		runtime, err := s.settingService.GetTgbotRuntime()
-		if err != nil {
-			logger.Warningf("Add NewStatsNotifyJob: failed to load runtime: %v; using default @daily", err)
-			runtime = "@daily"
-		} else if strings.TrimSpace(runtime) == "" {
-			logger.Warning("Add NewStatsNotifyJob runtime is empty, using default @daily")
-			runtime = "@daily"
-		}
-		logger.Infof("Tg notify enabled,run at %s", runtime)
-		_, err = s.cron.AddJob(runtime, job.NewStatsNotifyJob())
-		if err != nil {
-			logger.Warningf("Add NewStatsNotifyJob: failed to schedule runtime %q: %v", runtime, err)
-			return
-		}
-
-		// check for Telegram bot callback query hash storage reset
-		s.cron.AddJob("@every 2m", job.NewCheckHashStorageJob())
-
-		// Check CPU load and alarm to TgBot if threshold passes
-		cpuThreshold, err := s.settingService.GetTgCpu()
-		if (err == nil) && (cpuThreshold > 0) {
-			s.cron.AddJob("@every 10s", job.NewCheckCpuJob())
-		}
-	} else {
-		s.cron.Remove(entry)
-	}
 }
 
 // Start initializes and starts the web server with configured settings, routes, and background jobs.
@@ -516,24 +485,15 @@ func (s *Server) Start() (err error) {
 
 	s.startTask()
 
-	isTgbotenabled, err := s.settingService.GetTgbotEnabled()
-	if (err == nil) && (isTgbotenabled) {
-		tgBot := s.tgbotService.NewTgbot()
-		tgBot.Start(i18nFS)
-	}
-
 	return nil
 }
 
-// Stop gracefully shuts down the web server, stops Xray, cron jobs, and Telegram bot.
+// Stop gracefully shuts down the web server, stops Xray and cron jobs.
 func (s *Server) Stop() error {
 	s.cancel()
 	s.xrayService.StopXray()
 	if s.cron != nil {
 		s.cron.Stop()
-	}
-	if s.tgbotService.IsRunning() {
-		s.tgbotService.Stop()
 	}
 	// Gracefully stop WebSocket hub
 	if s.wsHub != nil {

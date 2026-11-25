@@ -72,10 +72,6 @@ func runWebServer() {
 		case syscall.SIGHUP:
 			logger.Info("Received SIGHUP signal. Restarting servers...")
 
-			// --- FIX FOR TELEGRAM BOT CONFLICT (409): Stop bot before restart ---
-			service.StopBot()
-			// --
-
 			err := server.Stop()
 			if err != nil {
 				logger.Debug("Error stopping web server:", err)
@@ -97,10 +93,6 @@ func runWebServer() {
 			}
 
 		default:
-			// --- FIX FOR TELEGRAM BOT CONFLICT (409) on full shutdown ---
-			service.StopBot()
-			// ------------------------------------------------------------
-
 			server.Stop()
 			log.Println("Shutting down servers.")
 			return
@@ -179,70 +171,6 @@ func showSetting(show bool) {
 	}
 }
 
-// updateTgbotEnableSts enables or disables the Telegram bot notifications based on the status parameter.
-func updateTgbotEnableSts(status bool) {
-	settingService := service.SettingService{}
-	currentTgSts, err := settingService.GetTgbotEnabled()
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	// NB: the logger is only initialized in runWebServer, so these
-	// CLI helpers must print with fmt — logger.Info* here dereferenced
-	// a nil logger and panicked after the setting was already stored.
-	fmt.Printf("current enabletgbot status[%v],need update to status[%v]\n", currentTgSts, status)
-	if currentTgSts != status {
-		err := settingService.SetTgbotEnabled(status)
-		if err != nil {
-			fmt.Println(err)
-			return
-		} else {
-			fmt.Printf("SetTgbotEnabled[%v] success\n", status)
-		}
-	}
-}
-
-// updateTgbotSetting updates Telegram bot settings including token, chat ID, and runtime schedule.
-func updateTgbotSetting(tgBotToken string, tgBotChatid string, tgBotRuntime string) {
-	err := database.InitDB(config.GetDBPath())
-	if err != nil {
-		fmt.Println("Error initializing database:", err)
-		return
-	}
-
-	settingService := service.SettingService{}
-
-	if tgBotToken != "" {
-		err := settingService.SetTgBotToken(tgBotToken)
-		if err != nil {
-			fmt.Printf("Error setting Telegram bot token: %v\n", err)
-			return
-		}
-		// NB: same nil-logger note as updateTgbotEnableSts above —
-		// the logger is only initialized in runWebServer, so print
-		// with fmt here.
-		fmt.Println("Successfully updated Telegram bot token.")
-	}
-
-	if tgBotRuntime != "" {
-		err := settingService.SetTgbotRuntime(tgBotRuntime)
-		if err != nil {
-			fmt.Printf("Error setting Telegram bot runtime: %v\n", err)
-			return
-		}
-		fmt.Printf("Successfully updated Telegram bot runtime to [%s].\n", tgBotRuntime)
-	}
-
-	if tgBotChatid != "" {
-		err := settingService.SetTgBotChatId(tgBotChatid)
-		if err != nil {
-			fmt.Printf("Error setting Telegram bot chat ID: %v\n", err)
-			return
-		}
-		fmt.Println("Successfully updated Telegram bot chat ID.")
-	}
-}
-
 // resolveSettingPassword returns the login password to apply (L-17).
 // When -password-stdin is set, the password is read from stdin so it
 // never appears in the process arguments, where any other local user
@@ -265,30 +193,6 @@ func resolveSettingPassword(passwordFlag string, readStdin bool, stdin io.Reader
 		fmt.Fprintln(os.Stderr, "warning: passing the password with -password exposes it to other local users via ps; use -password-stdin instead")
 	}
 	return passwordFlag, nil
-}
-
-// resolveSettingTgbotToken returns the Telegram bot token to apply.
-// Same shape as resolveSettingPassword (L-17): -tgbottoken-stdin reads
-// it from stdin so it never appears in the process arguments; a
-// literal -tgbottoken still works for compatibility but warns on
-// stderr. No script in this repo passes -tgbottoken today, so no
-// script changes accompany this flag.
-func resolveSettingTgbotToken(tokenFlag string, readStdin bool, stdin io.Reader) (string, error) {
-	if readStdin {
-		data, err := io.ReadAll(stdin)
-		if err != nil {
-			return "", fmt.Errorf("failed to read Telegram bot token from stdin: %w", err)
-		}
-		token := strings.TrimRight(string(data), "\r\n")
-		if token == "" {
-			return "", errors.New("no Telegram bot token provided on stdin")
-		}
-		return token, nil
-	}
-	if tokenFlag != "" {
-		fmt.Fprintln(os.Stderr, "warning: passing the Telegram bot token with -tgbottoken exposes it to other local users via ps; use -tgbottoken-stdin instead")
-	}
-	return tokenFlag, nil
 }
 
 // updateSetting updates various panel settings including port, credentials, base path, listen IP, and two-factor authentication.
@@ -449,11 +353,6 @@ func main() {
 	var getListen bool
 	var webCertFile string
 	var webKeyFile string
-	var tgbottoken string
-	var tgbottokenStdin bool
-	var tgbotchatid string
-	var enabletgbot bool
-	var tgbotRuntime string
 	var reset bool
 	var show bool
 	var getCert bool
@@ -471,11 +370,6 @@ func main() {
 	settingCmd.BoolVar(&getCert, "getCert", false, "Display current certificate settings")
 	settingCmd.StringVar(&webCertFile, "webCert", "", "Set path to public key file for panel")
 	settingCmd.StringVar(&webKeyFile, "webCertKey", "", "Set path to private key file for panel")
-	settingCmd.StringVar(&tgbottoken, "tgbottoken", "", "Set token for Telegram bot (deprecated: a token on the command line is visible to other local users via ps; use -tgbottoken-stdin instead)")
-	settingCmd.BoolVar(&tgbottokenStdin, "tgbottoken-stdin", false, "Read Telegram bot token from stdin instead of -tgbottoken")
-	settingCmd.StringVar(&tgbotRuntime, "tgbotRuntime", "", "Set cron time for Telegram bot notifications")
-	settingCmd.StringVar(&tgbotchatid, "tgbotchatid", "", "Set chat ID for Telegram bot notifications")
-	settingCmd.BoolVar(&enabletgbot, "enabletgbot", false, "Enable notifications via Telegram bot")
 
 	oldUsage := flag.Usage
 	flag.Usage = func() {
@@ -523,14 +417,6 @@ func main() {
 				fmt.Println(err)
 				return
 			}
-			// Resolve the token up front too, so a failed stdin read
-			// aborts the whole update instead of applying the other
-			// settings with a missing token.
-			tgbottoken, err = resolveSettingTgbotToken(tgbottoken, tgbottokenStdin, os.Stdin)
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
 			if err = updateSetting(port, username, password, webBasePath, listenIP, resetTwoFactor); err != nil {
 				return
 			}
@@ -543,12 +429,6 @@ func main() {
 		}
 		if getCert {
 			GetCertificate(getCert)
-		}
-		if (tgbottoken != "") || (tgbotchatid != "") || (tgbotRuntime != "") {
-			updateTgbotSetting(tgbottoken, tgbotchatid, tgbotRuntime)
-		}
-		if enabletgbot {
-			updateTgbotEnableSts(enabletgbot)
 		}
 	case "cert":
 		err := settingCmd.Parse(os.Args[2:])

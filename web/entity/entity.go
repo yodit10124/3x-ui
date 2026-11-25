@@ -18,7 +18,7 @@ type Msg struct {
 	Obj     any    `json:"obj"`     // Optional data object
 }
 
-// AllSetting contains all configuration settings for the 3x-ui panel including web server and Telegram bot settings.
+// AllSetting contains all configuration settings for the 3x-ui panel including web server settings.
 type AllSetting struct {
 	// Web server settings
 	WebListen        string `json:"webListen" form:"webListen"`               // Web server listen IP address
@@ -39,18 +39,6 @@ type AllSetting struct {
 	TrafficDiff int    `json:"trafficDiff" form:"trafficDiff"` // Traffic warning threshold percentage
 	RemarkModel string `json:"remarkModel" form:"remarkModel"` // Remark model pattern for inbounds
 	Datepicker  string `json:"datepicker" form:"datepicker"`   // Date picker format
-
-	// Telegram bot settings
-	TgBotEnable      bool   `json:"tgBotEnable" form:"tgBotEnable"`           // Enable Telegram bot notifications
-	TgBotToken       string `json:"tgBotToken" form:"tgBotToken"`             // Telegram bot token
-	TgBotProxy       string `json:"tgBotProxy" form:"tgBotProxy"`             // Proxy URL for Telegram bot
-	TgBotAPIServer   string `json:"tgBotAPIServer" form:"tgBotAPIServer"`     // Custom API server for Telegram bot
-	TgBotChatId      string `json:"tgBotChatId" form:"tgBotChatId"`           // Telegram chat ID for notifications
-	TgRunTime        string `json:"tgRunTime" form:"tgRunTime"`               // Cron schedule for Telegram notifications
-	TgBotBackup      bool   `json:"tgBotBackup" form:"tgBotBackup"`           // Enable database backup via Telegram
-	TgBotLoginNotify bool   `json:"tgBotLoginNotify" form:"tgBotLoginNotify"` // Send login notifications
-	TgCpu            int    `json:"tgCpu" form:"tgCpu"`                       // CPU usage threshold for alerts
-	TgLang           string `json:"tgLang" form:"tgLang"`                     // Telegram bot language
 
 	// Security settings
 	TimeLocation    string `json:"timeLocation" form:"timeLocation"`       // Time zone location

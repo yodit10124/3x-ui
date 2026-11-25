@@ -52,8 +52,7 @@ func SecurityHeadersMiddleware(hstsMaxAge int, https bool) gin.HandlerFunc {
 // which covers /panel/api/*, /panel/setting/* (update, updateUser,
 // restartPanel, all, ...) and /panel/xray/* (update, warp/:action,
 // nord/*, testOutbound, resetOutboundsTraffic, ...). GET requests are
-// read-only, except for /panel/api/backuptotgbot which triggers a Telegram
-// backup (a state-changing side effect), so that endpoint is protected too.
+// read-only.
 // The sensitive GET /panel/api/server/getDb was changed to POST (see
 // web/controller/server.go). Two routes outside /panel/ are covered
 // explicitly: POST /logout (L-3, logout is POST-only since the GET route
@@ -86,8 +85,7 @@ func CSRFMiddleware() gin.HandlerFunc {
 		switch {
 		case strings.Contains(path, "/panel/"):
 			needsCheck = method == http.MethodPost || method == http.MethodPut ||
-				method == http.MethodDelete || method == http.MethodPatch ||
-				strings.HasSuffix(path, "/backuptotgbot")
+				method == http.MethodDelete || method == http.MethodPatch
 		case strings.HasSuffix(path, "/logout"):
 			// L-3: logout is a state-changing POST; the GET route no
 			// longer exists, so only POST needs the check here.

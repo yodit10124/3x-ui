@@ -14,7 +14,6 @@ type APIController struct {
 	BaseController
 	inboundController *InboundController
 	serverController  *ServerController
-	Tgbot             service.Tgbot
 }
 
 // NewAPIController creates a new APIController instance and initializes its routes.
@@ -49,12 +48,4 @@ func (a *APIController) initRouter(g *gin.RouterGroup, customGeo *service.Custom
 	a.serverController = NewServerController(server)
 
 	NewCustomGeoController(api.Group("/custom-geo"), customGeo)
-
-	// Extra routes
-	api.GET("/backuptotgbot", a.BackuptoTgbot)
-}
-
-// BackuptoTgbot sends a backup of the panel data to Telegram bot admins.
-func (a *APIController) BackuptoTgbot(c *gin.Context) {
-	a.Tgbot.SendBackupToAdmins()
 }

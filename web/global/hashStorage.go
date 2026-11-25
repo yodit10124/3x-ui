@@ -36,7 +36,7 @@ func NewHashStorage(expiration time.Duration) *HashStorage {
 // same key and an attacker who could control the query could craft an
 // MD5 collision that decoded to a different query. A random key has
 // neither property. The key format stays 32 hex characters, so the
-// Telegram callback data length is unchanged.
+// callback data length is unchanged.
 func (h *HashStorage) SaveHash(query string) string {
 	h.Lock()
 	defer h.Unlock()

@@ -2,16 +2,12 @@ package service
 
 import (
 	"encoding/json"
-	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
-	"github.com/mhsanaei/3x-ui/v2/logger"
-	"github.com/mhsanaei/3x-ui/v2/xray"
-	"github.com/op/go-logging"
 )
 
 // N-2: InboundService.GetOnlineClients dereferenced the package-global
@@ -148,106 +144,8 @@ func TestUpdateInboundRejectsInvalidEmail(t *testing.T) {
 	}
 }
 
-// TestClientEmailsForTgID (L-16): the Telegram id may be stored as a
-// JSON number ("tgId": 999, spaced or compact) or as a string
-// ("tgId": "999", as the Telegram flow used to emit); all forms must
-// match. The old LIKE only matched the spaced number form.
-func TestClientEmailsForTgID(t *testing.T) {
-	settings := `{"clients":[
-		{"email":"spaced@example.com","tgId": 777},
-		{"email":"compact@example.com","tgId":777},
-		{"email":"string@example.com","tgId": "777"},
-		{"email":"other@example.com","tgId": 888},
-		{"email":"none@example.com"},
-		{"email":"empty@example.com","tgId": ""},
-		{"email":"bad@example.com","tgId": "not-a-number"}
-	]}`
-	got := clientEmailsForTgID(settings, 777)
-	want := []string{"spaced@example.com", "compact@example.com", "string@example.com"}
-	if len(got) != len(want) {
-		t.Fatalf("clientEmailsForTgID(777) = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("clientEmailsForTgID(777) = %v, want %v", got, want)
-		}
-	}
-	if got := clientEmailsForTgID(settings, 888); len(got) != 1 || got[0] != "other@example.com" {
-		t.Fatalf("clientEmailsForTgID(888) = %v, want [other@example.com]", got)
-	}
-	if got := clientEmailsForTgID(settings, 999); len(got) != 0 {
-		t.Fatalf("clientEmailsForTgID(999) = %v, want []", got)
-	}
-	if got := clientEmailsForTgID(`not json`, 777); len(got) != 0 {
-		t.Fatalf("clientEmailsForTgID(bad json) = %v, want []", got)
-	}
-}
-
-// TestGetClientTrafficTgBotFormats (L-16): traffic must be found for
-// clients whose tgId is stored in any of the three forms.
-func TestGetClientTrafficTgBotFormats(t *testing.T) {
-	t.Setenv("XUI_LOG_FOLDER", t.TempDir())
-	logger.InitLogger(logging.ERROR)
-
-	dbPath := filepath.Join(t.TempDir(), "x-ui.db")
-	if err := database.InitDB(dbPath); err != nil {
-		t.Fatalf("InitDB: %v", err)
-	}
-	t.Cleanup(func() { database.CloseDB() })
-
-	db := database.GetDB()
-	cases := []struct {
-		email    string
-		settings string
-	}{
-		{"spaced@example.com", `{"clients":[{"id":"11111111-1111-1111-1111-111111111111","email":"spaced@example.com","tgId": 777,"enable":true}]}`},
-		{"compact@example.com", `{"clients":[{"id":"22222222-2222-2222-2222-222222222222","email":"compact@example.com","tgId":777,"enable":true}]}`},
-		{"string@example.com", `{"clients":[{"id":"33333333-3333-3333-3333-333333333333","email":"string@example.com","tgId": "777","enable":true}]}`},
-	}
-	for i, tc := range cases {
-		inbound := &model.Inbound{
-			Remark:   "tg-format",
-			Enable:   true,
-			Port:     13000 + i,
-			Protocol: model.VLESS,
-			Settings: tc.settings,
-			Tag:      fmt.Sprintf("tg-format-%d", i),
-		}
-		if err := db.Create(inbound).Error; err != nil {
-			t.Fatalf("create inbound: %v", err)
-		}
-		if err := db.Create(&xray.ClientTraffic{
-			InboundId: inbound.Id, Email: tc.email, Up: 100, Down: 200, Enable: true,
-		}).Error; err != nil {
-			t.Fatalf("create traffic: %v", err)
-		}
-	}
-
-	traffics, err := (&InboundService{}).GetClientTrafficTgBot(777)
-	if err != nil {
-		t.Fatalf("GetClientTrafficTgBot(777): %v", err)
-	}
-	if len(traffics) != 3 {
-		t.Fatalf("GetClientTrafficTgBot(777) returned %d records, want 3", len(traffics))
-	}
-	found := map[string]bool{}
-	for _, ct := range traffics {
-		found[ct.Email] = true
-	}
-	for _, tc := range cases {
-		if !found[tc.email] {
-			t.Fatalf("GetClientTrafficTgBot(777) missed %s (found %v)", tc.email, found)
-		}
-	}
-
-	if traffics, err := (&InboundService{}).GetClientTrafficTgBot(999); err != nil || len(traffics) != 0 {
-		t.Fatalf("GetClientTrafficTgBot(999) = (%d, %v), want (0, nil)", len(traffics), err)
-	}
-}
-
 // TestUpdateInboundClientWithNilXrayProcess (leftover 1): with Xray
-// never started (p is nil), a legit client update — the path a TG
-// user bind takes via SetClientTelegramUserID — must persist the
+// never started (p is nil), a legit client update must persist the
 // change instead of panicking on p.GetAPIPort(), same class as H-2.
 func TestUpdateInboundClientWithNilXrayProcess(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "x-ui.db")
@@ -270,9 +168,9 @@ func TestUpdateInboundClientWithNilXrayProcess(t *testing.T) {
 		t.Fatalf("AddInbound: %v", err)
 	}
 
-	// Same client, only a tgId attached — the TG bind shape.
+	// Same client, only a comment attached.
 	updated := *created
-	updated.Settings = `{"clients":[{"id":"` + clientID + `","email":"old@example.com","enable":true,"tgId":12345}]}`
+	updated.Settings = `{"clients":[{"id":"` + clientID + `","email":"old@example.com","enable":true,"comment":"nil-xray"}]}`
 	needRestart, err := svc.UpdateInboundClient(&updated, clientID)
 	if err != nil {
 		t.Fatalf("UpdateInboundClient with nil Xray process: %v", err)
@@ -294,7 +192,7 @@ func TestUpdateInboundClientWithNilXrayProcess(t *testing.T) {
 		t.Fatalf("stored clients = %d, want 1", len(clients))
 	}
 	client, _ := clients[0].(map[string]any)
-	if got, _ := client["tgId"].(float64); got != 12345 {
-		t.Fatalf("stored tgId = %v, want 12345 (change was not persisted)", client["tgId"])
+	if got, _ := client["comment"].(string); got != "nil-xray" {
+		t.Fatalf("stored comment = %v, want nil-xray (change was not persisted)", client["comment"])
 	}
 }

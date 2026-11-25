@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"fmt"
 	"net/http"
 	"sync"
 	"text/template"
@@ -28,7 +27,6 @@ type IndexController struct {
 
 	settingService service.SettingService
 	userService    service.UserService
-	tgbot          service.Tgbot
 }
 
 // NewIndexController creates a new IndexController and initializes its routes.
@@ -156,8 +154,7 @@ func (a *IndexController) login(c *gin.Context) {
 		return
 	}
 
-	user, checkErr := a.userService.CheckUser(form.Username, form.Password, form.TwoFactorCode)
-	timeStr := time.Now().Format("2006-01-02 15:04:05")
+	user, _ := a.userService.CheckUser(form.Username, form.Password, form.TwoFactorCode)
 	safeUser := template.HTMLEscapeString(form.Username)
 
 	if user == nil {
@@ -165,13 +162,6 @@ func (a *IndexController) login(c *gin.Context) {
 		logger.Warningf("failed login attempt for username: \"%s\", IP: \"%s\"", safeUser, getRemoteIp(c))
 		recordLoginFailure(getRemoteIp(c))
 
-		notifyPass := "***"
-		if checkErr != nil && checkErr.Error() == "invalid 2fa code" {
-			translatedError := a.tgbot.I18nBot("tgbot.messages.2faFailed")
-			notifyPass = fmt.Sprintf("*** (%s)", translatedError)
-		}
-
-		a.tgbot.UserLoginNotify(form.Username, notifyPass, getRemoteIp(c), timeStr, 0)
 		pureJsonMsg(c, http.StatusOK, false, I18nWeb(c, "pages.login.toasts.wrongUsernameOrPassword"))
 		return
 	}
@@ -182,7 +172,6 @@ func (a *IndexController) login(c *gin.Context) {
 	if form.Username == "admin" && form.Password == "admin" {
 		logger.Warning("SECURITY: the panel is still using the default admin/admin credentials - change them immediately in Settings")
 	}
-	a.tgbot.UserLoginNotify(form.Username, ``, getRemoteIp(c), timeStr, 1)
 
 	if err := session.SetLoginUser(c, user); err != nil {
 		logger.Warning("Unable to save session:", err)

@@ -42,18 +42,6 @@
                     key ]]</a-select-option>
             </a-select>
         </a-form-item>
-        <a-form-item v-if="app.tgBotEnable">
-            <template slot="label">
-                <a-tooltip>
-                    <template slot="title">
-                        <span>{{ i18n "pages.inbounds.telegramDesc" }}</span>
-                    </template>
-                    Telegram ChatID
-                    <a-icon type="question-circle"></a-icon>
-                </a-tooltip>
-            </template>
-            <a-input-number :style="{ width: '50%' }" v-model.number="clientsBulkModal.tgId" min="0"></a-input-number>
-        </a-form-item>
         <a-form-item v-if="app.ipLimitEnable">
             <template slot="label">
                 <a-tooltip>
@@ -134,7 +122,6 @@
         lastNum: 1,
         emailPrefix: "",
         emailPostfix: "",
-        tgId: '',
         security: "auto",
         flow: "",
         delayedStart: false,
@@ -156,7 +143,6 @@
                 newClient = clientsBulkModal.newClient(clientsBulkModal.dbInbound.protocol);
                 if (method == 4) newClient.email = "";
                 newClient.email += useNum ? prefix + i.toString() + postfix : prefix + postfix;
-                newClient.tgId = clientsBulkModal.tgId;
                 newClient.security = clientsBulkModal.security;
                 newClient.limitIp = clientsBulkModal.limitIp;
                 newClient._totalGB = clientsBulkModal.totalGB;
@@ -188,7 +174,6 @@
             this.lastNum = 1;
             this.emailPrefix = "";
             this.emailPostfix = "";
-            this.tgId = '';
             this.security = "auto";
             this.flow = "";
             this.dbInbound = new DBInbound(dbInbound);
