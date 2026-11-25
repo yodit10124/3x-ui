@@ -248,3 +248,79 @@ func contains(haystack, needle string) bool {
 	}
 	return false
 }
+
+// TestGetInboundByEmailExactMatch (L-8): the old `settings LIKE
+// %email%` matched substrings and treated %/_ as wildcards. An email
+// containing % must match only its own inbound, and an address that
+// merely appears inside another field must match nothing.
+func TestGetInboundByEmailExactMatch(t *testing.T) {
+	setupIntegrationDB(t)
+	seedInboundWithClient(t, "in-a", "a%b@example.com", 1)
+	seedInboundWithClient(t, "in-b", "aXYZb@example.com", 1)
+
+	// C mentions victim@example.com in a client id, but no client
+	// has it as its email.
+	settings := map[string]any{
+		"clients": []map[string]any{
+			{"id": "victim@example.com", "email": "other@example.com", "limitIp": 1},
+		},
+	}
+	settingsJSON, err := json.Marshal(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.GetDB().Create(&model.Inbound{
+		Tag: "in-c", Enable: true, Protocol: model.VLESS, Port: 4321,
+		Settings: string(settingsJSON),
+	}).Error; err != nil {
+		t.Fatalf("seed inbound C: %v", err)
+	}
+
+	job := &CheckClientIpJob{}
+	got, err := job.getInboundByEmail("a%b@example.com")
+	if err != nil {
+		t.Fatalf("getInboundByEmail(a%%b@example.com): %v", err)
+	}
+	if got.Tag != "in-a" {
+		t.Fatalf("getInboundByEmail(a%%b@example.com) returned inbound %q, want in-a", got.Tag)
+	}
+	got, err = job.getInboundByEmail("aXYZb@example.com")
+	if err != nil {
+		t.Fatalf("getInboundByEmail(aXYZb@example.com): %v", err)
+	}
+	if got.Tag != "in-b" {
+		t.Fatalf("getInboundByEmail(aXYZb@example.com) returned inbound %q, want in-b", got.Tag)
+	}
+	if _, err := job.getInboundByEmail("victim@example.com"); err == nil {
+		t.Fatal("getInboundByEmail(victim@example.com) matched an inbound that only mentions the address, want an error")
+	}
+}
+
+// TestUpdateInboundClientIpsKeepsGlobalLogger (L-8): the over-limit
+// scan used to call log.SetOutput on the process-global standard
+// logger and never restore it, redirecting every log.Printf in the
+// process to 3xipl.log. The scan must leave the global logger alone.
+func TestUpdateInboundClientIpsKeepsGlobalLogger(t *testing.T) {
+	setupIntegrationDB(t)
+
+	const email = "pr4091-abuse"
+	seedInboundWithClient(t, "inbound-pr4091-logger", email, 1)
+
+	now := time.Now().Unix()
+	row := seedClientIps(t, email, []IPWithTimestamp{
+		{IP: "10.1.0.1", Timestamp: now - 60},
+	})
+
+	before := log.Writer()
+	j := NewCheckClientIpJob()
+	live := []IPWithTimestamp{
+		{IP: "10.1.0.1", Timestamp: now - 5},
+		{IP: "192.0.2.9", Timestamp: now},
+	}
+	if !j.updateInboundClientIps(row, email, live) {
+		t.Fatal("shouldCleanLog must be true when the live set exceeds the limit")
+	}
+	if log.Writer() != before {
+		t.Fatal("updateInboundClientIps changed the process-global log output; it must use its own logger")
+	}
+}

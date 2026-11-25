@@ -1039,7 +1039,7 @@ func TestBuildJSONForProtocolInjectionBlocked(t *testing.T) {
 			ID      string `json:"id"`
 			Flow    string `json:"flow"`
 			Email   string `json:"email"`
-			TgID    string `json:"tgId"`
+			TgID    int64  `json:"tgId"`
 			Comment string `json:"comment"`
 		} `json:"clients"`
 	}
@@ -1050,7 +1050,9 @@ func TestBuildJSONForProtocolInjectionBlocked(t *testing.T) {
 		t.Fatalf("want exactly one client, got %d: %s", len(parsed.Clients), out)
 	}
 	got := parsed.Clients[0]
-	if got.ID != base.id || got.Flow != base.flow || got.TgID != base.tgID {
+	// L-16: tgId is a JSON number now, and the injected "666" inside
+	// the comment must not override it.
+	if got.ID != base.id || got.Flow != base.flow || got.TgID != 123 {
 		t.Fatalf("injected fields leaked through: %+v", got)
 	}
 	if got.Comment != inject.comment {
@@ -1434,5 +1436,196 @@ func TestHandleUsersSharedRequiresIssuedRequest(t *testing.T) {
 	share(tgbotTestAdminID, int(issued2), 888)
 	if got := tgIDOf(); got != 777 {
 		t.Fatalf("tgId = %d after replay, want 777 (unchanged)", got)
+	}
+}
+
+// TestValidateTgbotURLs (L-15): the proxy must be a socks5 URL with a
+// host, the API server an http(s) URL with a host. The old prefix-only
+// checks accepted "httpfoo://..." and host-less URLs.
+func TestValidateTgbotURLs(t *testing.T) {
+	// The validators log on the invalid path, so the logger must be
+	// initialised first (as in setupTgbotTestDB).
+	t.Setenv("XUI_LOG_FOLDER", t.TempDir())
+	logger.InitLogger(logging.ERROR)
+	for _, good := range []string{"socks5://127.0.0.1:1080", "socks5://user:pass@proxy.example.com:1080"} {
+		if got := validateTgbotProxyURL(good); got != good {
+			t.Fatalf("validateTgbotProxyURL(%q) = %q, want it kept", good, got)
+		}
+	}
+	for _, bad := range []string{"http://127.0.0.1:1080", "https://proxy.example.com", "socks5://", "socks5:/x", "://bad", "socks4://127.0.0.1:1080"} {
+		if got := validateTgbotProxyURL(bad); got != "" {
+			t.Fatalf("validateTgbotProxyURL(%q) = %q, want empty", bad, got)
+		}
+	}
+	for _, good := range []string{"https://api.example.com", "http://127.0.0.1:8080", "https://api.example.com/bot"} {
+		if got := validateTgbotAPIServerURL(good); got != good {
+			t.Fatalf("validateTgbotAPIServerURL(%q) = %q, want it kept", good, got)
+		}
+	}
+	for _, bad := range []string{"httpfoo://api.example.com", "ftp://api.example.com", "https://", "https:/x", "://bad", "api.example.com"} {
+		if got := validateTgbotAPIServerURL(bad); got != "" {
+			t.Fatalf("validateTgbotAPIServerURL(%q) = %q, want empty", bad, got)
+		}
+	}
+	if got := validateTgbotProxyURL(""); got != "" {
+		t.Fatalf("validateTgbotProxyURL(\"\") = %q, want empty", got)
+	}
+	if got := validateTgbotAPIServerURL(""); got != "" {
+		t.Fatalf("validateTgbotAPIServerURL(\"\") = %q, want empty", got)
+	}
+}
+
+// TestAddClientKeepsLiveDraft (L-16): tapping "add client" again, or
+// picking an inbound, must not silently discard a draft in progress.
+func TestAddClientKeepsLiveDraft(t *testing.T) {
+	inboundID := setupTgbotTestDB(t)
+	setupFakeTgbot(t)
+	tb := (&Tgbot{}).NewTgbot()
+
+	addClientSessionsMu.Lock()
+	sess := tb.newAddClientSession(tgbotTestChatID, tgbotTestAdminID, inboundID)
+	sess.email = "draft@example.com"
+	origID := sess.id
+	addClientSessionsMu.Unlock()
+
+	tb.answerCallback(tgbotTestCallbackQuery(tgbotTestAdminID, "add_client"), true)
+	addClientSessionsMu.Lock()
+	kept := getAddClientSession(tgbotTestChatID, tgbotTestAdminID)
+	if kept == nil || kept.email != "draft@example.com" || kept.id != origID {
+		t.Fatalf("add_client discarded the live draft: %+v", kept)
+	}
+	addClientSessionsMu.Unlock()
+
+	tb.answerCallback(tgbotTestCallbackQuery(tgbotTestAdminID, fmt.Sprintf("add_client_to %d", inboundID)), true)
+	addClientSessionsMu.Lock()
+	kept = getAddClientSession(tgbotTestChatID, tgbotTestAdminID)
+	if kept == nil || kept.email != "draft@example.com" || kept.id != origID || kept.inboundID != inboundID {
+		t.Fatalf("add_client_to discarded the live draft: %+v", kept)
+	}
+	addClientSessionsMu.Unlock()
+}
+
+// TestBuildJSONForProtocolTgIDNumber (L-16): the stored client JSON
+// must carry tgId as a number, so model.Client parses it.
+func TestBuildJSONForProtocolTgIDNumber(t *testing.T) {
+	tb := (&Tgbot{}).NewTgbot()
+	sess := &addClientSession{
+		id: "11111111-1111-1111-1111-111111111111", email: "victim@example.com",
+		enable: true, tgID: "123",
+	}
+	out, err := tb.BuildJSONForProtocol(sess, model.VLESS)
+	if err != nil {
+		t.Fatalf("BuildJSONForProtocol: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	client := parsed["clients"].([]any)[0].(map[string]any)
+	if _, ok := client["tgId"].(float64); !ok {
+		t.Fatalf("tgId is not a JSON number: %s", out)
+	}
+	if client["tgId"].(float64) != 123 {
+		t.Fatalf("tgId = %v, want 123", client["tgId"])
+	}
+
+	// An unset Telegram id stores 0, not an empty string.
+	sess.tgID = ""
+	out, err = tb.BuildJSONForProtocol(sess, model.VLESS)
+	if err != nil {
+		t.Fatalf("BuildJSONForProtocol: %v", err)
+	}
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	client = parsed["clients"].([]any)[0].(map[string]any)
+	if _, ok := client["tgId"].(float64); !ok {
+		t.Fatalf("tgId is not a JSON number: %s", out)
+	}
+	if client["tgId"].(float64) != 0 {
+		t.Fatalf("tgId = %v, want 0", client["tgId"])
+	}
+}
+
+// TestBulkSenderCapsMessages (L-16): one bulk callback may not fan
+// out to unbounded Telegram sends.
+func TestBulkSenderCapsMessages(t *testing.T) {
+	api := setupFakeTgbot(t)
+	tb := (&Tgbot{}).NewTgbot()
+	sender := newBulkSender(tb, tgbotTestChatID)
+	for i := 0; i < maxTgbotBulkMessages+5; i++ {
+		sender.send(fmt.Sprintf("item %d", i))
+	}
+	sender.finish()
+	if got := api.sendCount(); got != maxTgbotBulkMessages+1 {
+		t.Fatalf("bulk sender sent %d messages, want %d (cap) + 1 summary", got, maxTgbotBulkMessages)
+	}
+	if sender.total != maxTgbotBulkMessages+5 || !sender.truncated {
+		t.Fatalf("bulk sender total=%d truncated=%v, want %d/true", sender.total, sender.truncated, maxTgbotBulkMessages+5)
+	}
+
+	// Under the cap nothing is truncated and no summary is sent.
+	api2 := setupFakeTgbot(t)
+	sender2 := newBulkSender(tb, tgbotTestChatID)
+	sender2.send("only one")
+	sender2.finish()
+	if got := api2.sendCount(); got != 1 {
+		t.Fatalf("bulk sender under the cap sent %d messages, want 1", got)
+	}
+}
+
+// TestResetAllTrafficsCapsMessages (L-16): resetting traffic for many
+// clients still resets every one of them, but reports at most the cap
+// plus a summary and the finish message.
+func TestResetAllTrafficsCapsMessages(t *testing.T) {
+	inboundID := setupTgbotTestDB(t)
+	api := setupFakeTgbot(t)
+	tb := (&Tgbot{}).NewTgbot()
+
+	origCap := maxTgbotBulkMessages
+	maxTgbotBulkMessages = 2
+	t.Cleanup(func() { maxTgbotBulkMessages = origCap })
+
+	db := database.GetDB()
+	var inbound model.Inbound
+	if err := db.First(&inbound, inboundID).Error; err != nil {
+		t.Fatalf("read inbound: %v", err)
+	}
+	clients := make([]string, 0, 5)
+	settings := `{"clients":[`
+	for i := 1; i <= 5; i++ {
+		email := fmt.Sprintf("reset-%d@example.com", i)
+		clients = append(clients, email)
+		if i > 1 {
+			settings += ","
+		}
+		settings += fmt.Sprintf(`{"id":"11111111-1111-1111-1111-11111111111%d","email":%q,"tgId":0,"enable":true}`, i, email)
+		if err := db.Create(&xray.ClientTraffic{
+			InboundId: inboundID, Email: email, Up: 500, Down: 600, Enable: true,
+		}).Error; err != nil {
+			t.Fatalf("create traffic: %v", err)
+		}
+	}
+	settings += `]}`
+	inbound.Settings = settings
+	if err := db.Save(&inbound).Error; err != nil {
+		t.Fatalf("save inbound: %v", err)
+	}
+
+	tb.answerCallback(tgbotTestCallbackQuery(tgbotTestAdminID, "reset_all_traffics_c"), true)
+
+	// 2 per-client reports + 1 summary + 1 finish message.
+	if got := api.sendCount(); got != 4 {
+		t.Fatalf("reset_all_traffics_c sent %d messages, want 4", got)
+	}
+	// ...but every client's traffic was still reset.
+	for _, email := range clients {
+		var ct xray.ClientTraffic
+		if err := db.Where("email = ?", email).First(&ct).Error; err != nil {
+			t.Fatalf("read traffic for %s: %v", email, err)
+		}
+		if ct.Up != 0 || ct.Down != 0 {
+			t.Fatalf("traffic for %s not reset: up=%d down=%d", email, ct.Up, ct.Down)
+		}
 	}
 }

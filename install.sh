@@ -909,7 +909,7 @@ config_after_install() {
                 echo -e "${yellow}Generated random port: ${config_port}${plain}"
             fi
 
-            ${xui_folder}/x-ui setting -username "${config_username}" -password "${config_password}" -port "${config_port}" -webBasePath "${config_webBasePath}"
+            printf '%s' "${config_password}" | ${xui_folder}/x-ui setting -username "${config_username}" -password-stdin -port "${config_port}" -webBasePath "${config_webBasePath}"
 
             # Fresh install with no certificate: prompt for SSL setup
             # (default: self-signed CN=8620, sign both IPv4 and IPv6),
@@ -976,7 +976,7 @@ config_after_install() {
             local config_password=$(gen_random_string 10)
 
             echo -e "${yellow}Default credentials detected. Security update required...${plain}"
-            ${xui_folder}/x-ui setting -username "${config_username}" -password "${config_password}"
+            printf '%s' "${config_password}" | ${xui_folder}/x-ui setting -username "${config_username}" -password-stdin
             echo -e "Generated new random login credentials:"
             echo -e "###############################################"
             echo -e "${green}Username: ${config_username}${plain}"

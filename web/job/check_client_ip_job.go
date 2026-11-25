@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/database"
@@ -410,8 +411,11 @@ func (j *CheckClientIpJob) updateInboundClientIps(inboundClientIps *model.Inboun
 		return false
 	}
 	defer logIpFile.Close()
-	log.SetOutput(logIpFile)
-	log.SetFlags(log.LstdFlags)
+	// L-8: the fail2ban log gets its own logger. log.SetOutput
+	// rewrites the process-global standard logger and was never
+	// restored, so after the first over-limit scan every log.Printf
+	// in the process went to 3xipl.log instead of its own destination.
+	ipLogger := log.New(logIpFile, "", log.LstdFlags)
 
 	// historical db-only ips are excluded from this count on purpose.
 	var keptLive []IPWithTimestamp
@@ -428,7 +432,11 @@ func (j *CheckClientIpJob) updateInboundClientIps(inboundClientIps *model.Inboun
 		// don't change the wording.
 		for _, ipTime := range bannedLive {
 			j.disAllowedIps = append(j.disAllowedIps, ipTime.IP)
-			log.Printf("[LIMIT_IP] Email = %s || Disconnecting OLD IP = %s || Timestamp = %d", clientEmail, ipTime.IP, ipTime.Timestamp)
+			// L-8: the email and IP are sanitised before they reach
+			// the load-bearing fail2ban line — a newline or "||" in
+			// a (e.g. imported) email would forge a [LIMIT_IP] line
+			// and get an arbitrary IP banned.
+			ipLogger.Printf("[LIMIT_IP] Email = %s || Disconnecting OLD IP = %s || Timestamp = %d", sanitizeFail2banField(clientEmail), sanitizeFail2banField(ipTime.IP), ipTime.Timestamp)
 		}
 
 		// force xray to drop existing connections from banned ips
@@ -520,10 +528,23 @@ func (j *CheckClientIpJob) disconnectClientTemporarily(inbound *model.Inbound, c
 	// Wait a moment for disconnection to take effect
 	time.Sleep(100 * time.Millisecond)
 
-	// Re-add user to allow new connections
-	err = xrayAPI.AddUser(protocol, inbound.Tag, clientConfig)
-	if err != nil {
-		logger.Warningf("[LIMIT_IP] Failed to re-add user %s: %v", clientEmail, err)
+	// Re-add user to allow new connections. Retry: a transient API
+	// failure here used to leave the client permanently offline
+	// until the next Xray restart, with only a warning logged (L-8).
+	// If every attempt fails, say so loudly — the client is still in
+	// the panel database and comes back on the next Xray restart.
+	var addErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
+		addErr = xrayAPI.AddUser(protocol, inbound.Tag, clientConfig)
+		if addErr == nil {
+			break
+		}
+	}
+	if addErr != nil {
+		logger.Errorf("[LIMIT_IP] Failed to re-add user %s after 3 attempts, client stays offline until Xray restarts: %v", clientEmail, addErr)
 	}
 }
 
@@ -585,13 +606,43 @@ func getAPIPortFromConfigData(configData []byte) (int, error) {
 }
 
 func (j *CheckClientIpJob) getInboundByEmail(clientEmail string) (*model.Inbound, error) {
+	// L-8: the old `settings LIKE %email%` matched substrings and
+	// treated %/_ in the email as wildcards, so it could return the
+	// wrong inbound — or one whose settings merely mention the email
+	// inside another field. Match the client email exactly, in Go,
+	// against the parsed settings.
 	db := database.GetDB()
-	inbound := &model.Inbound{}
-
-	err := db.Model(&model.Inbound{}).Where("settings LIKE ?", "%"+clientEmail+"%").First(inbound).Error
-	if err != nil {
+	var inbounds []model.Inbound
+	if err := db.Model(&model.Inbound{}).Find(&inbounds).Error; err != nil {
 		return nil, err
 	}
+	for i := range inbounds {
+		var settings map[string][]model.Client
+		if err := json.Unmarshal([]byte(inbounds[i].Settings), &settings); err != nil {
+			continue
+		}
+		for _, client := range settings["clients"] {
+			if client.Email == clientEmail {
+				return &inbounds[i], nil
+			}
+		}
+	}
+	return nil, errors.New("inbound not found for email")
+}
 
-	return inbound, nil
+// sanitizeFail2banField strips every character that could break the
+// load-bearing fail2ban log format (L-8): a newline or "||" in the
+// email would forge a [LIMIT_IP] line and get an arbitrary IP banned.
+// Only the characters a valid email or IP can contain survive.
+func sanitizeFail2banField(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		case r == '.' || r == '_' || r == '%' || r == '+' || r == '-' || r == '@' || r == ':':
+			return r
+		default:
+			return '_'
+		}
+	}, s)
 }

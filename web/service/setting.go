@@ -116,10 +116,12 @@ var defaultValueMap = map[string]string{
 // secretSettingKeys are never returned in clear text by GetAllSetting (M7):
 // a leaked Telegram bot token is equivalent to panel admin access, and the
 // 2FA token is a credential in its own right. The frontend only needs to
-// know whether they are set.
+// know whether they are set. The LDAP bind password is a credential for
+// another system (the LDAP directory), so it is masked the same way (L-1).
 var secretSettingKeys = map[string]bool{
 	"tgBotToken":     true,
 	"twoFactorToken": true,
+	"ldapPassword":   true,
 }
 
 // SettingService provides business logic for application settings management.
@@ -223,8 +225,16 @@ func (s *SettingService) ResetSettings() error {
 	if err != nil {
 		return err
 	}
-	return db.Model(model.User{}).
-		Where("1 = 1").Error
+	// L-2: this used to be a dead query — Model+Where with no
+	// Delete/Update/Find executes no SQL, so `x-ui setting -reset`
+	// reported success while the admin account survived. A reset
+	// that leaves the admin (and their live sessions) behind is not
+	// a reset: delete the users and their login sessions too. The
+	// panel recreates a default admin on next start (initUser).
+	if err := db.Where("1 = 1").Delete(model.User{}).Error; err != nil {
+		return err
+	}
+	return db.Where("1 = 1").Delete(model.LoginSession{}).Error
 }
 
 func (s *SettingService) getSetting(key string) (*model.Setting, error) {
@@ -500,6 +510,42 @@ func (s *SettingService) GetRemarkModel() (string, error) {
 // immediately even before a restart.
 func (s *SettingService) RotateSecret() error {
 	return s.saveSetting("secret", random.Seq(32))
+}
+
+// SanitizeImportedSettings neutralises the high-risk settings an
+// imported database may carry (L-6). ImportDB rotates the session
+// secret, but every other setting used to take effect as-is, so a
+// backup from an untrusted source could silently:
+//   - send Telegram notifications to the attacker's bot/chat
+//     (tgBotToken/tgBotChatId) — cleared, the operator re-enters them;
+//   - exfiltrate every client's email every 10s to a public attacker
+//     URL (externalTrafficInformEnable; M-1's URL validation cannot
+//     block a public URL) — the switch is turned off, the URL itself
+//     is left for the operator to review;
+//   - remove the Geo download bound (geoMaxFileSizeMB set absurdly
+//     high) — clamped to the ceiling, never raised above it.
+//
+// WARP/Nord credentials and the panel listen settings (webListen /
+// webPort / webCertFile / webKeyFile) are deliberately left alone:
+// clearing them would change where the restored panel listens on
+// next restart and could lock the operator out of their own restore.
+// The import success message tells the operator to review them.
+func (s *SettingService) SanitizeImportedSettings() error {
+	if err := s.SetTgBotToken(""); err != nil {
+		return err
+	}
+	if err := s.SetTgBotChatId(""); err != nil {
+		return err
+	}
+	if err := s.SetExternalTrafficInformEnable(false); err != nil {
+		return err
+	}
+	if mb, err := s.GetGeoMaxFileSizeMB(); err == nil && mb > maxGeoMaxFileSizeMB {
+		if err := s.setInt("geoMaxFileSizeMB", maxGeoMaxFileSizeMB); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *SettingService) GetSecret() ([]byte, error) {

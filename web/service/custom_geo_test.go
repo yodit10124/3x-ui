@@ -59,6 +59,62 @@ func disableSSRFCheck(t *testing.T) {
 	})
 }
 
+// stubExampleComDNS makes example.com resolve to its real public IP
+// (93.184.216.34) instead of whatever the local resolver returns. The
+// sandbox resolver answers 198.18.106.251 for every public name, which
+// is inside the blocked 198.18.0.0/15 benchmarking range, so without the
+// stub this test fails for environmental reasons. Other hostnames still
+// use the real resolver, and the SSRF check itself stays fully active.
+// Restores the original resolver on cleanup. (N-6)
+func stubExampleComDNS(t *testing.T) {
+	t.Helper()
+	orig := resolveHostIPs
+	resolveHostIPs = func(ctx context.Context, host string) ([]net.IP, error) {
+		if host == "example.com" {
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		}
+		return orig(ctx, host)
+	}
+	t.Cleanup(func() { resolveHostIPs = orig })
+}
+
+func TestIsBlockedIP_ExtendedRanges(t *testing.T) {
+	blocked := []string{
+		// Already covered by the net.IP helpers.
+		"127.0.0.1", "10.0.0.5", "172.16.0.1", "192.168.1.1",
+		"169.254.169.254", "0.0.0.0", "::1", "fe80::1", "fc00::1",
+		"::ffff:127.0.0.1", "::ffff:10.0.0.5",
+		// Ranges IsPrivate/IsLoopback/IsLinkLocalUnicast miss (L-5).
+		"0.1.2.3", "100.64.0.1", "100.127.255.255",
+		"192.0.0.8", "192.0.2.1", "198.18.0.1", "198.19.255.255",
+		"198.51.100.1", "203.0.113.1", "240.0.0.1", "255.255.255.255",
+		// IPv6 special forms (N-5): documentation, benchmarking,
+		// discard, deprecated site-local, and addresses embedding an
+		// internal IPv4 address (compatible, 6to4, NAT64).
+		"2001:db8::1", "2001:2::1", "100::1", "fec0::1",
+		"::127.0.0.1", "::10.0.0.5", "2002:7f00:1::1", "64:ff9b::a9fe:a9fe",
+	}
+	for _, s := range blocked {
+		if ip := net.ParseIP(s); ip == nil {
+			t.Fatalf("test setup: unparseable IP %q", s)
+		} else if !isBlockedIP(ip) {
+			t.Errorf("isBlockedIP(%s) = false, want true", s)
+		}
+	}
+	allowed := []string{
+		"8.8.8.8", "1.1.1.1", "93.184.216.34", "2001:4860:4860::8888",
+		// 6to4 / NAT64 embedding a public IPv4 address stay allowed.
+		"2002:808:808::1", "64:ff9b::808:808",
+	}
+	for _, s := range allowed {
+		if ip := net.ParseIP(s); ip == nil {
+			t.Fatalf("test setup: unparseable IP %q", s)
+		} else if isBlockedIP(ip) {
+			t.Errorf("isBlockedIP(%s) = true, want false", s)
+		}
+	}
+}
+
 func TestNormalizeAliasKey(t *testing.T) {
 	if got := NormalizeAliasKey("GeoIP-IR"); got != "geoip_ir" {
 		t.Fatalf("got %q", got)
@@ -83,8 +139,11 @@ func TestTriggerUpdateAllAllSuccess(t *testing.T) {
 			{Id: 2, Alias: "b"},
 		}, nil
 	}
-	s.updateAllApply = func(id int, onStartup bool) (string, *geoCommit, error) {
-		return fmt.Sprintf("geo_%d.dat", id), nil, nil
+	s.updateAllPrepare = func(id int, onStartup bool) (string, *geoDownload, error) {
+		return fmt.Sprintf("geo_%d.dat", id), &geoDownload{record: model.CustomGeoResource{Id: id}}, nil
+	}
+	s.updateAllApply = func(prepared *geoDownload, onStartup bool) (string, *geoCommit, error) {
+		return fmt.Sprintf("geo_%d.dat", prepared.record.Id), nil, nil
 	}
 	restartCalls := 0
 	s.updateAllRestart = func() error {
@@ -115,11 +174,14 @@ func TestTriggerUpdateAllPartialSuccess(t *testing.T) {
 			{Id: 2, Alias: "bad"},
 		}, nil
 	}
-	s.updateAllApply = func(id int, onStartup bool) (string, *geoCommit, error) {
+	s.updateAllPrepare = func(id int, onStartup bool) (string, *geoDownload, error) {
 		if id == 2 {
 			return "geo_2.dat", nil, ErrCustomGeoDownload
 		}
-		return "geo_1.dat", nil, nil
+		return "geo_1.dat", &geoDownload{record: model.CustomGeoResource{Id: id}}, nil
+	}
+	s.updateAllApply = func(prepared *geoDownload, onStartup bool) (string, *geoCommit, error) {
+		return fmt.Sprintf("geo_%d.dat", prepared.record.Id), nil, nil
 	}
 	restartCalls := 0
 	s.updateAllRestart = func() error {
@@ -150,8 +212,11 @@ func TestTriggerUpdateAllAllFailure(t *testing.T) {
 			{Id: 2, Alias: "b"},
 		}, nil
 	}
-	s.updateAllApply = func(id int, onStartup bool) (string, *geoCommit, error) {
+	s.updateAllPrepare = func(id int, onStartup bool) (string, *geoDownload, error) {
 		return fmt.Sprintf("geo_%d.dat", id), nil, ErrCustomGeoDownload
+	}
+	s.updateAllApply = func(prepared *geoDownload, onStartup bool) (string, *geoCommit, error) {
+		return fmt.Sprintf("geo_%d.dat", prepared.record.Id), nil, nil
 	}
 	restartCalls := 0
 	s.updateAllRestart = func() error {
@@ -194,6 +259,7 @@ func TestCustomGeoValidateAlias(t *testing.T) {
 }
 
 func TestCustomGeoValidateURL(t *testing.T) {
+	stubExampleComDNS(t)
 	s := CustomGeoService{}
 	if _, err := s.sanitizeURL(""); !errors.Is(err, ErrCustomGeoURLRequired) {
 		t.Fatal("empty")
@@ -205,6 +271,37 @@ func TestCustomGeoValidateURL(t *testing.T) {
 		t.Fatal(err)
 	} else if sanitized != "https://example.com/a.dat" {
 		t.Fatalf("unexpected sanitized URL: %s", sanitized)
+	}
+}
+
+// TestCustomGeoValidateURLTimeoutStalledDNS (N-7): a DNS lookup that
+// never returns must not hang the save-time URL check — it must fail
+// once the validation timeout fires.
+func TestCustomGeoValidateURLTimeoutStalledDNS(t *testing.T) {
+	origResolver := resolveHostIPs
+	resolveHostIPs = func(ctx context.Context, host string) ([]net.IP, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() { resolveHostIPs = origResolver })
+
+	origTimeout := customGeoDNSValidationTimeout
+	customGeoDNSValidationTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { customGeoDNSValidationTimeout = origTimeout })
+
+	done := make(chan error, 1)
+	go func() {
+		s := CustomGeoService{}
+		_, err := s.sanitizeURL("https://example.com/a.dat")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("sanitizeURL with stalled DNS returned nil error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sanitizeURL did not return within 2s with stalled DNS")
 	}
 }
 
@@ -1268,5 +1365,104 @@ func TestTriggerUpdateAllRestartFailureRollsBack(t *testing.T) {
 		if leftovers, _ := filepath.Glob(p + ".bak-*"); len(leftovers) != 0 {
 			t.Fatalf("backup left behind after batch rollback: %v", leftovers)
 		}
+	}
+}
+
+// TestGeoMaxFileSizeBytesClampsAboveCeiling (L-6): a stored
+// geoMaxFileSizeMB above the ceiling must not raise the effective
+// cap; a value below it is honoured.
+func TestGeoMaxFileSizeBytesClampsAboveCeiling(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "x-ui.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+	t.Cleanup(func() { database.CloseDB() })
+
+	svc := &CustomGeoService{settingService: &SettingService{}}
+	wantMax := int64(maxGeoMaxFileSizeMB * 1024 * 1024)
+	for _, mb := range []int{99999, 1000000} {
+		if err := (&SettingService{}).setInt("geoMaxFileSizeMB", mb); err != nil {
+			t.Fatalf("seed geoMaxFileSizeMB=%d: %v", mb, err)
+		}
+		if got := svc.geoMaxFileSizeBytes(); got != wantMax {
+			t.Fatalf("geoMaxFileSizeMB=%d: limit = %d, want the ceiling %d", mb, got, wantMax)
+		}
+	}
+
+	if err := (&SettingService{}).setInt("geoMaxFileSizeMB", 50); err != nil {
+		t.Fatalf("seed geoMaxFileSizeMB=50: %v", err)
+	}
+	if got, want := svc.geoMaxFileSizeBytes(), int64(50*1024*1024); got != want {
+		t.Fatalf("geoMaxFileSizeMB=50: limit = %d, want %d", got, want)
+	}
+}
+
+// TestCustomGeoDownloadDoesNotHoldUpdateMu (L-11): a slow geo download
+// must not block Xray updates, imports, or other geo updates, which
+// all serialise on updateMu. While a 3s download is in flight,
+// updateMu must be acquirable; the create must still succeed end to
+// end afterwards.
+func TestCustomGeoDownloadDoesNotHoldUpdateMu(t *testing.T) {
+	disableSSRFCheck(t)
+	setupCustomGeoTestDB(t)
+	s := NewCustomGeoService()
+
+	started := make(chan struct{}, 1)
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Signal that the download is actually in flight before
+		// stalling: polling the lock any earlier would race the
+		// Create goroutine's startup.
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		time.Sleep(3 * time.Second)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(bytes.Repeat([]byte{0x41}, minDatBytes+1))
+	}))
+	defer slow.Close()
+
+	r := &model.CustomGeoResource{Type: "geoip", Alias: "slow", Url: slow.URL}
+	done := make(chan error, 1)
+	go func() { done <- s.Create(r) }()
+
+	// Wait until the request has reached the server: the download
+	// is in flight from here.
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatalf("Create finished before the download started (err = %v)", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("slow server never received the download request")
+	}
+
+	// Poll for the lock while the download is in flight: if Create
+	// still held updateMu across the download, TryLock would fail
+	// for the whole 3 seconds.
+	observedFree := false
+	deadline := time.Now().Add(2500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if updateMu.TryLock() {
+			updateMu.Unlock()
+			observedFree = true
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("Create finished before the lock was observed free (err = %v); the download may have been too fast to observe, or it finished early", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if !observedFree {
+		t.Fatal("updateMu stayed locked for 2.5s during the geo download; the download must run outside the lock")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Create with slow server: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Create did not finish")
 	}
 }

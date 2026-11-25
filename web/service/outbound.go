@@ -363,8 +363,7 @@ func (s *OutboundService) testConnection(proxyPort int, testURL string) (int64, 
 	if err != nil {
 		return 0, 0, common.NewErrorf("Request failed: %v", err)
 	}
-	io.Copy(io.Discard, warmupResp.Body)
-	warmupResp.Body.Close()
+	discardTestBody(warmupResp.Body)
 
 	// Measure the actual request on the warm connection
 	startTime := time.Now()
@@ -374,10 +373,24 @@ func (s *OutboundService) testConnection(proxyPort int, testURL string) (int64, 
 	if err != nil {
 		return 0, 0, common.NewErrorf("Request failed: %v", err)
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	discardTestBody(resp.Body)
 
 	return delay, resp.StatusCode, nil
+}
+
+// maxOutboundTestBodyBytes caps how much of a test response body is
+// read (L-7). testConnection only measures latency and discards the
+// body, so an unbounded read lets a malicious or broken server hold
+// the request for the full 10s timeout while the panel copies
+// gigabytes to /dev/null. 64 KiB is far more than a latency probe
+// needs.
+const maxOutboundTestBodyBytes = 64 << 10
+
+// discardTestBody drains at most maxOutboundTestBodyBytes from the
+// response body and closes it.
+func discardTestBody(body io.ReadCloser) {
+	io.Copy(io.Discard, io.LimitReader(body, maxOutboundTestBodyBytes))
+	body.Close()
 }
 
 // waitForPort polls until the given TCP port is accepting connections or the timeout expires.

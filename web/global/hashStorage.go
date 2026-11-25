@@ -1,7 +1,7 @@
 package global
 
 import (
-	"crypto/md5"
+	"crypto/rand"
 	"encoding/hex"
 	"regexp"
 	"sync"
@@ -10,7 +10,7 @@ import (
 
 // HashEntry represents a stored hash entry with its value and timestamp.
 type HashEntry struct {
-	Hash      string    // MD5 hash string
+	Hash      string    // Random key string (32 hex characters)
 	Value     string    // Original value
 	Timestamp time.Time // Time when the hash was created
 }
@@ -30,37 +30,64 @@ func NewHashStorage(expiration time.Duration) *HashStorage {
 	}
 }
 
-// SaveHash generates an MD5 hash for the given query string and stores it with a timestamp.
+// SaveHash generates a random key for the given query string and stores
+// it with a timestamp (L-14). The old implementation derived the key as
+// an unsalted MD5 of the query, so the same query always produced the
+// same key and an attacker who could control the query could craft an
+// MD5 collision that decoded to a different query. A random key has
+// neither property. The key format stays 32 hex characters, so the
+// Telegram callback data length is unchanged.
 func (h *HashStorage) SaveHash(query string) string {
 	h.Lock()
 	defer h.Unlock()
 
-	md5Hash := md5.Sum([]byte(query))
-	md5HashString := hex.EncodeToString(md5Hash[:])
+	key := make([]byte, 16)
+	if _, err := rand.Read(key); err != nil {
+		// crypto/rand only fails if the OS RNG is unavailable; fall
+		// back to a time-seeded key so SaveHash still returns a
+		// usable unique key instead of an empty one.
+		seed := time.Now().UnixNano()
+		for i := range key {
+			seed = seed*6364136223846793005 + 1442695040888963407
+			key[i] = byte(seed >> 56)
+		}
+	}
+	keyString := hex.EncodeToString(key)
 
 	entry := HashEntry{
-		Hash:      md5HashString,
+		Hash:      keyString,
 		Value:     query,
 		Timestamp: time.Now(),
 	}
 
-	h.Data[md5HashString] = entry
+	h.Data[keyString] = entry
 
-	return md5HashString
+	return keyString
 }
 
 // GetValue retrieves the original value for the given hash, returning true if found.
+// Expired entries are treated as absent (L-14): the old implementation
+// ignored Timestamp entirely, so a query stayed decodable after its
+// 20-minute expiry until the 2-minute sweeper happened to delete it.
 func (h *HashStorage) GetValue(hash string) (string, bool) {
 	h.RLock()
 	defer h.RUnlock()
 
 	entry, exists := h.Data[hash]
+	if !exists {
+		return "", false
+	}
+	if time.Since(entry.Timestamp) > h.Expiration {
+		return "", false
+	}
 
-	return entry.Value, exists
+	return entry.Value, true
 }
 
-// IsMD5 checks if the given string is a valid 32-character MD5 hash.
-func (h *HashStorage) IsMD5(hash string) bool {
+// IsHashKey checks if the given string is a valid 32-character hex key
+// as produced by SaveHash. (Formerly IsMD5, renamed when the keys
+// stopped being MD5 digests.)
+func (h *HashStorage) IsHashKey(hash string) bool {
 	match, _ := regexp.MatchString("^[a-f0-9]{32}$", hash)
 	return match
 }

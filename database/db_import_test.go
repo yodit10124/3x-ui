@@ -325,6 +325,69 @@ func TestImportValidationIsReadOnly(t *testing.T) {
 	}
 }
 
+// makeImportDBWithInbounds builds an import candidate whose inbounds
+// table holds one row per given (protocol, listen, port) triple.
+func makeImportDBWithInbounds(t *testing.T, rows [][3]any) string {
+	t.Helper()
+	path := makeImportDB(t, "")
+	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("CREATE TABLE inbounds (protocol TEXT, listen TEXT, port INTEGER)").Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if err := db.Exec("INSERT INTO inbounds (protocol, listen, port) VALUES (?, ?, ?)", r[0], r[1], r[2]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestValidateImportedXrayConfigInbounds (L-4): an imported database
+// must not smuggle in an inbound the panel never offers, or a bogus
+// listen address or port.
+func TestValidateImportedXrayConfigInbounds(t *testing.T) {
+	good := [][3]any{
+		{"vless", "0.0.0.0", 443},
+		{"hysteria2", "", 50001},
+		{"tunnel", "127.0.0.1", 10000},
+	}
+	if err := ValidateImportedXrayConfig(makeImportDBWithInbounds(t, good)); err != nil {
+		t.Errorf("benign inbounds should pass, got %v", err)
+	}
+
+	bad := map[string][][3]any{
+		"dokodemo-door protocol": {{"dokodemo-door", "0.0.0.0", 1234}},
+		"freedom protocol":       {{"freedom", "0.0.0.0", 1234}},
+		"empty protocol":         {{"", "0.0.0.0", 1234}},
+		"non-IP listen":          {{"vless", "example.com", 443}},
+		"port 0":                 {{"vless", "0.0.0.0", 0}},
+		"port 70000":             {{"vless", "0.0.0.0", 70000}},
+		"one bad row among good": {{"vless", "0.0.0.0", 443}, {"blackhole", "0.0.0.0", 1234}},
+	}
+	for name, rows := range bad {
+		if err := ValidateImportedXrayConfig(makeImportDBWithInbounds(t, rows)); err == nil {
+			t.Errorf("%s: imported inbounds should be rejected", name)
+		}
+	}
+
+	// No inbounds table at all: nothing to validate.
+	if err := ValidateImportedXrayConfig(makeImportDB(t, "")); err != nil {
+		t.Errorf("import without inbounds table should pass, got %v", err)
+	}
+}
+
 // Leftover 2: an imported inbound tagged "api" would collide with the
 // built-in api inbound and break Xray startup. Panel-created inbounds
 // can never carry that tag (server-generated inbound-<port>), so only

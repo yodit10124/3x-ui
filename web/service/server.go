@@ -196,9 +196,15 @@ type LogEntry struct {
 	Event       int
 }
 
+// getPublicIPTimeout bounds the IP lookup, and maxPublicIPBodyBytes
+// bounds the response (L-12): an IP is a few dozen bytes at most.
+// Both are vars so tests can shorten them.
+var getPublicIPTimeout = 3 * time.Second
+var maxPublicIPBodyBytes int64 = 1024
+
 func getPublicIP(url string) string {
 	client := &http.Client{
-		Timeout: 3 * time.Second,
+		Timeout: getPublicIPTimeout,
 	}
 
 	resp, err := client.Get(url)
@@ -215,8 +221,8 @@ func getPublicIP(url string) string {
 		return "N/A"
 	}
 
-	ip, err := io.ReadAll(resp.Body)
-	if err != nil {
+	ip, err := io.ReadAll(io.LimitReader(resp.Body, maxPublicIPBodyBytes+1))
+	if err != nil || int64(len(ip)) > maxPublicIPBodyBytes {
 		return "N/A"
 	}
 
@@ -520,13 +526,23 @@ func (s *ServerService) sampleCPUUtilization() (float64, error) {
 	return s.emaCPU, nil
 }
 
-func (s *ServerService) GetXrayVersions() ([]string, error) {
-	const (
-		XrayURL    = "https://api.github.com/repos/XTLS/Xray-core/releases"
-		bufferSize = 8192
-	)
+// xrayVersionsTimeout bounds the GitHub releases list request
+// (L-12: the old http.Get had no timeout at all, so a stalled
+// network left the handler hanging forever).
+// xrayVersionsMaxBodyBytes bounds the response: the list is
+// per_page=30 and well under 1 MiB in practice. Both are vars so
+// tests can shorten them.
+var xrayVersionsTimeout = 30 * time.Second
+var xrayVersionsMaxBodyBytes int64 = 2 << 20
 
-	resp, err := http.Get(XrayURL)
+func (s *ServerService) GetXrayVersions() ([]string, error) {
+	return fetchXrayVersions("https://api.github.com/repos/XTLS/Xray-core/releases")
+}
+
+func fetchXrayVersions(versionsURL string) ([]string, error) {
+	client := &http.Client{Timeout: xrayVersionsTimeout}
+
+	resp, err := client.Get(versionsURL)
 	if err != nil {
 		return nil, err
 	}
@@ -534,7 +550,7 @@ func (s *ServerService) GetXrayVersions() ([]string, error) {
 
 	// Check HTTP status code - GitHub API returns object instead of array on error
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		var errorResponse struct {
 			Message string `json:"message"`
 		}
@@ -544,14 +560,16 @@ func (s *ServerService) GetXrayVersions() ([]string, error) {
 		return nil, fmt.Errorf("GitHub API returned status %d: %s", resp.StatusCode, resp.Status)
 	}
 
-	buffer := bytes.NewBuffer(make([]byte, bufferSize))
-	buffer.Reset()
-	if _, err := buffer.ReadFrom(resp.Body); err != nil {
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, xrayVersionsMaxBodyBytes+1))
+	if err != nil {
 		return nil, err
+	}
+	if int64(len(bodyBytes)) > xrayVersionsMaxBodyBytes {
+		return nil, fmt.Errorf("GitHub API response exceeds the %d-byte limit", xrayVersionsMaxBodyBytes)
 	}
 
 	var releases []Release
-	if err := json.Unmarshal(buffer.Bytes(), &releases); err != nil {
+	if err := json.Unmarshal(bodyBytes, &releases); err != nil {
 		return nil, err
 	}
 
@@ -900,6 +918,12 @@ func xrayUpdateTarget(goos string) (targetBinary, zipEntry string) {
 	return xray.GetBinaryPath(), "xray"
 }
 
+// maxExtractedEntrySize caps a single extracted zip entry (L-9). A
+// real Xray binary is ~30 MiB; 200 MiB leaves ample room while a
+// swapped zip can no longer fill the bin disk with one huge entry.
+// It is a var so tests can lower it.
+var maxExtractedEntrySize int64 = 200 << 20
+
 // extractZipEntry extracts one entry from a zip archive to destPath
 // (0755), refusing an empty result. The destination is written to a
 // temporary file and renamed into place, so a corrupt or truncated
@@ -931,7 +955,11 @@ func extractZipEntry(zipPath, entryName, destPath string) error {
 	if err != nil {
 		return err
 	}
-	n, err := io.Copy(out, entry)
+	// L-9: bound the extraction. The zip itself is already capped
+	// at download time (M-4), but a zip bomb expands far beyond its
+	// archive size; read one byte past the cap so an entry exactly at
+	// the cap still passes and anything over it is refused.
+	n, err := io.Copy(out, io.LimitReader(entry, maxExtractedEntrySize+1))
 	closeErr := out.Close()
 	if err != nil {
 		_ = os.Remove(tmpPath)
@@ -944,6 +972,18 @@ func extractZipEntry(zipPath, entryName, destPath string) error {
 	if n == 0 {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("empty entry %q in %s", entryName, zipPath)
+	}
+	if n > maxExtractedEntrySize {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("entry %q in %s exceeds the %d-byte limit", entryName, zipPath, maxExtractedEntrySize)
+	}
+	// Verify the file on disk matches what was copied.
+	if st, statErr := os.Stat(tmpPath); statErr != nil || st.Size() != n {
+		_ = os.Remove(tmpPath)
+		if statErr != nil {
+			return statErr
+		}
+		return fmt.Errorf("extracted entry %q size mismatch: file %d bytes, copied %d", entryName, st.Size(), n)
 	}
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		_ = os.Remove(tmpPath)
@@ -1435,6 +1475,15 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 		return common.NewErrorf("Imported DB but failed to rotate secret: %v", err)
 	}
 
+	// L-6: the imported settings are not all trustworthy — clear the
+	// Telegram channel, switch off external traffic reporting, and
+	// clamp the Geo download cap. A sanitisation failure is reported
+	// loudly, and the deferred rollback restores the original
+	// database, like any other post-swap failure.
+	if err := (&SettingService{}).SanitizeImportedSettings(); err != nil {
+		return common.NewErrorf("Imported DB but failed to sanitize settings: %v", err)
+	}
+
 	committed = true
 	return nil
 }
@@ -1774,13 +1823,10 @@ func (s *ServerService) GetNewX25519Cert() (any, error) {
 		return nil, err
 	}
 
-	lines := strings.Split(out.String(), "\n")
-
-	privateKeyLine := strings.Split(lines[0], ":")
-	publicKeyLine := strings.Split(lines[1], ":")
-
-	privateKey := strings.TrimSpace(privateKeyLine[1])
-	publicKey := strings.TrimSpace(publicKeyLine[1])
+	privateKey, publicKey, err := parseKeyValueLines(out.String(), "x25519")
+	if err != nil {
+		return nil, err
+	}
 
 	keyPair := map[string]any{
 		"privateKey": privateKey,
@@ -1800,13 +1846,10 @@ func (s *ServerService) GetNewmldsa65() (any, error) {
 		return nil, err
 	}
 
-	lines := strings.Split(out.String(), "\n")
-
-	SeedLine := strings.Split(lines[0], ":")
-	VerifyLine := strings.Split(lines[1], ":")
-
-	seed := strings.TrimSpace(SeedLine[1])
-	verify := strings.TrimSpace(VerifyLine[1])
+	seed, verify, err := parseKeyValueLines(out.String(), "mldsa65")
+	if err != nil {
+		return nil, err
+	}
 
 	keyPair := map[string]any{
 		"seed":   seed,
@@ -1909,13 +1952,10 @@ func (s *ServerService) GetNewmlkem768() (any, error) {
 		return nil, err
 	}
 
-	lines := strings.Split(out.String(), "\n")
-
-	SeedLine := strings.Split(lines[0], ":")
-	ClientLine := strings.Split(lines[1], ":")
-
-	seed := strings.TrimSpace(SeedLine[1])
-	client := strings.TrimSpace(ClientLine[1])
+	seed, client, err := parseKeyValueLines(out.String(), "mlkem768")
+	if err != nil {
+		return nil, err
+	}
 
 	keyPair := map[string]any{
 		"seed":   seed,
@@ -1923,4 +1963,23 @@ func (s *ServerService) GetNewmlkem768() (any, error) {
 	}
 
 	return keyPair, nil
+}
+
+// parseKeyValueLines extracts two "Label: value" lines from a CLI's
+// stdout (L-10). The xray subcommands print exactly this shape, but
+// an unexpected output format used to panic on lines[0]/lines[1] or
+// on the split's [1] instead of returning an error — the same guard
+// GetNewEchCert already has. SplitN keeps a value that itself
+// contains ":" intact.
+func parseKeyValueLines(output string, what string) (string, string, error) {
+	lines := strings.Split(output, "\n")
+	if len(lines) < 2 {
+		return "", "", common.NewErrorf("invalid %s output: %d lines", what, len(lines))
+	}
+	first := strings.SplitN(lines[0], ":", 2)
+	second := strings.SplitN(lines[1], ":", 2)
+	if len(first) < 2 || len(second) < 2 {
+		return "", "", common.NewErrorf("invalid %s output: expected \"Label: value\" lines", what)
+	}
+	return strings.TrimSpace(first[1]), strings.TrimSpace(second[1]), nil
 }

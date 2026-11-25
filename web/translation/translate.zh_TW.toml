@@ -173,7 +173,7 @@
 "importDatabase" = "恢復"
 "importDatabaseDesc" = "點擊選擇並上傳設備中的 .db 文件以從備份恢復資料庫。"
 "importDatabaseSuccess" = "資料庫匯入成功"
-"importDatabaseCheckAccounts" = "提示：工作階段金鑰已輪換，請檢查管理員帳號，匯入的資料庫可能含有未知管理員帳號。"
+"importDatabaseCheckAccounts" = "提示：工作階段金鑰已輪換，Telegram 機器人 token 與聊天 ID 已清空，外部流量上報已關閉；請檢查管理員帳號（匯入的資料庫可能含有未知管理員帳號），並核對 Telegram、Geo 下載上限與面板監聽設定。"
 "importDatabaseError" = "匯入資料庫時發生錯誤"
 "readDatabaseError" = "讀取資料庫時發生錯誤"
 "getDatabaseError" = "檢索資料庫時發生錯誤"
@@ -419,7 +419,7 @@
 "telegramProxy" = "SOCKS5 Proxy"
 "telegramProxyDesc" = "啟用 SOCKS5 代理連線到 Telegram（根據指南調整設定）"
 "telegramAPIServer" = "Telegram API Server"
-"telegramAPIServerDesc" = "要使用的 Telegram API 伺服器。留空以使用預設伺服器。"
+"telegramAPIServerDesc" = "要使用的 Telegram API 伺服器。留空以使用預設伺服器。注意：自訂伺服器會收到你的機器人 token 及全部機器人流量，僅使用你信任的伺服器。"
 "telegramChatId" = "管理員聊天 ID"
 "telegramChatIdDesc" = "Telegram 管理員聊天 ID (多個以逗號分隔)（可通過 @userinfobot 獲取，或在機器人中使用 '/id' 命令獲取）"
 "telegramNotifyTime" = "通知時間"
@@ -808,6 +808,7 @@
 "SuccessResetTraffic" = "📧 電子郵件: {{ .ClientEmail }}\n🏁 結果: ✅ 成功"
 "FailedResetTraffic" = "📧 電子郵件: {{ .ClientEmail }}\n🏁 結果: ❌ 失敗 \n\n🛠️ 錯誤: [ {{ .ErrorMessage }} ]"
 "FinishProcess" = "🔚 所有客戶的流量重置已完成。"
+"bulkReportTruncated" = "⚠️ 僅顯示前 {{ .Shown }} 條結果，共 {{ .Total }} 條，其餘已省略以避免刷屏。"
 
 [tgbot.buttons]
 "closeKeyboard" = "❌ 關閉鍵盤"

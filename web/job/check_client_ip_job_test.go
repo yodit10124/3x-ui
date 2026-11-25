@@ -144,3 +144,25 @@ func TestPartitionLiveIps_EmptyScanLeavesDbIntact(t *testing.T) {
 		t.Fatalf("all merged entries should flow to historical\ngot:  %v\nwant: [A B]", got)
 	}
 }
+
+// TestSanitizeFail2banField (L-8): the fail2ban log line is
+// load-bearing, so nothing that could break its format may survive:
+// newlines, pipes, and other control characters become underscores,
+// while the characters a valid email or IP can contain pass through.
+func TestSanitizeFail2banField(t *testing.T) {
+	cases := map[string]string{
+		"alice@example.com":     "alice@example.com",
+		"pr4091-abuse":          "pr4091-abuse",
+		"192.0.2.9":             "192.0.2.9",
+		"2001:db8::1":           "2001:db8::1",
+		"evil\n|| 1.2.3.4":      "evil____1.2.3.4",
+		"a@b.com\r\n[LIMIT_IP]": "a@b.com___LIMIT_IP_",
+		"a/b\\c:d":              "a_b_c:d",
+		"":                      "",
+	}
+	for in, want := range cases {
+		if got := sanitizeFail2banField(in); got != want {
+			t.Fatalf("sanitizeFail2banField(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

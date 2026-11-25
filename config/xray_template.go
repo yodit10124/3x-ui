@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 )
 
@@ -116,6 +117,21 @@ func isLoopbackListen(listen string) bool {
 // containsGeoIPPrivate reports whether a routing match list (the "ip" or
 // "source" field, normally []string, occasionally a single string) mentions
 // geoip:private.
+//
+// Besides the exact "geoip:private" form, several spellings that mean the
+// same thing to Xray are treated as private (L-3, N-1):
+//   - "ext:<file>:private" / "ext-ip:<file>:private" (an external geoip
+//     file's private category; Xray accepts both prefixes);
+//   - a literal CIDR whose range overlaps any private range
+//     (e.g. "192.0.0.0/8" covers 192.168.0.0/16), not just one whose
+//     network address is private;
+//   - a bare IP, which Xray treats as a /32 (or /128) rule;
+//   - a reverse "!X" entry, judged by its complement: it counts as
+//     private unless X covers the whole private space.
+//
+// A catch-all "0.0.0.0/0" (or "::/0") is deliberately NOT treated as
+// private: it matches everything, and rejecting every catch-all rule
+// would break legitimate minimal configs.
 func containsGeoIPPrivate(raw json.RawMessage) bool {
 	if len(raw) == 0 {
 		return false
@@ -123,7 +139,7 @@ func containsGeoIPPrivate(raw json.RawMessage) bool {
 	var list []string
 	if err := json.Unmarshal(raw, &list); err == nil {
 		for _, v := range list {
-			if strings.EqualFold(strings.TrimSpace(v), "geoip:private") {
+			if matchesPrivateEntry(v) {
 				return true
 			}
 		}
@@ -131,7 +147,121 @@ func containsGeoIPPrivate(raw json.RawMessage) bool {
 	}
 	var single string
 	if err := json.Unmarshal(raw, &single); err == nil {
-		return strings.EqualFold(strings.TrimSpace(single), "geoip:private")
+		return matchesPrivateEntry(single)
+	}
+	return false
+}
+
+// privatePrefixes are the address ranges geoip:private covers (RFC 1918
+// private, loopback, link-local, "this network"), used for CIDR overlap
+// and bare-IP checks. CGNAT (100.64.0.0/10) and the reserved 240.0.0.0/4
+// range are deliberately NOT included: Go's IsPrivate does not cover
+// them, and whether geoip.dat counts them as private is unverified, so
+// they stay out of this check's scope.
+var privatePrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("fc00::/7"),
+}
+
+// matchesPrivateEntry reports whether one routing match entry means
+// "private addresses" to Xray.
+func matchesPrivateEntry(entry string) bool {
+	v := strings.TrimSpace(entry)
+	if v == "" {
+		return false
+	}
+	// Reverse match: "!X" matches everything X does not. It sends
+	// private traffic to the outbound unless X covers the whole
+	// private space ("!geoip:private" is harmless and allowed;
+	// "!geoip:cn" and "!10.0.0.0/8" are not).
+	if strings.HasPrefix(v, "!") {
+		return !coversAllPrivate(strings.TrimSpace(v[1:]))
+	}
+	if strings.EqualFold(v, "geoip:private") {
+		return true
+	}
+	// ext:<file>:private / ext-ip:<file>:private — the category after
+	// the last colon is what Xray looks up in the external geoip file.
+	lower := strings.ToLower(v)
+	if strings.HasPrefix(lower, "ext:") || strings.HasPrefix(lower, "ext-ip:") {
+		if idx := strings.LastIndex(v, ":"); idx >= 0 && strings.EqualFold(strings.TrimSpace(v[idx+1:]), "private") {
+			return true
+		}
+	}
+	// Literal CIDR: reject when the range overlaps any private range,
+	// not just when its network address is private.
+	if prefix, err := netip.ParsePrefix(v); err == nil {
+		return cidrOverlapsPrivate(prefix)
+	}
+	// Bare IP: Xray treats it as a /32 (or /128) rule.
+	if addr, err := netip.ParseAddr(v); err == nil {
+		return isPrivateAddr(addr)
+	}
+	return false
+}
+
+// coversAllPrivate reports whether an entry matches the entire private
+// address space, so that its reverse ("!entry") matches no private
+// address at all. Only geoip:private (and its ext: spellings) and
+// catch-all CIDRs qualify; a single CIDR can only cover all private
+// addresses if it is a catch-all.
+func coversAllPrivate(entry string) bool {
+	v := strings.TrimSpace(entry)
+	if strings.EqualFold(v, "geoip:private") {
+		return true
+	}
+	lower := strings.ToLower(v)
+	if strings.HasPrefix(lower, "ext:") || strings.HasPrefix(lower, "ext-ip:") {
+		if idx := strings.LastIndex(v, ":"); idx >= 0 && strings.EqualFold(strings.TrimSpace(v[idx+1:]), "private") {
+			return true
+		}
+	}
+	if prefix, err := netip.ParsePrefix(v); err == nil {
+		return prefix.Bits() == 0
+	}
+	return false
+}
+
+// cidrOverlapsPrivate reports whether a CIDR range overlaps any private
+// range. A /0 catch-all is deliberately not treated as private.
+func cidrOverlapsPrivate(prefix netip.Prefix) bool {
+	if prefix.Bits() == 0 {
+		return false // catch-all, see containsGeoIPPrivate
+	}
+	addr := prefix.Addr()
+	if addr.Is4In6() {
+		// IPv4-mapped IPv6 prefix: judge it in IPv4 space.
+		if prefix.Bits() < 96 {
+			// Shorter than the mapped /96 range: it necessarily spans
+			// the whole mapped space, including private IPv4.
+			return true
+		}
+		prefix = netip.PrefixFrom(addr.Unmap(), prefix.Bits()-96)
+	}
+	prefix = prefix.Masked()
+	for _, p := range privatePrefixes {
+		if prefix.Overlaps(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPrivateAddr reports whether a single address is private, loopback,
+// link-local, or unspecified.
+func isPrivateAddr(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	for _, p := range privatePrefixes {
+		if p.Contains(addr) {
+			return true
+		}
 	}
 	return false
 }
@@ -247,9 +377,18 @@ func validateXrayConfig(raw string, checkInboundProtocols bool) error {
 	// geoip:private but routes it somewhere other than "blocked".
 	// A routing section with no geoip:private rule at all is allowed —
 	// see the doc comment on ValidateXrayTemplateConfig.
+	//
+	// L-3: a balancerTag on such a rule defeats the check — Xray's
+	// Rule.GetTag() prefers the balancer's pick over outboundTag, so a
+	// rule that "looks" blocked can still send private traffic to a
+	// direct balancer. Any balancerTag on a private-matching rule is
+	// rejected outright.
 	for i, rule := range cfg.Routing.Rules {
 		if !containsGeoIPPrivate(rule.IP) && !containsGeoIPPrivate(rule.Source) {
 			continue
+		}
+		if strings.TrimSpace(rule.BalancerTag) != "" {
+			return fmt.Errorf("xray routing rule %d matches geoip:private traffic but uses balancer %q; a balancer can override the blocked outbound", i, rule.BalancerTag)
 		}
 		if rule.OutboundTag != "blocked" {
 			return fmt.Errorf("xray routing rule %d sends geoip:private traffic to %q instead of \"blocked\"", i, rule.OutboundTag)

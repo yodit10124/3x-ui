@@ -493,3 +493,72 @@ func TestDownloadXRayFromURL(t *testing.T) {
 		}
 	})
 }
+
+// makeTestZip builds a zip file with a single entry of the given size
+// (filled with 'x') and returns its path.
+func makeTestZip(t *testing.T, entryName string, size int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test.zip")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := zip.NewWriter(f)
+	entry, err := w.Create(entryName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write(bytes.Repeat([]byte("x"), size)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestExtractZipEntrySizeLimit (L-9): an entry over the cap must be
+// refused and leave nothing behind; a small entry extracts intact.
+func TestExtractZipEntrySizeLimit(t *testing.T) {
+	oldCap := maxExtractedEntrySize
+	maxExtractedEntrySize = 1024
+	t.Cleanup(func() { maxExtractedEntrySize = oldCap })
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "xray")
+
+	// Exactly at the cap: passes.
+	if err := extractZipEntry(makeTestZip(t, "xray", 1024), "xray", dest); err != nil {
+		t.Fatalf("entry at the cap should extract, got %v", err)
+	}
+	if got, err := os.ReadFile(dest); err != nil || len(got) != 1024 {
+		t.Fatalf("extracted file size = %d, err = %v, want 1024 bytes", len(got), err)
+	}
+
+	// One byte over: refused, and neither the destination nor the
+	// temp file survives.
+	dest2 := filepath.Join(dir, "xray2")
+	if err := extractZipEntry(makeTestZip(t, "xray", 1025), "xray", dest2); err == nil {
+		t.Fatal("oversized entry should be refused")
+	}
+	if _, err := os.Stat(dest2); !os.IsNotExist(err) {
+		t.Fatalf("oversized entry left a destination behind (stat err = %v)", err)
+	}
+	if _, err := os.Stat(dest2 + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("oversized entry left a temp file behind (stat err = %v)", err)
+	}
+
+	// A huge entry (1 MiB of 'x' compresses to almost nothing in the
+	// zip, so the archive stays small while the entry expands): the
+	// zip-bomb shape must be refused too.
+	dest3 := filepath.Join(dir, "xray3")
+	if err := extractZipEntry(makeTestZip(t, "xray", 1<<20), "xray", dest3); err == nil {
+		t.Fatal("1 MiB entry over the 1 KiB test cap should be refused")
+	}
+	if _, err := os.Stat(dest3); !os.IsNotExist(err) {
+		t.Fatalf("zip-bomb entry left a destination behind (stat err = %v)", err)
+	}
+}

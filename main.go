@@ -3,11 +3,14 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	_ "unsafe"
 
@@ -105,7 +108,9 @@ func runWebServer() {
 	}
 }
 
-// resetSetting resets all panel settings to their default values.
+// resetSetting resets all panel settings to their default values and
+// removes all admin accounts (with their login sessions). The panel
+// creates a fresh default admin on next start.
 func resetSetting() error {
 	err := database.InitDB(config.GetDBPath())
 	if err != nil {
@@ -119,7 +124,7 @@ func resetSetting() error {
 		fmt.Println("Failed to reset settings:", err)
 		return err
 	} else {
-		fmt.Println("Settings successfully reset.")
+		fmt.Println("Settings successfully reset. All admin accounts were removed; the panel will create a default admin on next start.")
 	}
 	return nil
 }
@@ -182,14 +187,17 @@ func updateTgbotEnableSts(status bool) {
 		fmt.Println(err)
 		return
 	}
-	logger.Infof("current enabletgbot status[%v],need update to status[%v]", currentTgSts, status)
+	// NB: the logger is only initialized in runWebServer, so these
+	// CLI helpers must print with fmt — logger.Info* here dereferenced
+	// a nil logger and panicked after the setting was already stored.
+	fmt.Printf("current enabletgbot status[%v],need update to status[%v]\n", currentTgSts, status)
 	if currentTgSts != status {
 		err := settingService.SetTgbotEnabled(status)
 		if err != nil {
 			fmt.Println(err)
 			return
 		} else {
-			logger.Infof("SetTgbotEnabled[%v] success", status)
+			fmt.Printf("SetTgbotEnabled[%v] success\n", status)
 		}
 	}
 }
@@ -210,7 +218,10 @@ func updateTgbotSetting(tgBotToken string, tgBotChatid string, tgBotRuntime stri
 			fmt.Printf("Error setting Telegram bot token: %v\n", err)
 			return
 		}
-		logger.Info("Successfully updated Telegram bot token.")
+		// NB: same nil-logger note as updateTgbotEnableSts above —
+		// the logger is only initialized in runWebServer, so print
+		// with fmt here.
+		fmt.Println("Successfully updated Telegram bot token.")
 	}
 
 	if tgBotRuntime != "" {
@@ -219,7 +230,7 @@ func updateTgbotSetting(tgBotToken string, tgBotChatid string, tgBotRuntime stri
 			fmt.Printf("Error setting Telegram bot runtime: %v\n", err)
 			return
 		}
-		logger.Infof("Successfully updated Telegram bot runtime to [%s].", tgBotRuntime)
+		fmt.Printf("Successfully updated Telegram bot runtime to [%s].\n", tgBotRuntime)
 	}
 
 	if tgBotChatid != "" {
@@ -228,8 +239,56 @@ func updateTgbotSetting(tgBotToken string, tgBotChatid string, tgBotRuntime stri
 			fmt.Printf("Error setting Telegram bot chat ID: %v\n", err)
 			return
 		}
-		logger.Info("Successfully updated Telegram bot chat ID.")
+		fmt.Println("Successfully updated Telegram bot chat ID.")
 	}
+}
+
+// resolveSettingPassword returns the login password to apply (L-17).
+// When -password-stdin is set, the password is read from stdin so it
+// never appears in the process arguments, where any other local user
+// could read it with ps while the command runs. A literal -password
+// still works for compatibility, but warns on stderr; the project's
+// own scripts (install.sh, x-ui.sh) use -password-stdin.
+func resolveSettingPassword(passwordFlag string, readStdin bool, stdin io.Reader) (string, error) {
+	if readStdin {
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", fmt.Errorf("failed to read password from stdin: %w", err)
+		}
+		password := strings.TrimRight(string(data), "\r\n")
+		if password == "" {
+			return "", errors.New("no password provided on stdin")
+		}
+		return password, nil
+	}
+	if passwordFlag != "" {
+		fmt.Fprintln(os.Stderr, "warning: passing the password with -password exposes it to other local users via ps; use -password-stdin instead")
+	}
+	return passwordFlag, nil
+}
+
+// resolveSettingTgbotToken returns the Telegram bot token to apply.
+// Same shape as resolveSettingPassword (L-17): -tgbottoken-stdin reads
+// it from stdin so it never appears in the process arguments; a
+// literal -tgbottoken still works for compatibility but warns on
+// stderr. No script in this repo passes -tgbottoken today, so no
+// script changes accompany this flag.
+func resolveSettingTgbotToken(tokenFlag string, readStdin bool, stdin io.Reader) (string, error) {
+	if readStdin {
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", fmt.Errorf("failed to read Telegram bot token from stdin: %w", err)
+		}
+		token := strings.TrimRight(string(data), "\r\n")
+		if token == "" {
+			return "", errors.New("no Telegram bot token provided on stdin")
+		}
+		return token, nil
+	}
+	if tokenFlag != "" {
+		fmt.Fprintln(os.Stderr, "warning: passing the Telegram bot token with -tgbottoken exposes it to other local users via ps; use -tgbottoken-stdin instead")
+	}
+	return tokenFlag, nil
 }
 
 // updateSetting updates various panel settings including port, credentials, base path, listen IP, and two-factor authentication.
@@ -384,12 +443,14 @@ func main() {
 	var port int
 	var username string
 	var password string
+	var passwordStdin bool
 	var webBasePath string
 	var listenIP string
 	var getListen bool
 	var webCertFile string
 	var webKeyFile string
 	var tgbottoken string
+	var tgbottokenStdin bool
 	var tgbotchatid string
 	var enabletgbot bool
 	var tgbotRuntime string
@@ -401,7 +462,8 @@ func main() {
 	settingCmd.BoolVar(&show, "show", false, "Display current settings")
 	settingCmd.IntVar(&port, "port", 0, "Set panel port number")
 	settingCmd.StringVar(&username, "username", "", "Set login username")
-	settingCmd.StringVar(&password, "password", "", "Set login password")
+	settingCmd.StringVar(&password, "password", "", "Set login password (deprecated: a password on the command line is visible to other local users via ps; use -password-stdin instead)")
+	settingCmd.BoolVar(&passwordStdin, "password-stdin", false, "Read login password from stdin instead of -password")
 	settingCmd.StringVar(&webBasePath, "webBasePath", "", "Set base path for Panel")
 	settingCmd.StringVar(&listenIP, "listenIP", "", "set panel listenIP IP")
 	settingCmd.BoolVar(&resetTwoFactor, "resetTwoFactor", false, "Reset two-factor authentication settings")
@@ -409,7 +471,8 @@ func main() {
 	settingCmd.BoolVar(&getCert, "getCert", false, "Display current certificate settings")
 	settingCmd.StringVar(&webCertFile, "webCert", "", "Set path to public key file for panel")
 	settingCmd.StringVar(&webKeyFile, "webCertKey", "", "Set path to private key file for panel")
-	settingCmd.StringVar(&tgbottoken, "tgbottoken", "", "Set token for Telegram bot")
+	settingCmd.StringVar(&tgbottoken, "tgbottoken", "", "Set token for Telegram bot (deprecated: a token on the command line is visible to other local users via ps; use -tgbottoken-stdin instead)")
+	settingCmd.BoolVar(&tgbottokenStdin, "tgbottoken-stdin", false, "Read Telegram bot token from stdin instead of -tgbottoken")
 	settingCmd.StringVar(&tgbotRuntime, "tgbotRuntime", "", "Set cron time for Telegram bot notifications")
 	settingCmd.StringVar(&tgbotchatid, "tgbotchatid", "", "Set chat ID for Telegram bot notifications")
 	settingCmd.BoolVar(&enabletgbot, "enabletgbot", false, "Enable notifications via Telegram bot")
@@ -451,6 +514,23 @@ func main() {
 				return
 			}
 		} else {
+			// L-17: resolve the password (possibly from stdin) before
+			// touching anything, so a failed read aborts the whole
+			// update instead of applying the other settings with a
+			// missing password.
+			password, err := resolveSettingPassword(password, passwordStdin, os.Stdin)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			// Resolve the token up front too, so a failed stdin read
+			// aborts the whole update instead of applying the other
+			// settings with a missing token.
+			tgbottoken, err = resolveSettingTgbotToken(tgbottoken, tgbottokenStdin, os.Stdin)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
 			if err = updateSetting(port, username, password, webBasePath, listenIP, resetTwoFactor); err != nil {
 				return
 			}

@@ -190,6 +190,45 @@ func (s *InboundService) checkEmailsExistForClients(clients []model.Client) (str
 	return "", nil
 }
 
+// validateClientEmails rejects client emails outside the plain
+// address-or-token-label shape (L-8). A crafted email containing a
+// newline or "||" could otherwise forge [LIMIT_IP] lines in the
+// fail2ban log and get arbitrary IPs banned. Empty emails are left
+// to the caller's own required-field checks.
+func validateClientEmails(clients []model.Client) error {
+	for _, client := range clients {
+		if client.Email != "" && !model.IsValidClientEmail(client.Email) {
+			return common.NewErrorf("invalid client email %q", client.Email)
+		}
+	}
+	return nil
+}
+
+// validateInboundSettingsEmails validates the "clients" emails in a
+// raw inbound settings JSON blob. Unparseable settings are left to
+// the caller's later error handling.
+func validateInboundSettingsEmails(settingsJSON string) error {
+	var settings map[string]any
+	if err := json.Unmarshal([]byte(settingsJSON), &settings); err != nil {
+		return nil
+	}
+	rawClients, ok := settings["clients"].([]any)
+	if !ok {
+		return nil
+	}
+	for _, raw := range rawClients {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		email, _ := m["email"].(string)
+		if email != "" && !model.IsValidClientEmail(email) {
+			return common.NewErrorf("invalid client email %q", email)
+		}
+	}
+	return nil
+}
+
 func (s *InboundService) checkEmailExistForInbound(inbound *model.Inbound) (string, error) {
 	clients, err := s.GetClients(inbound)
 	if err != nil {
@@ -219,6 +258,12 @@ func (s *InboundService) checkEmailExistForInbound(inbound *model.Inbound) (stri
 // then saves the inbound to the database and optionally adds it to the running Xray instance.
 // Returns the created inbound, whether Xray needs restart, and any error.
 func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, bool, error) {
+	// L-4: reject protocols the panel does not offer; without this
+	// a caller can create e.g. a dokodemo-door inbound straight
+	// through the API, bypassing the template checks.
+	if !model.IsValidInboundProtocol(inbound.Protocol) {
+		return inbound, false, common.NewError("Unsupported protocol:", string(inbound.Protocol))
+	}
 	exist, err := s.checkPortExist(inbound.Listen, inbound.Port, 0)
 	if err != nil {
 		return inbound, false, err
@@ -237,6 +282,11 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 
 	clients, err := s.GetClients(inbound)
 	if err != nil {
+		return inbound, false, err
+	}
+
+	// L-8: reject crafted client emails before they are stored.
+	if err := validateClientEmails(clients); err != nil {
 		return inbound, false, err
 	}
 
@@ -460,6 +510,10 @@ func (s *InboundService) SetInboundEnable(id int, enable bool) (bool, error) {
 // It validates changes, updates the database, and syncs with the running Xray instance.
 // Returns the updated inbound, whether Xray needs restart, and any error.
 func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, bool, error) {
+	// L-4: same protocol allowlist as AddInbound.
+	if !model.IsValidInboundProtocol(inbound.Protocol) {
+		return inbound, false, common.NewError("Unsupported protocol:", string(inbound.Protocol))
+	}
 	exist, err := s.checkPortExist(inbound.Listen, inbound.Port, inbound.Id)
 	if err != nil {
 		return inbound, false, err
@@ -474,6 +528,13 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 	}
 
 	tag := oldInbound.Tag
+
+	// L-8: an update replaces the whole client list, so validate the
+	// new emails here too (UpdateInbound works on the raw settings
+	// JSON rather than parsed clients).
+	if err := validateInboundSettingsEmails(inbound.Settings); err != nil {
+		return inbound, false, err
+	}
 
 	db := database.GetDB()
 	tx := db.Begin()
@@ -724,6 +785,11 @@ func (s *InboundService) updateClientTraffics(tx *gorm.DB, oldInbound *model.Inb
 func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 	clients, err := s.GetClients(data)
 	if err != nil {
+		return false, err
+	}
+
+	// L-8: reject crafted client emails before they are stored.
+	if err := validateClientEmails(clients); err != nil {
 		return false, err
 	}
 
@@ -2421,25 +2487,22 @@ func (s *InboundService) GetClientTrafficTgBot(tgId int64) ([]*xray.ClientTraffi
 	db := database.GetDB()
 	var inbounds []*model.Inbound
 
-	// Retrieve inbounds where settings contain the given tgId
-	err := db.Model(model.Inbound{}).Where("settings LIKE ?", fmt.Sprintf(`%%"tgId": %d%%`, tgId)).Find(&inbounds).Error
+	// L-16: no LIKE pre-filter on the settings JSON. The old filter
+	// matched only the spaced number form `"tgId": 999`, so inbounds
+	// whose settings store the id compactly ("tgId":999) or as a
+	// string ("tgId": "999", as the Telegram flow used to emit) were
+	// never scanned and their clients' traffic came back empty. The
+	// inbound count is small, so scan all of them and match the id in
+	// Go, where both stored forms are understood.
+	err := db.Model(model.Inbound{}).Find(&inbounds).Error
 	if err != nil && err != gorm.ErrRecordNotFound {
-		logger.Errorf("Error retrieving inbounds with tgId %d: %v", tgId, err)
+		logger.Errorf("Error retrieving inbounds: %v", err)
 		return nil, err
 	}
 
 	var emails []string
 	for _, inbound := range inbounds {
-		clients, err := s.GetClients(inbound)
-		if err != nil {
-			logger.Errorf("Error retrieving clients for inbound %d: %v", inbound.Id, err)
-			continue
-		}
-		for _, client := range clients {
-			if client.TgID == tgId {
-				emails = append(emails, client.Email)
-			}
-		}
+		emails = append(emails, clientEmailsForTgID(inbound.Settings, tgId)...)
 	}
 
 	// Chunked to stay under SQLite's bind-variable limit when a single Telegram
@@ -2471,6 +2534,42 @@ func (s *InboundService) GetClientTrafficTgBot(tgId int64) ([]*xray.ClientTraffi
 	}
 
 	return traffics, nil
+}
+
+// clientEmailsForTgID returns the emails of clients in a raw inbound
+// settings JSON whose tgId equals tgId (L-16). The id may be stored as
+// a JSON number ("tgId": 999, with or without a space) or as a string
+// ("tgId": "999", as the Telegram flow used to emit); both forms
+// match. An absent or unparsable tgId means the client has no
+// Telegram user. It parses the raw JSON instead of going through
+// model.Client, whose int64 TgID decodes a string-form id as 0.
+func clientEmailsForTgID(settings string, tgId int64) []string {
+	var raw struct {
+		Clients []struct {
+			Email string `json:"email"`
+			TgID  any    `json:"tgId"`
+		} `json:"clients"`
+	}
+	if err := json.Unmarshal([]byte(settings), &raw); err != nil {
+		return nil
+	}
+	var emails []string
+	for _, c := range raw.Clients {
+		var id int64
+		var ok bool
+		switch v := c.TgID.(type) {
+		case float64:
+			id, ok = int64(v), true
+		case string:
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				id, ok = n, true
+			}
+		}
+		if ok && id == tgId && c.Email != "" {
+			emails = append(emails, c.Email)
+		}
+	}
+	return emails
 }
 
 // sqliteMaxVars is a safe ceiling for the number of bind parameters in a

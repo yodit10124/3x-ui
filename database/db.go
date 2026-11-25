@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"path"
@@ -282,13 +283,11 @@ func ValidateImportedXrayConfig(dbPath string) error {
 		}
 	}
 
-	// Leftover 2: validate the inbounds table's tags. An imported
-	// inbound tagged "api" would collide with the built-in api
-	// inbound the panel injects into the template, and Xray would
-	// fail to start. Compared case-insensitively, matching the H-1
-	// check in the template validator (config/xray_template.go).
-	// (Protocol / listen / port validation of the same rows is L-4
-	// and lands in a later batch.)
+	// L-4: validate the inbounds table row by row, too. The template
+	// check above only covers settings.xrayTemplateConfig; a crafted
+	// database could otherwise smuggle in an inbound whose protocol
+	// the panel never offers (e.g. dokodemo-door) or a bogus
+	// listen address or port, and it would run on the next start.
 	var inbounds []struct {
 		Tag      string
 		Protocol string
@@ -299,15 +298,31 @@ func ValidateImportedXrayConfig(dbPath string) error {
 		// No tag column (a very old backup) or no table at all:
 		// retry without the tag. A table without a tag column
 		// cannot hold a tag="api" row, so Tag stays "" and only the
-		// tag check below applies; a missing table errors here too,
-		// which means there is nothing to validate.
+		// other checks apply; a missing table errors here too, which
+		// means there is nothing to validate.
 		if err := gdb.Raw("SELECT protocol, listen, port FROM inbounds").Scan(&inbounds).Error; err != nil {
 			return nil
 		}
 	}
 	for _, in := range inbounds {
+		// Leftover 2: an imported inbound tagged "api" would collide
+		// with the built-in api inbound the panel injects into the
+		// template, and Xray would fail to start. Compared
+		// case-insensitively, matching the H-1 check in the template
+		// validator (config/xray_template.go). Panel-created inbounds
+		// can never hit this — their tags are server-generated
+		// (inbound-<port>) — so only the import path needs the check.
 		if strings.EqualFold(in.Tag, "api") {
 			return fmt.Errorf("imported inbound uses reserved tag %q", in.Tag)
+		}
+		if !model.IsValidInboundProtocol(model.Protocol(in.Protocol)) {
+			return fmt.Errorf("imported inbound has unsupported protocol %q", in.Protocol)
+		}
+		if in.Listen != "" && net.ParseIP(in.Listen) == nil {
+			return fmt.Errorf("imported inbound has invalid listen address %q", in.Listen)
+		}
+		if in.Port < 1 || in.Port > 65535 {
+			return fmt.Errorf("imported inbound has invalid port %d", in.Port)
 		}
 	}
 	return nil

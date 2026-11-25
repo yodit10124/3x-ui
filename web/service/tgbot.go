@@ -643,35 +643,46 @@ func (t *Tgbot) createRobustFastHTTPClient(proxyUrl string) *fasthttp.Client {
 	return client
 }
 
+// validateTgbotProxyURL checks a Telegram proxy URL (L-15). The old
+// check only looked for a "socks5://" prefix, so a URL with no host
+// passed and failed later at dial time. The scheme must be exactly
+// socks5 and a host must be present; anything else is ignored.
+func validateTgbotProxyURL(proxyUrl string) string {
+	if proxyUrl == "" {
+		return ""
+	}
+	u, err := url.Parse(proxyUrl)
+	if err != nil || u.Scheme != "socks5" || u.Host == "" {
+		logger.Warning("Invalid socks5 URL, ignoring proxy")
+		return ""
+	}
+	return proxyUrl
+}
+
+// validateTgbotAPIServerURL checks a custom Telegram API server URL
+// (L-15). The old check only looked for an "http" prefix, so
+// "httpfoo://..." or a host-less URL passed. The scheme must be
+// http(s) and a host must be present; anything else falls back to the
+// default server. A custom server receives the bot token and all bot
+// traffic by design — the settings page warns about that — so this
+// only guards against typos and malformed values, not against a
+// deliberately configured untrusted server.
+func validateTgbotAPIServerURL(apiServerUrl string) string {
+	if apiServerUrl == "" {
+		return ""
+	}
+	u, err := url.Parse(apiServerUrl)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		logger.Warning("Invalid http(s) URL for API server, using default")
+		return ""
+	}
+	return apiServerUrl
+}
+
 // NewBot creates a new Telegram bot instance with optional proxy and API server settings.
 func (t *Tgbot) NewBot(token string, proxyUrl string, apiServerUrl string) (*telego.Bot, error) {
-	// Validate proxy URL if provided
-	if proxyUrl != "" {
-		if !strings.HasPrefix(proxyUrl, "socks5://") {
-			logger.Warning("Invalid socks5 URL, ignoring proxy")
-			proxyUrl = "" // Clear invalid proxy
-		} else {
-			_, err := url.Parse(proxyUrl)
-			if err != nil {
-				logger.Warningf("Can't parse proxy URL, ignoring proxy: %v", err)
-				proxyUrl = ""
-			}
-		}
-	}
-
-	// Validate API server URL if provided
-	if apiServerUrl != "" {
-		if !strings.HasPrefix(apiServerUrl, "http") {
-			logger.Warning("Invalid http(s) URL for API server, using default")
-			apiServerUrl = ""
-		} else {
-			_, err := url.Parse(apiServerUrl)
-			if err != nil {
-				logger.Warningf("Can't parse API server URL, using default: %v", err)
-				apiServerUrl = ""
-			}
-		}
-	}
+	proxyUrl = validateTgbotProxyURL(proxyUrl)
+	apiServerUrl = validateTgbotAPIServerURL(apiServerUrl)
 
 	// Create robust fasthttp client
 	client := t.createRobustFastHTTPClient(proxyUrl)
@@ -749,7 +760,7 @@ func (t *Tgbot) encodeQuery(query string) string {
 
 // decodeQuery decodes a hashed query string back to its original form.
 func (t *Tgbot) decodeQuery(query string) (string, error) {
-	if !hashStorage.IsMD5(query) {
+	if !hashStorage.IsHashKey(query) {
 		return query, nil
 	}
 
@@ -1977,7 +1988,15 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
 					return
 				}
-				sess := t.newAddClientSession(chatId, callbackQuery.From.ID, inboundIdInt)
+				// L-16: keep a live draft instead of silently discarding
+				// it; only the target inbound changes to the one just
+				// picked, the filled-in fields stay.
+				sess := getAddClientSession(chatId, callbackQuery.From.ID)
+				if sess == nil {
+					sess = t.newAddClientSession(chatId, callbackQuery.From.ID, inboundIdInt)
+				} else {
+					sess.inboundID = inboundIdInt
+				}
 				inbound, err := t.inboundService.GetInbound(inboundIdInt)
 				if err != nil {
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, err.Error())
@@ -2058,7 +2077,11 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 	case "add_client":
 		addClientSessionsMu.Lock()
 		defer addClientSessionsMu.Unlock()
-		t.newAddClientSession(chatId, callbackQuery.From.ID, 0)
+		// L-16: keep a live draft instead of silently discarding it;
+		// the admin just picks an inbound again for the same draft.
+		if getAddClientSession(chatId, callbackQuery.From.ID) == nil {
+			t.newAddClientSession(chatId, callbackQuery.From.ID, 0)
+		}
 
 		inbounds, err := t.getInboundsAddClient()
 		if err != nil {
@@ -2363,16 +2386,18 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 			return
 		}
 
+		sender := newBulkSender(t, chatId)
 		for _, email := range emails {
 			err := t.inboundService.ResetClientTrafficByEmail(email)
 			if err == nil {
 				msg := t.I18nBot("tgbot.messages.SuccessResetTraffic", "ClientEmail=="+email)
-				t.SendMsgToTgbot(chatId, msg, tu.ReplyKeyboardRemove())
+				sender.send(msg, tu.ReplyKeyboardRemove())
 			} else {
 				msg := t.I18nBot("tgbot.messages.FailedResetTraffic", "ClientEmail=="+email, "ErrorMessage=="+err.Error())
-				t.SendMsgToTgbot(chatId, msg, tu.ReplyKeyboardRemove())
+				sender.send(msg, tu.ReplyKeyboardRemove())
 			}
 		}
+		sender.finish()
 
 		t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.messages.FinishProcess"), tu.ReplyKeyboardRemove())
 	case "get_sorted_traffic_usage_report":
@@ -2389,28 +2414,30 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 			return
 		}
 
+		sender := newBulkSender(t, chatId)
 		for _, valid_emails := range valid_emails {
 			traffic, err := t.inboundService.GetClientTrafficByEmail(valid_emails)
 			if err != nil {
 				logger.Warning(err)
 				msg := t.I18nBot("tgbot.wentWrong")
-				t.SendMsgToTgbot(chatId, msg)
+				sender.send(msg)
 				continue
 			}
 			if traffic == nil {
 				msg := t.I18nBot("tgbot.noResult")
-				t.SendMsgToTgbot(chatId, msg)
+				sender.send(msg)
 				continue
 			}
 
 			output := t.clientInfoMsg(traffic, false, false, false, false, true, false)
-			t.SendMsgToTgbot(chatId, output, tu.ReplyKeyboardRemove())
+			sender.send(output, tu.ReplyKeyboardRemove())
 		}
 		for _, extra_emails := range extra_emails {
 			msg := fmt.Sprintf("📧 %s\n%s", extra_emails, t.I18nBot("tgbot.noResult"))
-			t.SendMsgToTgbot(chatId, msg, tu.ReplyKeyboardRemove())
+			sender.send(msg, tu.ReplyKeyboardRemove())
 
 		}
+		sender.finish()
 	}
 }
 
@@ -2481,9 +2508,13 @@ type tgbotClientJSON struct {
 	TotalGB    int64  `json:"totalGB"`
 	ExpiryTime int64  `json:"expiryTime"`
 	Enable     bool   `json:"enable"`
-	TgID       string `json:"tgId"`
-	Comment    string `json:"comment"`
-	Reset      int    `json:"reset"`
+	// L-16: a number, not a string. The old string form ("tgId":
+	// "999") does not parse into model.Client's int64 TgID, so a
+	// client created from Telegram decoded with TgID 0 and its
+	// traffic could never be found by Telegram id.
+	TgID    int64  `json:"tgId"`
+	Comment string `json:"comment"`
+	Reset   int    `json:"reset"`
 }
 
 // tgbotClientSettings wraps one client the way AddInboundClient
@@ -2491,13 +2522,6 @@ type tgbotClientJSON struct {
 type tgbotClientSettings struct {
 	Clients []tgbotClientJSON `json:"clients"`
 }
-
-// tgbotEmailPattern accepts either a plain email address or a plain
-// token label (the add-client flow's default email is an 8-character
-// random token, not an address). It rejects quotes, commas, colons,
-// whitespace, and control characters, so a value can never smuggle
-// extra JSON fields even before marshaling.
-var tgbotEmailPattern = regexp.MustCompile(`^(?:[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Za-z0-9._\-]+)$`)
 
 // BuildJSONForProtocol builds a JSON string for the given protocol with client data.
 func (t *Tgbot) BuildJSONForProtocol(sess *addClientSession, protocol model.Protocol) (string, error) {
@@ -2509,17 +2533,22 @@ func (t *Tgbot) BuildJSONForProtocol(sess *addClientSession, protocol model.Prot
 			return "", fmt.Errorf("invalid client id %q: not a UUID", sess.id)
 		}
 	}
-	if !tgbotEmailPattern.MatchString(sess.email) {
+	// L-8: the pattern lives in model now (IsValidClientEmail), shared
+	// with the panel API paths.
+	if !model.IsValidClientEmail(sess.email) {
 		return "", fmt.Errorf("invalid client email %q", sess.email)
 	}
 
+	// L-16: the session keeps the Telegram id as a string ("" when
+	// unset); the stored client JSON carries it as a number.
+	tgID, _ := strconv.ParseInt(sess.tgID, 10, 64)
 	client := tgbotClientJSON{
 		Email:      sess.email,
 		LimitIP:    sess.limitIP,
 		TotalGB:    sess.totalGB,
 		ExpiryTime: sess.expiryTime,
 		Enable:     sess.enable,
-		TgID:       sess.tgID,
+		TgID:       tgID,
 		Comment:    sess.comment,
 		Reset:      sess.reset,
 	}
@@ -2756,6 +2785,49 @@ func (t *Tgbot) SendMsgToTgbot(chatId int64, msg string, replyMarkup ...telego.R
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
+}
+
+// maxTgbotBulkMessages caps how many per-item messages one admin
+// callback may send (L-16): reset_all_traffics_c and
+// get_sorted_traffic_usage_report used to send one message per client
+// with no limit, so one tap could fan out to hundreds of Telegram
+// sends. A var so tests can lower it.
+var maxTgbotBulkMessages = 20
+
+// bulkSender counts the messages one bulk callback sends and, once
+// the cap is reached, drops further per-item messages and reports a
+// single summary instead. The underlying work (resets, lookups) still
+// runs for every item; only the reporting is capped.
+type bulkSender struct {
+	t         *Tgbot
+	chatID    int64
+	sent      int
+	total     int
+	truncated bool
+}
+
+func newBulkSender(t *Tgbot, chatID int64) *bulkSender {
+	return &bulkSender{t: t, chatID: chatID}
+}
+
+// send reports one item unless the cap is already reached.
+func (b *bulkSender) send(msg string, replyMarkup ...telego.ReplyMarkup) {
+	b.total++
+	if b.sent >= maxTgbotBulkMessages {
+		b.truncated = true
+		return
+	}
+	b.sent++
+	b.t.SendMsgToTgbot(b.chatID, msg, replyMarkup...)
+}
+
+// finish sends the truncation summary when items were dropped.
+func (b *bulkSender) finish() {
+	if !b.truncated {
+		return
+	}
+	b.t.SendMsgToTgbot(b.chatID, b.t.I18nBot("tgbot.messages.bulkReportTruncated",
+		"Shown=="+strconv.Itoa(b.sent), "Total=="+strconv.Itoa(b.total)))
 }
 
 func (t *Tgbot) SendMsgToTgbotAdmins(msg string, replyMarkup ...telego.ReplyMarkup) {

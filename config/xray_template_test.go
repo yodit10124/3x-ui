@@ -68,6 +68,29 @@ func TestValidateXrayTemplateConfig(t *testing.T) {
 		{"routing without any private rule", `{"routing": {"rules": [{"type": "field", "outboundTag": "blocked", "protocol": ["bittorrent"]}]}}`, false},
 		{"routing empty rules", `{"routing": {"rules": []}}`, false},
 
+		// L-3: geoip:private check bypasses.
+		{"routing private blocked via balancer still rejected", `{"routing": {"rules": [{"type": "field", "outboundTag": "blocked", "balancerTag": "b-direct", "ip": ["geoip:private"]}]}}`, true},
+		{"routing literal private CIDR to direct", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"]}]}}`, true},
+		{"routing literal private CIDR via source", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "source": ["192.168.1.0/24"]}]}}`, true},
+		{"routing ext geoip private to direct", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["ext:geoip.dat:private"]}]}}`, true},
+		{"routing ext geoip other category allowed", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["ext:geoip.dat:cn"]}]}}`, false},
+		{"routing public CIDR to direct", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["8.8.8.8/32"]}]}}`, false},
+		{"routing catch-all CIDR to direct allowed", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["0.0.0.0/0"]}]}}`, false},
+		{"routing private CIDR to blocked", `{"routing": {"rules": [{"type": "field", "outboundTag": "blocked", "ip": ["10.0.0.0/8"]}]}}`, false},
+
+		// N-1: L-3 residual bypasses.
+		{"routing ext-ip geoip private to direct", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["ext-ip:geoip.dat:private"]}]}}`, true},
+		{"routing ext-ip geoip private uppercase", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["EXT-IP:GEOIP.DAT:PRIVATE"]}]}}`, true},
+		{"routing bare private IP to direct", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["10.0.0.1", "192.168.1.5"]}]}}`, true},
+		{"routing bare public IP to direct", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["8.8.8.8"]}]}}`, false},
+		{"routing reverse private CIDR to direct", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["!10.0.0.0/8"]}]}}`, true},
+		{"routing reverse geoip cn to direct", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["!geoip:cn"]}]}}`, true},
+		{"routing reverse geoip private harmless", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["!geoip:private"]}]}}`, false},
+		{"routing reverse catch-all harmless", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["!0.0.0.0/0"]}]}}`, false},
+		{"routing overlapping CIDR to direct", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["192.0.0.0/8", "128.0.0.0/2", "169.0.0.0/8", "fe00::/7"]}]}}`, true},
+		{"routing private CIDR with host bits", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["10.1.2.3/8"]}]}}`, true},
+		{"routing zero-prefix CIDR allowed", `{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["10.0.0.0/0"]}]}}`, false},
+
 		// H-7: freedom.redirect.
 		{"freedom redirect empty", `{"outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"redirect": ""}}]}`, false},
 		{"freedom redirect set", `{"outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"redirect": "127.0.0.1:8080"}}]}`, true},

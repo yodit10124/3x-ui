@@ -3,6 +3,7 @@ package model
 
 import (
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/util/json_util"
@@ -35,6 +36,38 @@ const (
 // with the literal v2 string would otherwise fall through (#4081).
 func IsHysteria(p Protocol) bool {
 	return p == Hysteria || p == Hysteria2
+}
+
+// validInboundProtocols is the allowlist of protocols the panel can
+// create (L-4): exactly the protocols the frontend offers, plus
+// "hysteria2", which imports may carry as a literal string (see
+// IsHysteria). Anything else — notably dokodemo-door, which the
+// template checks forbid — must not enter through the API or an
+// imported database either.
+var validInboundProtocols = map[Protocol]bool{
+	VMESS: true, VLESS: true, Trojan: true, Shadowsocks: true,
+	WireGuard: true, Hysteria: true, Hysteria2: true,
+	Mixed: true, HTTP: true, Tunnel: true,
+}
+
+// IsValidInboundProtocol reports whether p is a protocol the panel
+// supports for inbounds.
+func IsValidInboundProtocol(p Protocol) bool {
+	return validInboundProtocols[p]
+}
+
+// clientEmailPattern accepts either a plain email address or a plain
+// token label (the add-client flow's default email is an 8-character
+// random token, not an address). It rejects quotes, commas, colons,
+// whitespace, and control characters, so a value can never smuggle
+// extra JSON fields (M-7) or forge a fail2ban log line (L-8).
+var clientEmailPattern = regexp.MustCompile(`^(?:[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Za-z0-9._\-]+)$`)
+
+// IsValidClientEmail reports whether email is a plain address or a
+// plain token label. An empty email is not valid here; callers that
+// allow empty emails check that separately.
+func IsValidClientEmail(email string) bool {
+	return clientEmailPattern.MatchString(email)
 }
 
 // User represents a user account in the 3x-ui panel.

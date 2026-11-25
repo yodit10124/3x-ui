@@ -25,6 +25,9 @@ func (s *NordService) GetCountries() (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", common.NewErrorf("NordVPN API error: %s", resp.Status)
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return "", err
@@ -62,7 +65,10 @@ func (s *NordService) GetServers(countryId string) (string, error) {
 	var filtered []any
 	for _, s := range servers {
 		if server, ok := s.(map[string]any); ok {
-			if load, ok := server["load"].(float64); ok && load > 7 {
+			// L-18: load is a percentage; keep low-load servers.
+			// The old condition (load > 7) kept nearly every server
+			// and only dropped the most idle ones.
+			if load, ok := server["load"].(float64); ok && load < 70 {
 				filtered = append(filtered, s)
 			}
 		}

@@ -214,12 +214,20 @@ func downloadVerifiedUpdateScript() (string, error) {
 	return tmp.Name(), nil
 }
 
+// panelReleasesURL is the endpoint fetchLatestPanelVersion reads
+// (L-12): a var so tests can point it at a local server.
+// panelVersionTimeout bounds the request, panelVersionMaxBodyBytes
+// bounds the response: one release object is a few dozen KiB at most.
+var panelReleasesURL = "https://api.github.com/repos/yodit10124/3x-ui/releases?per_page=1"
+var panelVersionTimeout = 10 * time.Second
+var panelVersionMaxBodyBytes int64 = 1 << 20
+
 func fetchLatestPanelVersion() (string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: panelVersionTimeout}
 	// The fork publishes prereleases, and GitHub's /releases/latest endpoint
 	// only returns full releases, so list releases instead and take the
 	// newest one (the list is newest-first, prereleases included).
-	resp, err := client.Get("https://api.github.com/repos/yodit10124/3x-ui/releases?per_page=1")
+	resp, err := client.Get(panelReleasesURL)
 	if err != nil {
 		return "", err
 	}
@@ -228,8 +236,16 @@ func fetchLatestPanelVersion() (string, error) {
 		return "", fmt.Errorf("GitHub API returned status %d: %s", resp.StatusCode, resp.Status)
 	}
 
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, panelVersionMaxBodyBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(bodyBytes)) > panelVersionMaxBodyBytes {
+		return "", fmt.Errorf("GitHub API response exceeds the %d-byte limit", panelVersionMaxBodyBytes)
+	}
+
 	var releases []Release
-	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+	if err := json.Unmarshal(bodyBytes, &releases); err != nil {
 		return "", err
 	}
 	if len(releases) == 0 || releases[0].TagName == "" {

@@ -173,7 +173,7 @@
 "importDatabase" = "恢复"
 "importDatabaseDesc" = "点击选择并上传设备中的 .db 文件以从备份恢复数据库。"
 "importDatabaseSuccess" = "数据库导入成功"
-"importDatabaseCheckAccounts" = "提示：会话密钥已轮换，请检查管理员账号，导入的数据库可能含有未知的管理员账号。"
+"importDatabaseCheckAccounts" = "提示：会话密钥已轮换，Telegram 机器人 token 与聊天 ID 已清空，外部流量上报已关闭；请检查管理员账号（导入的数据库可能含有未知的管理员账号），并核对 Telegram、Geo 下载上限与面板监听设置。"
 "importDatabaseError" = "导入数据库时出错"
 "readDatabaseError" = "读取数据库时出错"
 "getDatabaseError" = "检索数据库时出错"
@@ -419,7 +419,7 @@
 "telegramProxy" = "SOCKS5 Proxy"
 "telegramProxyDesc" = "启用 SOCKS5 代理连接到 Telegram（根据指南调整设置）"
 "telegramAPIServer" = "Telegram API Server"
-"telegramAPIServerDesc" = "要使用的 Telegram API 服务器。留空以使用默认服务器。"
+"telegramAPIServerDesc" = "要使用的 Telegram API 服务器。留空以使用默认服务器。注意：自定义服务器会收到你的机器人 token 及全部机器人流量，仅使用你信任的服务器。"
 "telegramChatId" = "管理员聊天 ID"
 "telegramChatIdDesc" = "Telegram 管理员聊天 ID (多个以逗号分隔)（可通过 @userinfobot 获取，或在机器人中使用 '/id' 命令获取）"
 "telegramNotifyTime" = "通知时间"
@@ -816,6 +816,7 @@
 "SuccessResetTraffic" = "📧 邮箱: {{ .ClientEmail }}\n🏁 结果: ✅ 成功"
 "FailedResetTraffic" = "📧 邮箱: {{ .ClientEmail }}\n🏁 结果: ❌ 失败 \n\n🛠️ 错误: [ {{ .ErrorMessage }} ]"
 "FinishProcess" = "🔚 所有客户的流量重置已完成。"
+"bulkReportTruncated" = "⚠️ 仅显示前 {{ .Shown }} 条结果，共 {{ .Total }} 条，其余已省略以避免刷屏。"
 
 [tgbot.buttons]
 "closeKeyboard" = "❌ 关闭键盘"

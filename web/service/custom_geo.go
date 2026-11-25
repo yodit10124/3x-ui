@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -31,7 +32,17 @@ const (
 	// at most, so 100 MiB leaves ample room while bounding how much a
 	// malicious or compromised remote source can write to the disk.
 	defaultGeoMaxFileSizeMB = 100
+	// maxGeoMaxFileSizeMB is the hard ceiling for geoMaxFileSizeMB
+	// (L-6): the setting can only lower the cap, never raise it above
+	// the default. An imported database could otherwise set it to an
+	// absurd value and remove the download bound entirely.
+	maxGeoMaxFileSizeMB = defaultGeoMaxFileSizeMB
 )
+
+// customGeoDNSValidationTimeout bounds the DNS lookup in the save-time
+// URL check (N-7). A stalled resolver must not hang the save request
+// indefinitely. It is a var so tests can shorten it.
+var customGeoDNSValidationTimeout = 5 * time.Second
 
 var (
 	customGeoAliasPattern = regexp.MustCompile(`^[a-z0-9_-]+$`)
@@ -77,7 +88,8 @@ type CustomGeoService struct {
 	serverService      *ServerService
 	settingService     *SettingService
 	updateAllGetAll    func() ([]model.CustomGeoResource, error)
-	updateAllApply     func(id int, onStartup bool) (string, *geoCommit, error)
+	updateAllPrepare   func(id int, onStartup bool) (string, *geoDownload, error)
+	updateAllApply     func(prepared *geoDownload, onStartup bool) (string, *geoCommit, error)
 	updateAllRestart   func() error
 	updateAllWaitReady func() error
 }
@@ -88,7 +100,8 @@ func NewCustomGeoService() *CustomGeoService {
 		settingService: &SettingService{},
 	}
 	s.updateAllGetAll = s.GetAll
-	s.updateAllApply = s.applyDownloadAndPersist
+	s.updateAllPrepare = s.prepareGeoDownload
+	s.updateAllApply = s.commitGeoDownload
 	s.updateAllRestart = func() error { return s.serverService.RestartXrayService() }
 	s.updateAllWaitReady = func() error { return s.serverService.WaitReady(10 * time.Second) }
 	return s
@@ -97,7 +110,8 @@ func NewCustomGeoService() *CustomGeoService {
 // geoMaxFileSizeBytes returns the configured maximum download size in
 // bytes. A missing setting service (zero-value service in tests), a
 // missing setting, or a stored value <= 0 all fall back to the default,
-// so the limit can never be disabled by accident.
+// so the limit can never be disabled by accident. A stored value above
+// the ceiling is clamped (L-6): the setting can only lower the cap.
 func (s *CustomGeoService) geoMaxFileSizeBytes() int64 {
 	if s == nil || s.settingService == nil {
 		return defaultGeoMaxFileSizeMB * 1024 * 1024
@@ -105,6 +119,9 @@ func (s *CustomGeoService) geoMaxFileSizeBytes() int64 {
 	mb, err := s.settingService.GetGeoMaxFileSizeMB()
 	if err != nil || mb <= 0 {
 		return defaultGeoMaxFileSizeMB * 1024 * 1024
+	}
+	if mb > maxGeoMaxFileSizeMB {
+		return maxGeoMaxFileSizeMB * 1024 * 1024
 	}
 	return int64(mb) * 1024 * 1024
 }
@@ -154,7 +171,11 @@ func (s *CustomGeoService) sanitizeURL(raw string) (string, error) {
 	if u.Host == "" {
 		return "", ErrCustomGeoURLHost
 	}
-	if err := checkSSRF(context.Background(), u.Hostname()); err != nil {
+	// N-7: bound the DNS lookup so a stalled resolver cannot hang the
+	// save request indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), customGeoDNSValidationTimeout)
+	defer cancel()
+	if err := checkSSRF(ctx, u.Hostname()); err != nil {
 		return "", err
 	}
 	// Reconstruct URL from parsed components to break taint propagation.
@@ -189,8 +210,98 @@ func CustomGeoLocalFileNeedsRepair(path string) bool {
 }
 
 func isBlockedIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true // Unparseable address: fail closed.
+	}
+	addr = addr.Unmap()
+	if !addr.Is4() {
+		// IPv6: loopback/private/link-local/unspecified are already
+		// covered above, but several non-global-unicast forms slip
+		// past the net.IP helpers (N-5): documentation, benchmarking,
+		// discard and deprecated site-local ranges, plus addresses
+		// that embed an IPv4 address — IPv4-compatible ::a.b.c.d,
+		// 6to4 2002:<ipv4>:: and NAT64 64:ff9b::<ipv4>. The embedded
+		// IPv4 address is judged by the same IPv4 rules.
+		for _, p := range blockedIPPrefixesV6 {
+			if p.Contains(addr) {
+				return true
+			}
+		}
+		if embedded, ok := embeddedIPv4(addr); ok {
+			return isBlockedIP(embedded.AsSlice())
+		}
+		return false
+	}
+	for _, p := range blockedIPPrefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// blockedIPPrefixes are non-global-unicast IPv4 ranges that
+// net.IP.IsPrivate/IsLoopback/IsLinkLocalUnicast do not cover. Any host
+// resolving into one of these is internal, reserved, or documentation
+// space — never a legitimate public download/report target.
+var blockedIPPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),       // "this network" (RFC 791)
+	netip.MustParsePrefix("100.64.0.0/10"),   // CGNAT shared address space (RFC 6598)
+	netip.MustParsePrefix("192.0.0.0/24"),    // IETF protocol assignments (RFC 6890)
+	netip.MustParsePrefix("192.0.2.0/24"),    // TEST-NET-1 documentation (RFC 5737)
+	netip.MustParsePrefix("198.18.0.0/15"),   // benchmarking (RFC 2544)
+	netip.MustParsePrefix("198.51.100.0/24"), // TEST-NET-2 documentation (RFC 5737)
+	netip.MustParsePrefix("203.0.113.0/24"),  // TEST-NET-3 documentation (RFC 5737)
+	netip.MustParsePrefix("240.0.0.0/4"),     // reserved, incl. 255.255.255.255 (RFC 1112)
+}
+
+// blockedIPPrefixesV6 are non-global-unicast IPv6 ranges that
+// net.IP.IsPrivate/IsLoopback/IsLinkLocalUnicast do not cover. Any host
+// resolving into one of these is reserved or documentation space —
+// never a legitimate public download/report target.
+var blockedIPPrefixesV6 = []netip.Prefix{
+	netip.MustParsePrefix("2001:db8::/32"), // documentation (RFC 3849)
+	netip.MustParsePrefix("2001:2::/48"),   // benchmarking (RFC 5180)
+	netip.MustParsePrefix("100::/64"),      // discard (RFC 6666)
+	netip.MustParsePrefix("fec0::/10"),     // site-local, deprecated (RFC 3879)
+}
+
+var (
+	sixToFourPrefix = netip.MustParsePrefix("2002::/16")    // 6to4 (RFC 3056)
+	nat64WKPPrefix  = netip.MustParsePrefix("64:ff9b::/96") // NAT64 well-known prefix (RFC 6052)
+)
+
+// embeddedIPv4 extracts the IPv4 address embedded in an IPv6 address
+// that carries one: IPv4-compatible ::a.b.c.d (RFC 4291), 6to4
+// 2002:<ipv4>::/48 (RFC 3056), and NAT64 64:ff9b::<ipv4> (RFC 6052).
+// It reports false for ordinary IPv6 addresses.
+func embeddedIPv4(addr netip.Addr) (netip.Addr, bool) {
+	b := addr.As16()
+	// IPv4-compatible ::/96: the low 32 bits are an IPv4 address.
+	compatible := true
+	for _, c := range b[:12] {
+		if c != 0 {
+			compatible = false
+			break
+		}
+	}
+	if compatible {
+		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
+	}
+	// 6to4 embeds the IPv4 address in bits 16..48.
+	if sixToFourPrefix.Contains(addr) {
+		return netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}), true
+	}
+	// NAT64 well-known prefix embeds it in the low 32 bits.
+	if nat64WKPPrefix.Contains(addr) {
+		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
+	}
+	return netip.Addr{}, false
 }
 
 // checkBlockedIP is the active blocklist decision, used both when resolving
@@ -481,19 +592,73 @@ func (s *CustomGeoService) downloadToPathFull(resourceURL, destPath string) (ski
 }
 
 func (s *CustomGeoService) downloadToPathOnce(resourceURL, destPath string, lastModifiedHeader string, forceFull bool) (skipped bool, newLastModified string, err error) {
+	skipped, lm, tmpPath, err := s.downloadToTempOnce(resourceURL, destPath, lastModifiedHeader, forceFull)
+	if err != nil || skipped {
+		return skipped, lm, err
+	}
+	if err = os.Rename(tmpPath, destPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
+	}
+	return false, lm, nil
+}
+
+// downloadToTemp is downloadToPath without the final rename: it
+// downloads to a uniquely named temp file next to destPath and
+// returns its path (L-11). The caller owns the temp file: it must
+// rename it into place or remove it. A 304 with a missing or corrupt
+// local file retries unconditionally, like downloadToPath.
+func (s *CustomGeoService) downloadToTemp(resourceURL, destPath string, lastModifiedHeader string) (skipped bool, newLastModified string, tmpPath string, err error) {
 	safeDestPath, err := sanitizeDestPath(destPath)
 	if err != nil {
-		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
+		return false, "", "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
+	}
+
+	skipped, lm, tmp, err := s.downloadToTempOnce(resourceURL, safeDestPath, lastModifiedHeader, false)
+	if err != nil {
+		return false, "", "", err
+	}
+	if skipped {
+		if _, statErr := os.Stat(safeDestPath); statErr == nil && !localDatFileNeedsRepair(safeDestPath) {
+			return true, lm, "", nil
+		}
+		return s.downloadToTempOnce(resourceURL, safeDestPath, lastModifiedHeader, true)
+	}
+	return false, lm, tmp, nil
+}
+
+// downloadToTempFull downloads without a conditional request: used
+// when the source URL changed, so the old source's Last-Modified is
+// never sent to the new source — a 304 there would keep the old
+// source's data under the new URL.
+func (s *CustomGeoService) downloadToTempFull(resourceURL, destPath string) (skipped bool, newLastModified string, tmpPath string, err error) {
+	safeDestPath, err := sanitizeDestPath(destPath)
+	if err != nil {
+		return false, "", "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
+	}
+	return s.downloadToTempOnce(resourceURL, safeDestPath, "", true)
+}
+
+// downloadToTempOnce downloads resourceURL to a uniquely named temp
+// file next to destPath and returns its path without renaming it
+// into place (L-11). The caller owns the temp file: it must rename
+// it to destPath or remove it. On a 304 it returns skipped=true and
+// no temp file. The server's Last-Modified is stamped on the temp
+// file, so the rename preserves it exactly as before.
+func (s *CustomGeoService) downloadToTempOnce(resourceURL, destPath string, lastModifiedHeader string, forceFull bool) (skipped bool, newLastModified string, tmpPath string, err error) {
+	safeDestPath, err := sanitizeDestPath(destPath)
+	if err != nil {
+		return false, "", "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
 	}
 	sanitizedURL, err := s.sanitizeURL(resourceURL)
 	if err != nil {
-		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
+		return false, "", "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
 	}
 
 	var req *http.Request
 	req, err = http.NewRequest(http.MethodGet, sanitizedURL, nil)
 	if err != nil {
-		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
+		return false, "", "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
 	}
 
 	if !forceFull {
@@ -512,7 +677,7 @@ func (s *CustomGeoService) downloadToPathOnce(resourceURL, destPath string, last
 	// codeql[go/request-forgery]
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
+		return false, "", "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
 	}
 	defer resp.Body.Close()
 
@@ -524,21 +689,21 @@ func (s *CustomGeoService) downloadToPathOnce(resourceURL, destPath string, last
 		}
 	}
 
-	updateModTime := func() {
+	updateModTime := func(p string) {
 		if !serverModTime.IsZero() {
-			_ = os.Chtimes(safeDestPath, serverModTime, serverModTime)
+			_ = os.Chtimes(p, serverModTime, serverModTime)
 		}
 	}
 
 	if resp.StatusCode == http.StatusNotModified {
 		if forceFull {
-			return false, "", fmt.Errorf("%w: unexpected 304 on unconditional get", ErrCustomGeoDownload)
+			return false, "", "", fmt.Errorf("%w: unexpected 304 on unconditional get", ErrCustomGeoDownload)
 		}
-		updateModTime()
-		return true, newLastModified, nil
+		updateModTime(safeDestPath)
+		return true, newLastModified, "", nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return false, "", fmt.Errorf("%w: unexpected status %d", ErrCustomGeoDownload, resp.StatusCode)
+		return false, "", "", fmt.Errorf("%w: unexpected status %d", ErrCustomGeoDownload, resp.StatusCode)
 	}
 
 	// Enforce the download size limit before writing anything: a
@@ -548,51 +713,46 @@ func (s *CustomGeoService) downloadToPathOnce(resourceURL, destPath string, last
 	// chunked responses that carry no Content-Length.
 	maxBytes := s.geoMaxFileSizeBytes()
 	if resp.ContentLength > maxBytes {
-		return false, "", fmt.Errorf("%w: file too large: Content-Length %d exceeds limit %d", ErrCustomGeoDownload, resp.ContentLength, maxBytes)
+		return false, "", "", fmt.Errorf("%w: file too large: Content-Length %d exceeds limit %d", ErrCustomGeoDownload, resp.ContentLength, maxBytes)
 	}
 
 	binDir := filepath.Dir(safeDestPath)
 	if err = os.MkdirAll(binDir, 0o755); err != nil {
-		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
+		return false, "", "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
 	}
 
 	safeTmpPath, err := sanitizeDestPath(safeDestPath + ".tmp-" + random.Seq(8))
 	if err != nil {
-		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
+		return false, "", "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
 	}
 	out, err := os.Create(safeTmpPath)
 	if err != nil {
-		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
+		return false, "", "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
 	}
 	n, err := io.Copy(out, io.LimitReader(resp.Body, maxBytes+1))
 	closeErr := out.Close()
 	if err != nil {
 		_ = os.Remove(safeTmpPath)
-		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
+		return false, "", "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
 	}
 	if closeErr != nil {
 		_ = os.Remove(safeTmpPath)
-		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, closeErr)
+		return false, "", "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, closeErr)
 	}
 	if n > maxBytes {
 		_ = os.Remove(safeTmpPath)
-		return false, "", fmt.Errorf("%w: file too large: exceeds limit %d bytes", ErrCustomGeoDownload, maxBytes)
+		return false, "", "", fmt.Errorf("%w: file too large: exceeds limit %d bytes", ErrCustomGeoDownload, maxBytes)
 	}
 	if n < minDatBytes {
 		_ = os.Remove(safeTmpPath)
-		return false, "", fmt.Errorf("%w: file too small", ErrCustomGeoDownload)
+		return false, "", "", fmt.Errorf("%w: file too small", ErrCustomGeoDownload)
 	}
 
-	if err = os.Rename(safeTmpPath, safeDestPath); err != nil {
-		_ = os.Remove(safeTmpPath)
-		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
-	}
-
-	updateModTime()
+	updateModTime(safeTmpPath)
 	if newLastModified == "" && resp.Header.Get("Last-Modified") != "" {
 		newLastModified = resp.Header.Get("Last-Modified")
 	}
-	return false, newLastModified, nil
+	return false, newLastModified, safeTmpPath, nil
 }
 
 func (s *CustomGeoService) resolveDestPath(r *model.CustomGeoResource) string {
@@ -756,10 +916,9 @@ func (s *CustomGeoService) preRestartState() (wasRunning, wasManuallyStopped boo
 }
 
 func (s *CustomGeoService) Create(r *model.CustomGeoResource) error {
-	// The whole update transaction is serialised with Xray updates,
-	// other geo updates, and imports.
-	updateMu.Lock()
-	defer updateMu.Unlock()
+	// L-11: the download runs without updateMu; only the commit
+	// (file swap + record write + restart) is serialised with Xray
+	// updates, other geo updates, and imports.
 	if err := s.validateType(r.Type); err != nil {
 		return err
 	}
@@ -780,18 +939,35 @@ func (s *CustomGeoService) Create(r *model.CustomGeoResource) error {
 	if err := s.syncAndSanitizeLocalPath(r); err != nil {
 		return err
 	}
-	// Back up any file already at the destination before the
-	// download replaces it, so a failed database insert restores
-	// the old content instead of deleting a file the record never
-	// owned.
-	backupPath, err := backupGeoFile(r.LocalPath)
+	skipped, lm, tmpPath, err := s.downloadToTemp(r.Url, r.LocalPath, r.LastModified)
 	if err != nil {
 		return err
 	}
-	skipped, lm, err := s.downloadToPath(r.Url, r.LocalPath, r.LastModified)
+
+	updateMu.Lock()
+	defer updateMu.Unlock()
+	// Re-check the duplicate under the lock: two concurrent creates
+	// of the same alias both pass the check above.
+	database.GetDB().Model(&model.CustomGeoResource{}).
+		Where("geo_type = ? AND alias = ?", r.Type, r.Alias).Count(&existing)
+	if existing > 0 {
+		_ = os.Remove(tmpPath)
+		return ErrCustomGeoDuplicateAlias
+	}
+	// Back up any file already at the destination before the swap,
+	// so a failed database insert restores the old content instead
+	// of deleting a file the record never owned.
+	backupPath, err := backupGeoFile(r.LocalPath)
 	if err != nil {
-		discardGeoFileBackup(backupPath)
+		_ = os.Remove(tmpPath)
 		return err
+	}
+	if tmpPath != "" {
+		if err := os.Rename(tmpPath, r.LocalPath); err != nil {
+			_ = os.Remove(tmpPath)
+			discardGeoFileBackup(backupPath)
+			return err
+		}
 	}
 	now := time.Now().Unix()
 	r.LastUpdatedAt = now
@@ -810,10 +986,8 @@ func (s *CustomGeoService) Create(r *model.CustomGeoResource) error {
 }
 
 func (s *CustomGeoService) Update(id int, r *model.CustomGeoResource) error {
-	// The whole update transaction is serialised with Xray updates,
-	// other geo updates, and imports.
-	updateMu.Lock()
-	defer updateMu.Unlock()
+	// L-11: the download runs without updateMu; only the commit
+	// (file swap + record write + restart) is serialised.
 	var cur model.CustomGeoResource
 	if err := database.GetDB().First(&cur, id).Error; err != nil {
 		if database.IsNotFound(err) {
@@ -846,34 +1020,43 @@ func (s *CustomGeoService) Update(id int, r *model.CustomGeoResource) error {
 	if err := s.syncAndSanitizeLocalPath(r); err != nil {
 		return err
 	}
-	// Download first, commit last. Before the download, back up
-	// whatever file already sits at the destination: if the
+	// Download first, commit last. The old file is deleted only
+	// after the download AND the database update succeed: if the
+	// new source answers 404, is oversized, or the network drops,
+	// the old file and the old record stay untouched, so Xray keeps
+	// working. When the source URL changed, the old source's
+	// Last-Modified must not be sent to the new source: a 304 there
+	// would keep the old source's data while the record is updated
+	// to the new URL. Force a full download in that case.
+	var lm string
+	var tmpPath string
+	if r.Url != cur.Url {
+		_, lm, tmpPath, err = s.downloadToTempFull(r.Url, r.LocalPath)
+	} else {
+		_, lm, tmpPath, err = s.downloadToTemp(r.Url, r.LocalPath, cur.LastModified)
+	}
+	if err != nil {
+		return err
+	}
+
+	updateMu.Lock()
+	defer updateMu.Unlock()
+	// Back up whatever file already sits at the destination: if the
 	// database update fails after the file was replaced, the old
 	// content is restored instead of leaving the file and the
 	// record inconsistent (the new content under the old URL and
-	// Last-Modified). The old file is deleted only after the
-	// download AND the database update succeed: if the new source
-	// answers 404, is oversized, or the network drops, the old file
-	// and the old record stay untouched, so Xray keeps working.
-	// When the source URL changed, the old source's Last-Modified
-	// must not be sent to the new source: a 304 there would keep the
-	// old source's data while the record is updated to the new URL.
-	// Force a full download in that case.
+	// Last-Modified).
 	backupPath, err := backupGeoFile(r.LocalPath)
 	if err != nil {
+		_ = os.Remove(tmpPath)
 		return err
 	}
-	var lm string
-	if r.Url != cur.Url {
-		_, lm, err = s.downloadToPathFull(r.Url, r.LocalPath)
-	} else {
-		_, lm, err = s.downloadToPath(r.Url, r.LocalPath, cur.LastModified)
-	}
-	if err != nil {
-		// The download failed before replacing anything; the
-		// backup is a redundant copy now.
-		discardGeoFileBackup(backupPath)
-		return err
+	if tmpPath != "" {
+		if err := os.Rename(tmpPath, r.LocalPath); err != nil {
+			_ = os.Remove(tmpPath)
+			discardGeoFileBackup(backupPath)
+			return err
+		}
 	}
 	r.LastUpdatedAt = time.Now().Unix()
 	r.LastModified = lm
@@ -948,7 +1131,25 @@ func (s *CustomGeoService) GetAll() ([]model.CustomGeoResource, error) {
 	return list, err
 }
 
-func (s *CustomGeoService) applyDownloadAndPersist(id int, onStartup bool) (displayName string, commit *geoCommit, err error) {
+// geoDownload is a downloaded CustomGeo file waiting to be committed
+// (L-11): the network fetch — slow, up to 10 minutes — is done, the
+// temp file holds the new content, and the file swap + record update
+// still have to happen under updateMu. Splitting the two phases is
+// what keeps a slow download from blocking Xray updates, imports,
+// and other geo updates for its whole duration.
+type geoDownload struct {
+	record      model.CustomGeoResource // as loaded (pre-update state)
+	displayName string
+	destPath    string
+	tmpPath     string // "" when the source answered 304
+	skipped     bool
+	lm          string
+}
+
+// prepareGeoDownload loads the record and downloads the new file to
+// a temp file. It takes no lock: the download is the slow part and
+// touches no shared state (the temp file name is unique per call).
+func (s *CustomGeoService) prepareGeoDownload(id int, onStartup bool) (displayName string, prepared *geoDownload, err error) {
 	var r model.CustomGeoResource
 	if err := database.GetDB().First(&r, id).Error; err != nil {
 		if database.IsNotFound(err) {
@@ -964,18 +1165,8 @@ func (s *CustomGeoService) applyDownloadAndPersist(id int, onStartup bool) (disp
 	if sanitizeErr != nil {
 		return displayName, nil, sanitizeErr
 	}
-	// Back up the current file before the download replaces it, so
-	// a failed metadata update restores the old content instead of
-	// leaving the file and the record inconsistent. The backup is
-	// returned to the caller, which owns it until the service
-	// restart and readiness check pass.
-	backupPath, err := backupGeoFile(r.LocalPath)
+	skipped, lm, tmpPath, err := s.downloadToTemp(sanitizedURL, r.LocalPath, r.LastModified)
 	if err != nil {
-		return displayName, nil, err
-	}
-	skipped, lm, err := s.downloadToPath(sanitizedURL, r.LocalPath, r.LastModified)
-	if err != nil {
-		discardGeoFileBackup(backupPath)
 		if onStartup {
 			logger.Warningf("custom geo startup download id=%d: %v", id, err)
 		} else {
@@ -983,44 +1174,91 @@ func (s *CustomGeoService) applyDownloadAndPersist(id int, onStartup bool) (disp
 		}
 		return displayName, nil, err
 	}
+	return displayName, &geoDownload{
+		record: r, displayName: displayName, destPath: r.LocalPath,
+		tmpPath: tmpPath, skipped: skipped, lm: lm,
+	}, nil
+}
+
+// commitGeoDownload swaps a prepared download into place and updates
+// the record. The caller must hold updateMu: the backup, the rename,
+// and the record write are one atomic step, so a concurrent update
+// cannot interleave them and leave the file and the record
+// inconsistent. The returned commit owns the backup until the
+// service restart and readiness check pass.
+func (s *CustomGeoService) commitGeoDownload(prepared *geoDownload, onStartup bool) (displayName string, commit *geoCommit, err error) {
+	r := prepared.record
+	displayName = prepared.displayName
+	// Back up the current file before the download replaces it, so
+	// a failed metadata update restores the old content instead of
+	// leaving the file and the record inconsistent.
+	backupPath, err := backupGeoFile(prepared.destPath)
+	if err != nil {
+		_ = os.Remove(prepared.tmpPath)
+		return displayName, nil, err
+	}
+	if prepared.tmpPath != "" {
+		if err := os.Rename(prepared.tmpPath, prepared.destPath); err != nil {
+			_ = os.Remove(prepared.tmpPath)
+			discardGeoFileBackup(backupPath)
+			return displayName, nil, err
+		}
+	}
 	now := time.Now().Unix()
 	updates := map[string]any{
-		"last_modified":   lm,
-		"local_path":      r.LocalPath,
+		"last_modified":   prepared.lm,
+		"local_path":      prepared.destPath,
 		"last_updated_at": now,
 	}
-	if err = database.GetDB().Model(&model.CustomGeoResource{}).Where("id = ?", id).Updates(updates).Error; err != nil {
-		rollbackGeoFile(backupPath, r.LocalPath)
+	if err = database.GetDB().Model(&model.CustomGeoResource{}).Where("id = ?", r.Id).Updates(updates).Error; err != nil {
+		rollbackGeoFile(backupPath, prepared.destPath)
 		if onStartup {
-			logger.Warningf("custom geo startup id=%d: persist metadata: %v", id, err)
+			logger.Warningf("custom geo startup id=%d: persist metadata: %v", r.Id, err)
 		} else {
-			logger.Warningf("custom geo manual update id=%d: persist metadata: %v", id, err)
+			logger.Warningf("custom geo manual update id=%d: persist metadata: %v", r.Id, err)
 		}
 		return displayName, nil, err
 	}
-	if skipped {
+	if prepared.skipped {
 		if onStartup {
-			logger.Infof("custom geo startup download skipped (not modified) id=%d", id)
+			logger.Infof("custom geo startup download skipped (not modified) id=%d", r.Id)
 		} else {
-			logger.Infof("custom geo manual update skipped (not modified) id=%d", id)
+			logger.Infof("custom geo manual update skipped (not modified) id=%d", r.Id)
 		}
 	} else {
 		if onStartup {
-			logger.Infof("custom geo startup download ok id=%d", id)
+			logger.Infof("custom geo startup download ok id=%d", r.Id)
 		} else {
-			logger.Infof("custom geo manual update ok id=%d", id)
+			logger.Infof("custom geo manual update ok id=%d", r.Id)
 		}
 	}
-	return displayName, &geoCommit{destPath: r.LocalPath, backupPath: backupPath, old: &r, recordID: id}, nil
+	return displayName, &geoCommit{destPath: prepared.destPath, backupPath: backupPath, old: &r, recordID: r.Id}, nil
+}
+
+// applyDownloadAndPersist downloads and commits one resource. It is
+// the self-contained form used by EnsureOnStartup (which holds no
+// lock): the download runs lock-free and the commit takes updateMu.
+func (s *CustomGeoService) applyDownloadAndPersist(id int, onStartup bool) (displayName string, commit *geoCommit, err error) {
+	displayName, prepared, err := s.prepareGeoDownload(id, onStartup)
+	if err != nil {
+		return displayName, nil, err
+	}
+	updateMu.Lock()
+	defer updateMu.Unlock()
+	return s.commitGeoDownload(prepared, onStartup)
 }
 
 func (s *CustomGeoService) TriggerUpdate(id int) (string, error) {
-	// The whole update transaction is serialised with Xray updates,
-	// other geo updates, and imports.
+	// L-11: the download runs without updateMu; only the commit and
+	// the restart are serialised.
+	displayName, prepared, err := s.prepareGeoDownload(id, false)
+	if err != nil {
+		return displayName, err
+	}
 	updateMu.Lock()
 	defer updateMu.Unlock()
 	wasRunning, wasManuallyStopped := s.preRestartState()
-	displayName, commit, err := s.applyDownloadAndPersist(id, false)
+	displayName, commit, err := s.commitGeoDownload(prepared, false)
 	if err != nil {
 		return displayName, err
 	}
@@ -1031,11 +1269,6 @@ func (s *CustomGeoService) TriggerUpdate(id int) (string, error) {
 }
 
 func (s *CustomGeoService) TriggerUpdateAll() (*CustomGeoUpdateAllResult, error) {
-	// The whole batch is one serialised update transaction: the
-	// per-resource applies, the single restart, and the readiness
-	// check.
-	updateMu.Lock()
-	defer updateMu.Unlock()
 	var list []model.CustomGeoResource
 	var err error
 	if s.updateAllGetAll != nil {
@@ -1050,25 +1283,53 @@ func (s *CustomGeoService) TriggerUpdateAll() (*CustomGeoUpdateAllResult, error)
 	if len(list) == 0 {
 		return res, nil
 	}
+	// L-11: download every resource first, without the lock — a slow
+	// source no longer blocks Xray updates, imports, or other geo
+	// updates for up to 10 minutes per file. Only the file swaps,
+	// the record writes, and the single restart run under updateMu.
+	prepare := s.updateAllPrepare
+	if prepare == nil {
+		prepare = s.prepareGeoDownload
+	}
+	type preparedItem struct {
+		r        model.CustomGeoResource
+		prepared *geoDownload
+	}
+	var preparedItems []preparedItem
+	for _, r := range list {
+		_, prepared, prepErr := prepare(r.Id, false)
+		if prepErr != nil {
+			res.Failed = append(res.Failed, CustomGeoUpdateAllFailure{
+				Id: r.Id, Alias: r.Alias, FileName: s.fileNameFor(r.Type, r.Alias), Err: prepErr.Error(),
+			})
+			continue
+		}
+		preparedItems = append(preparedItems, preparedItem{r: r, prepared: prepared})
+	}
+
+	// The batch commit — the per-resource swaps, the single restart,
+	// and the readiness check — is one serialised update transaction.
+	updateMu.Lock()
+	defer updateMu.Unlock()
 	wasRunning, wasManuallyStopped := s.preRestartState()
 	var commits []*geoCommit
-	for _, r := range list {
+	apply := s.updateAllApply
+	if apply == nil {
+		apply = s.commitGeoDownload
+	}
+	for _, item := range preparedItems {
 		var name string
 		var commit *geoCommit
 		var applyErr error
-		if s.updateAllApply != nil {
-			name, commit, applyErr = s.updateAllApply(r.Id, false)
-		} else {
-			name, commit, applyErr = s.applyDownloadAndPersist(r.Id, false)
-		}
+		name, commit, applyErr = apply(item.prepared, false)
 		if applyErr != nil {
 			res.Failed = append(res.Failed, CustomGeoUpdateAllFailure{
-				Id: r.Id, Alias: r.Alias, FileName: name, Err: applyErr.Error(),
+				Id: item.r.Id, Alias: item.r.Alias, FileName: name, Err: applyErr.Error(),
 			})
 			continue
 		}
 		res.Succeeded = append(res.Succeeded, CustomGeoUpdateAllItem{
-			Id: r.Id, Alias: r.Alias, FileName: name,
+			Id: item.r.Id, Alias: item.r.Alias, FileName: name,
 		})
 		commits = append(commits, commit)
 	}
