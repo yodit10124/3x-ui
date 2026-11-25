@@ -579,18 +579,6 @@ func sanitizeDestPath(destPath string) (string, error) {
 	return destPathAbs, nil
 }
 
-// downloadToPathFull downloads without a conditional request: used
-// when the source URL changed, so the old source's Last-Modified is
-// never sent to the new source — a 304 there would keep the old
-// source's data under the new URL.
-func (s *CustomGeoService) downloadToPathFull(resourceURL, destPath string) (skipped bool, newLastModified string, err error) {
-	safeDestPath, err := sanitizeDestPath(destPath)
-	if err != nil {
-		return false, "", fmt.Errorf("%w: %v", ErrCustomGeoDownload, err)
-	}
-	return s.downloadToPathOnce(resourceURL, safeDestPath, "", true)
-}
-
 func (s *CustomGeoService) downloadToPathOnce(resourceURL, destPath string, lastModifiedHeader string, forceFull bool) (skipped bool, newLastModified string, err error) {
 	skipped, lm, tmpPath, err := s.downloadToTempOnce(resourceURL, destPath, lastModifiedHeader, forceFull)
 	if err != nil || skipped {
