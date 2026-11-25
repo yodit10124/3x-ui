@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/mymmrac/telego"
+	th "github.com/mymmrac/telego/telegohandler"
 	"github.com/op/go-logging"
 )
 
@@ -707,5 +708,184 @@ func TestAdminIdsConcurrentReload(t *testing.T) {
 	setAdminIds(nil)
 	if checkAdmin(111) {
 		t.Fatalf("cleared admin list still reports 111 as admin")
+	}
+}
+
+// H-2: with Xray never started, the package-global process pointer p is
+// nil. The three Telegram paths that used to touch p directly must not
+// panic, and the client must be reported offline. On the old code each
+// of these calls panics (the test binary crashes).
+func TestTgbotNilXrayProcess(t *testing.T) {
+	setupTgbotTestDB(t)
+	tb := (&Tgbot{}).NewTgbot()
+
+	// Pin p to nil: other tests in this package start a fake Xray and
+	// leave p set. Restore it afterwards.
+	oldP := p
+	p = nil
+	t.Cleanup(func() { p = oldP })
+
+	// Force the uncached path in prepareServerUsageInfo: a warm cache
+	// would return early without touching the process pointer.
+	statusCache.mutex.Lock()
+	statusCache.data = nil
+	statusCache.mutex.Unlock()
+	serverStatsCache.mutex.Lock()
+	serverStatsCache.data = ""
+	serverStatsCache.mutex.Unlock()
+
+	var ct xray.ClientTraffic
+	if err := database.GetDB().Where("email = ?", "victim@example.com").First(&ct).Error; err != nil {
+		t.Fatalf("read traffic: %v", err)
+	}
+
+	// clientInfoMsg: must not panic and must produce output. Whether the
+	// client is reported offline is decided by IsXrayRunning, asserted
+	// below; the rendered status text itself is not observable here
+	// because the locale bundle is not loaded in tests.
+	msg := tb.clientInfoMsg(&ct, true, true, true, true, true, false)
+	if msg == "" {
+		t.Fatal("clientInfoMsg with nil Xray process returned empty info")
+	}
+	if tb.xrayService.IsXrayRunning() {
+		t.Fatal("IsXrayRunning with nil Xray process returned true")
+	}
+	if onlines := tb.xrayService.GetOnlineClients(); onlines != nil {
+		t.Fatalf("GetOnlineClients with nil Xray process returned %v, want nil", onlines)
+	}
+
+	// prepareServerUsageInfo: must not panic and must produce output.
+	if info := tb.prepareServerUsageInfo(); info == "" {
+		t.Fatal("prepareServerUsageInfo with nil Xray process returned empty info")
+	}
+
+	// onlineClients: must not panic and must send nothing.
+	tb.onlineClients(tgbotTestChatID)
+}
+
+// H-2: the PanicRecovery middleware registered by newBotHandler must
+// keep the update loop alive after a handler panics. The panicking
+// update is a callback query without a message, which matches none of
+// the production routes (they all need a message or a command) and
+// therefore reaches the panicking handler registered last. Without the
+// middleware the panic crashes the test binary; with it, the following
+// close-keyboard message is still answered.
+func TestTgbotPanicRecoveryMiddleware(t *testing.T) {
+	setupTgbotTestDB(t)
+	api := setupFakeTgbot(t)
+	tb := (&Tgbot{}).NewTgbot()
+
+	updates := make(chan telego.Update, 4)
+	h, err := tb.newBotHandler(bot, updates)
+	if err != nil {
+		t.Fatalf("newBotHandler: %v", err)
+	}
+	// Registered last, but matched first for a message-less callback:
+	// the production callback route requires a message.
+	h.HandleCallbackQuery(func(ctx *th.Context, query telego.CallbackQuery) error {
+		panic("boom")
+	}, th.AnyCallbackQuery())
+
+	go func() { _ = h.Start() }()
+	t.Cleanup(func() { _ = h.Stop() })
+
+	// Update 1: panics inside a handler.
+	updates <- telego.Update{UpdateID: 1, CallbackQuery: &telego.CallbackQuery{
+		ID:   "q1",
+		From: telego.User{ID: tgbotTestAdminID},
+	}}
+
+	// Update 2: the close-keyboard button must still be answered. If
+	// the panic had killed the handler loop, no send would ever arrive.
+	closeText := tb.I18nBot("tgbot.buttons.closeKeyboard")
+	updates <- telego.Update{UpdateID: 2, Message: &telego.Message{
+		MessageID: 2,
+		From:      &telego.User{ID: tgbotTestAdminID},
+		Chat:      telego.Chat{ID: tgbotTestChatID},
+		Text:      closeText,
+	}}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if api.sendCount() >= 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("handler loop died after the panicking update: no answer to the second update")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// H-2 (end to end): the admin get_usage callback with Xray never started
+// must be answered, not crash the panel. It runs through the real
+// dispatch path: newBotHandler -> AnyCallbackQueryWithMessage -> worker
+// goroutine -> answerCallback -> getServerUsage -> prepareServerUsageInfo.
+// On the old code the goroutine panics on the nil process pointer and
+// the test binary crashes; with the guards removed but the recover kept
+// the process would survive yet never answer, so the send assertion
+// pins the guards, not just the recover.
+func TestTgbotGetUsageWithNilXrayProcess(t *testing.T) {
+	setupTgbotTestDB(t)
+	api := setupFakeTgbot(t)
+	tb := (&Tgbot{}).NewTgbot()
+	setAdminIds([]int64{tgbotTestAdminID})
+	t.Cleanup(func() { setAdminIds(nil) })
+
+	oldP := p
+	p = nil
+	t.Cleanup(func() { p = oldP })
+	statusCache.mutex.Lock()
+	statusCache.data = nil
+	statusCache.mutex.Unlock()
+	serverStatsCache.mutex.Lock()
+	serverStatsCache.data = ""
+	serverStatsCache.mutex.Unlock()
+
+	// The worker pool is created by Start() in production; tests never
+	// call Start(), so a nil pool would block the dispatch goroutine
+	// forever before answerCallback runs.
+	oldPool := messageWorkerPool
+	messageWorkerPool = make(chan struct{}, 10)
+	t.Cleanup(func() {
+		// Wait for the in-flight dispatch worker to release its slot
+		// before restoring the global pool. The worker holds a token
+		// from the moment it is dispatched until its deferred release
+		// runs, so a non-empty pool means it is still running; restoring
+		// the global while it runs would race with its release. (N-8)
+		deadline := time.Now().Add(5 * time.Second)
+		for len(messageWorkerPool) > 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		messageWorkerPool = oldPool
+	})
+
+	updates := make(chan telego.Update, 4)
+	h, err := tb.newBotHandler(bot, updates)
+	if err != nil {
+		t.Fatalf("newBotHandler: %v", err)
+	}
+	go func() { _ = h.Start() }()
+	t.Cleanup(func() { _ = h.Stop() })
+
+	updates <- telego.Update{UpdateID: 1, CallbackQuery: &telego.CallbackQuery{
+		ID:   "q-usage",
+		From: telego.User{ID: tgbotTestAdminID},
+		Message: &telego.Message{
+			Chat:      telego.Chat{ID: tgbotTestChatID},
+			MessageID: 7,
+		},
+		Data: "get_usage",
+	}}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if api.sendCount() >= 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("get_usage callback with nil Xray process was never answered")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

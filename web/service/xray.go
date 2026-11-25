@@ -35,6 +35,17 @@ func (s *XrayService) IsXrayRunning() bool {
 	return p != nil && p.IsRunning()
 }
 
+// GetOnlineClients returns the emails of clients currently online, or nil
+// when Xray never started (p is nil) — the Telegram bot reads online
+// state through this instead of touching the process pointer directly,
+// so a bot callback can never panic on a nil process (H-2).
+func (s *XrayService) GetOnlineClients() []string {
+	if p == nil {
+		return nil
+	}
+	return p.GetOnlineClients()
+}
+
 // GetXrayErr returns the error from the Xray process, if any.
 func (s *XrayService) GetXrayErr() error {
 	if p == nil {

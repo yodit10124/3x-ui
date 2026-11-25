@@ -573,48 +573,103 @@ func (t *Tgbot) OnReceive() {
 	updates, _ := bot.UpdatesViaLongPolling(ctx, &params)
 	go func() {
 		defer botWG.Done()
-		h, _ := th.NewBotHandler(bot, updates)
+		// N-4: this goroutine is outside the handler middleware's
+		// reach; a panic in NewBotHandler/h.Start() must not kill the
+		// whole panel process.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("TgBot receiver panic recovered: ", r)
+			}
+		}()
+		h, err := t.newBotHandler(bot, updates)
+		if err != nil {
+			logger.Error("TgBot failed to create update handler: ", err)
+			return
+		}
 		tgBotMutex.Lock()
 		botHandler = h
 		tgBotMutex.Unlock()
 
-		h.HandleMessage(func(ctx *th.Context, message telego.Message) error {
-			clearAddClientInputState(message.Chat.ID, message.From.ID)
-			t.SendMsgToTgbot(message.Chat.ID, t.I18nBot("tgbot.keyboardClosed"), tu.ReplyKeyboardRemove())
-			return nil
-		}, th.TextEqual(t.I18nBot("tgbot.buttons.closeKeyboard")))
-
-		h.HandleMessage(func(ctx *th.Context, message telego.Message) error {
-			// Use goroutine with worker pool for concurrent command processing
-			go func() {
-				messageWorkerPool <- struct{}{}        // Acquire worker
-				defer func() { <-messageWorkerPool }() // Release worker
-
-				clearAddClientInputState(message.Chat.ID, message.From.ID)
-				t.answerCommand(&message, message.Chat.ID, checkAdmin(message.From.ID))
-			}()
-			return nil
-		}, th.AnyCommand())
-
-		h.HandleCallbackQuery(func(ctx *th.Context, query telego.CallbackQuery) error {
-			// Use goroutine with worker pool for concurrent callback processing
-			go func() {
-				messageWorkerPool <- struct{}{}        // Acquire worker
-				defer func() { <-messageWorkerPool }() // Release worker
-
-				clearAddClientInputState(query.Message.GetChat().ID, query.From.ID)
-				t.answerCallback(&query, checkAdmin(query.From.ID))
-			}()
-			return nil
-		}, th.AnyCallbackQueryWithMessage())
-
-		h.HandleMessage(func(ctx *th.Context, message telego.Message) error {
-			t.handleAddClientInput(&message)
-			return nil
-		}, th.AnyMessage())
-
 		h.Start()
 	}()
+}
+
+// newBotHandler builds the Telegram update handler with all message and
+// callback routes. It is split out of OnReceive so tests can drive it
+// with a fake bot and a synthetic updates channel.
+func (t *Tgbot) newBotHandler(bot *telego.Bot, updates <-chan telego.Update) (*th.BotHandler, error) {
+	h, err := th.NewBotHandler(bot, updates)
+	if err != nil {
+		return nil, err
+	}
+
+	// Defense in depth (H-2): a panic in any handler must not kill the
+	// whole panel process. The middleware only covers the synchronous
+	// handler itself, so the worker goroutines below carry their own
+	// recover as well. A recovered panic is logged, never swallowed
+	// silently.
+	h.Use(th.PanicRecoveryHandler(func(recovered any) error {
+		logger.Error("TgBot handler panic recovered: ", recovered)
+		return nil
+	}))
+
+	h.HandleMessage(func(ctx *th.Context, message telego.Message) error {
+		clearAddClientInputState(message.Chat.ID, message.From.ID)
+		t.SendMsgToTgbot(message.Chat.ID, t.I18nBot("tgbot.keyboardClosed"), tu.ReplyKeyboardRemove())
+		return nil
+	}, th.TextEqual(t.I18nBot("tgbot.buttons.closeKeyboard")))
+
+	h.HandleMessage(func(ctx *th.Context, message telego.Message) error {
+		// Use goroutine with worker pool for concurrent command processing
+		go func() {
+			// The handler middleware cannot see into this goroutine:
+			// recover here so a panic in answerCommand never kills
+			// the panel process.
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("TgBot command handler panic recovered: ", r)
+				}
+			}()
+			// Capture the pool channel locally: Start() may replace the
+			// global pool on bot reload, and a worker releasing into the
+			// new pool (which it never acquired from) would block
+			// forever on the empty channel and corrupt its count. (N-8)
+			pool := messageWorkerPool
+			pool <- struct{}{}        // Acquire worker
+			defer func() { <-pool }() // Release worker
+
+			clearAddClientInputState(message.Chat.ID, message.From.ID)
+			t.answerCommand(&message, message.Chat.ID, checkAdmin(message.From.ID))
+		}()
+		return nil
+	}, th.AnyCommand())
+
+	h.HandleCallbackQuery(func(ctx *th.Context, query telego.CallbackQuery) error {
+		// Use goroutine with worker pool for concurrent callback processing
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("TgBot callback handler panic recovered: ", r)
+				}
+			}()
+			// Same local capture as the command worker above (N-8):
+			// never release into a pool replaced by a later Start().
+			pool := messageWorkerPool
+			pool <- struct{}{}        // Acquire worker
+			defer func() { <-pool }() // Release worker
+
+			clearAddClientInputState(query.Message.GetChat().ID, query.From.ID)
+			t.answerCallback(&query, checkAdmin(query.From.ID))
+		}()
+		return nil
+	}, th.AnyCallbackQueryWithMessage())
+
+	h.HandleMessage(func(ctx *th.Context, message telego.Message) error {
+		t.handleAddClientInput(&message)
+		return nil
+	}, th.AnyMessage())
+
+	return h, nil
 }
 
 // handleAddClientInput consumes one text message as the next value of an
@@ -2545,7 +2600,7 @@ func (t *Tgbot) prepareServerUsageInfo() string {
 		t.lastStatus = t.serverService.GetStatus(t.lastStatus)
 		t.setCachedStatus(t.lastStatus)
 	}
-	onlines := p.GetOnlineClients()
+	onlines := t.xrayService.GetOnlineClients()
 
 	info += t.I18nBot("tgbot.messages.hostname", "Hostname=="+hostname)
 	info += t.I18nBot("tgbot.messages.version", "Version=="+config.GetVersion())
@@ -2834,8 +2889,8 @@ func (t *Tgbot) clientInfoMsg(
 
 	status := t.I18nBot("tgbot.offline")
 	isOnline := false
-	if p.IsRunning() {
-		if slices.Contains(p.GetOnlineClients(), traffic.Email) {
+	if t.xrayService.IsXrayRunning() {
+		if slices.Contains(t.xrayService.GetOnlineClients(), traffic.Email) {
 			status = t.I18nBot("tgbot.online")
 			isOnline = true
 		}
@@ -3362,11 +3417,11 @@ func int64Contains(slice []int64, item int64) bool {
 
 // onlineClients retrieves and sends information about online clients.
 func (t *Tgbot) onlineClients(chatId int64, messageID ...int) {
-	if !p.IsRunning() {
+	if !t.xrayService.IsXrayRunning() {
 		return
 	}
 
-	onlines := p.GetOnlineClients()
+	onlines := t.xrayService.GetOnlineClients()
 	onlinesCount := len(onlines)
 	output := t.I18nBot("tgbot.messages.onlinesCount", "Count=="+fmt.Sprint(onlinesCount))
 	keyboard := tu.InlineKeyboard(tu.InlineKeyboardRow(
@@ -3584,6 +3639,13 @@ func (t *Tgbot) SendMsgToTgbotDeleteAfter(chatId int64, msg string, delayInSecon
 	// The timer deletes only the message; it deliberately does not
 	// clear the add-client input state (see the function comment).
 	go func() {
+		// N-4: recover so a panic in the delayed delete cannot kill
+		// the panel process.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("TgBot delayed delete panic recovered: ", r)
+			}
+		}()
 		time.Sleep(time.Duration(delayInSeconds) * time.Second) // Wait for the specified delay
 		t.deleteMessageTgBot(chatId, sentMsg.MessageID)         // Delete the message
 	}()

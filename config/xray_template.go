@@ -26,6 +26,10 @@ import (
 //     default template uses tunnel for api). A retargeted api tunnel whose
 //     settings.address is not loopback is also rejected.
 //   - a freedom outbound with a non-empty settings.redirect is rejected.
+//   - a loopback outbound must not target the "api" inbound: it would
+//     re-dispatch unauthenticated proxy traffic straight into the
+//     unauthenticated Xray gRPC API (HandlerService), bypassing the
+//     geoip:private rule and the per-start ephemeral API port.
 //   - metrics.listen must be loopback or empty.
 //   - a non-empty reverse section (bridges/portals) is rejected.
 //   - routing: any rule matching geoip:private (in "ip" or "source") whose
@@ -74,6 +78,7 @@ type xrayTemplateCheck struct {
 		Settings json.RawMessage `json:"settings"`
 	} `json:"inbounds"`
 	Outbounds []struct {
+		Tag      string          `json:"tag"`
 		Protocol string          `json:"protocol"`
 		Settings json.RawMessage `json:"settings"`
 	} `json:"outbounds"`
@@ -185,21 +190,45 @@ func validateXrayConfig(raw string, checkInboundProtocols bool) error {
 
 	// H-7: a freedom outbound with redirect rewrites traffic to a fixed
 	// address. The shipped default has "redirect": "".
+	//
+	// H-1: a loopback outbound re-dispatches traffic into another
+	// inbound by tag. Pointing it at the "api" inbound hands any
+	// unauthenticated proxy user the unauthenticated Xray gRPC API
+	// (HandlerService: AddUser/RemoveUser/AddInbound/...), bypassing
+	// both the geoip:private -> blocked rule and the per-start ephemeral
+	// API port (no TCP port is involved). Reject loopback -> api; a
+	// loopback outbound whose target cannot be verified (unparseable or
+	// missing settings) is rejected too, fail closed.
 	for _, outbound := range cfg.Outbounds {
-		if !strings.EqualFold(outbound.Protocol, "freedom") {
-			continue
-		}
-		if len(outbound.Settings) == 0 {
-			continue
-		}
-		var settings struct {
-			Redirect string `json:"redirect"`
-		}
-		if err := json.Unmarshal(outbound.Settings, &settings); err != nil {
-			return fmt.Errorf("xray freedom outbound has invalid settings: %w", err)
-		}
-		if strings.TrimSpace(settings.Redirect) != "" {
-			return fmt.Errorf("xray freedom outbound must not set redirect (got %q)", settings.Redirect)
+		switch {
+		case strings.EqualFold(outbound.Protocol, "freedom"):
+			if len(outbound.Settings) == 0 {
+				continue
+			}
+			var settings struct {
+				Redirect string `json:"redirect"`
+			}
+			if err := json.Unmarshal(outbound.Settings, &settings); err != nil {
+				return fmt.Errorf("xray freedom outbound has invalid settings: %w", err)
+			}
+			if strings.TrimSpace(settings.Redirect) != "" {
+				return fmt.Errorf("xray freedom outbound must not set redirect (got %q)", settings.Redirect)
+			}
+		case strings.EqualFold(outbound.Protocol, "loopback"):
+			if len(outbound.Settings) == 0 {
+				return fmt.Errorf("xray loopback outbound (tag %q) has no settings; its target inbound cannot be verified", outbound.Tag)
+			}
+			var settings struct {
+				InboundTag string `json:"inboundTag"`
+			}
+			if err := json.Unmarshal(outbound.Settings, &settings); err != nil {
+				return fmt.Errorf("xray loopback outbound (tag %q) has invalid settings: %w", outbound.Tag, err)
+			}
+			if target := strings.TrimSpace(settings.InboundTag); strings.EqualFold(target, "api") {
+				return fmt.Errorf("xray loopback outbound (tag %q) must not target the api inbound", outbound.Tag)
+			} else if target == "" {
+				return fmt.Errorf("xray loopback outbound (tag %q) has no inboundTag; its target inbound cannot be verified", outbound.Tag)
+			}
 		}
 	}
 

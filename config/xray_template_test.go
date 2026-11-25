@@ -74,6 +74,15 @@ func TestValidateXrayTemplateConfig(t *testing.T) {
 		{"freedom no settings", `{"outbounds": [{"tag": "direct", "protocol": "freedom"}]}`, false},
 		{"non-freedom outbound untouched", `{"outbounds": [{"tag": "x", "protocol": "blackhole", "settings": {}}]}`, false},
 
+		// H-1: loopback outbound must not target the api inbound.
+		{"loopback to api", `{"outbounds": [{"tag": "lb", "protocol": "loopback", "settings": {"inboundTag": "api"}}]}`, true},
+		{"loopback to API case-insensitive", `{"outbounds": [{"tag": "lb", "protocol": "loopback", "settings": {"inboundTag": "API"}}]}`, true},
+		{"loopback to api with spaces", `{"outbounds": [{"tag": "lb", "protocol": "loopback", "settings": {"inboundTag": " api "}}]}`, true},
+		{"loopback to other inbound", `{"outbounds": [{"tag": "lb", "protocol": "loopback", "settings": {"inboundTag": "vless-in"}}]}`, false},
+		{"loopback invalid settings", `{"outbounds": [{"tag": "lb", "protocol": "loopback", "settings": "{bad json"}}]}`, true},
+		{"loopback no settings", `{"outbounds": [{"tag": "lb", "protocol": "loopback"}]}`, true},
+		{"loopback no inboundTag", `{"outbounds": [{"tag": "lb", "protocol": "loopback", "settings": {}}]}`, true},
+
 		// H-7: forwarding-class inbounds in the template.
 		{"api tunnel loopback (default)", `{"inbounds": [{"tag": "api", "listen": "127.0.0.1", "port": 62789, "protocol": "tunnel", "settings": {"address": "127.0.0.1"}}]}`, false},
 		{"api tunnel retargeted", `{"inbounds": [{"tag": "api", "listen": "127.0.0.1", "port": 62789, "protocol": "tunnel", "settings": {"address": "192.168.1.1"}}]}`, true},
@@ -113,6 +122,7 @@ func TestValidateXrayRuntimeConfig(t *testing.T) {
 		`{"reverse": {"bridges": [{"tag": "b"}]}}`,
 		`{"routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["geoip:private"]}]}}`,
 		`{"outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"redirect": "127.0.0.1:8080"}}]}`,
+		`{"outbounds": [{"tag": "lb", "protocol": "loopback", "settings": {"inboundTag": "api"}}]}`,
 		`{"log": {"access": "/tmp/evil.log"}}`,
 	} {
 		if err := ValidateXrayRuntimeConfig(cfg); err == nil {
