@@ -246,6 +246,16 @@ func (s *SettingService) getSetting(key string) (*model.Setting, error) {
 }
 
 func (s *SettingService) saveSetting(key string, value string) error {
+	// The external traffic report posts every client's email and
+	// counters to this URL every 10s (M-1): never let an internal,
+	// reserved, or unresolvable target be stored. Empty means disabled.
+	// This covers both the typed setter and /panel/setting/all, which
+	// both go through saveSetting.
+	if key == "externalTrafficInformURI" && value != "" {
+		if _, err := ValidatePublicHTTPURL(value); err != nil {
+			return err
+		}
+	}
 	setting, err := s.getSetting(key)
 	db := database.GetDB()
 	if database.IsNotFound(err) {

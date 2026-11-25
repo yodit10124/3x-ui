@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/mhsanaei/3x-ui/v2/config"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
@@ -277,6 +279,35 @@ func ValidateImportedXrayConfig(dbPath string) error {
 	for _, row := range rows {
 		if err := config.ValidateXrayTemplateConfig(row.Value); err != nil {
 			return err
+		}
+	}
+
+	// Leftover 2: validate the inbounds table's tags. An imported
+	// inbound tagged "api" would collide with the built-in api
+	// inbound the panel injects into the template, and Xray would
+	// fail to start. Compared case-insensitively, matching the H-1
+	// check in the template validator (config/xray_template.go).
+	// (Protocol / listen / port validation of the same rows is L-4
+	// and lands in a later batch.)
+	var inbounds []struct {
+		Tag      string
+		Protocol string
+		Listen   string
+		Port     int
+	}
+	if err := gdb.Raw("SELECT tag, protocol, listen, port FROM inbounds").Scan(&inbounds).Error; err != nil {
+		// No tag column (a very old backup) or no table at all:
+		// retry without the tag. A table without a tag column
+		// cannot hold a tag="api" row, so Tag stays "" and only the
+		// tag check below applies; a missing table errors here too,
+		// which means there is nothing to validate.
+		if err := gdb.Raw("SELECT protocol, listen, port FROM inbounds").Scan(&inbounds).Error; err != nil {
+			return nil
+		}
+	}
+	for _, in := range inbounds {
+		if strings.EqualFold(in.Tag, "api") {
+			return fmt.Errorf("imported inbound uses reserved tag %q", in.Tag)
 		}
 	}
 	return nil

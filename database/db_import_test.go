@@ -324,3 +324,28 @@ func TestImportValidationIsReadOnly(t *testing.T) {
 		}
 	}
 }
+
+// Leftover 2: an imported inbound tagged "api" would collide with the
+// built-in api inbound and break Xray startup. Panel-created inbounds
+// can never carry that tag (server-generated inbound-<port>), so only
+// the import path needs the check.
+func TestValidateImportedXrayConfigRejectsApiTag(t *testing.T) {
+	logDir := t.TempDir()
+	t.Setenv("XUI_LOG_FOLDER", logDir)
+	benign := `{"log": {"access": "none", "error": "", "loglevel": "warning"}}`
+	ddl := `CREATE TABLE inbounds (tag TEXT, protocol TEXT, listen TEXT, port INTEGER)`
+	insert := func(tag string) string {
+		return `INSERT INTO inbounds (tag, protocol, listen, port) VALUES ('` + tag + `', 'vmess', '0.0.0.0', 10000)`
+	}
+
+	ok := makeImportDBWithExtra(t, benign, ddl, insert("inbound-10000"))
+	if err := ValidateImportedXrayConfig(ok); err != nil {
+		t.Errorf("imported inbound with a normal tag should pass, got %v", err)
+	}
+	for _, tag := range []string{"api", "API", "Api"} {
+		bad := makeImportDBWithExtra(t, benign, ddl, insert(tag))
+		if err := ValidateImportedXrayConfig(bad); err == nil {
+			t.Errorf("imported inbound with tag %q should fail", tag)
+		}
+	}
+}

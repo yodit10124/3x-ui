@@ -306,6 +306,11 @@ func isValidFilename(filename string) bool {
 // original database back, and start it even when it was stopped
 // before the import.
 func (a *ServerController) importDB(c *gin.Context) {
+	// M-3: cap the upload before parsing the multipart form, so a
+	// multi-gigabyte "database" cannot fill the disk before any
+	// validation runs. ImportDB enforces the same limit again while
+	// copying to the temp file.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, service.ImportDBMaxSize)
 	// Get the file from the request body
 	file, _, err := c.Request.FormFile("db")
 	if err != nil {

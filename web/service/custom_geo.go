@@ -306,6 +306,30 @@ func ssrfSafeTransport() http.RoundTripper {
 	return cloned
 }
 
+// ValidatePublicHTTPURL parses rawURL and rejects anything that is not a
+// public http(s) URL: bad scheme, missing host, or a host resolving to a
+// blocked (internal/reserved) address. It returns the reconstructed,
+// normalized URL. Empty input is rejected here; callers that treat an
+// empty value as "disabled" must check for it first.
+func ValidatePublicHTTPURL(rawURL string) (string, error) {
+	return (&CustomGeoService{}).sanitizeURL(rawURL)
+}
+
+// NewSSRFCheckedHTTPClient returns an HTTP client that only ever dials
+// public addresses (the SSRF-safe transport re-validates every address
+// at dial time, so a DNS answer that changes between check and connect
+// cannot redirect the request inward), refuses redirects, and bounds
+// the whole request by timeout.
+func NewSSRFCheckedHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Transport: ssrfSafeTransport(),
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
 func probeCustomGeoURLWithGET(rawURL string) error {
 	sanitizedURL, err := (&CustomGeoService{}).sanitizeURL(rawURL)
 	if err != nil {

@@ -3,11 +3,16 @@ package service
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // TestDownloadGeofile: a failed download must never damage the old
@@ -124,6 +129,62 @@ func TestDownloadGeofile(t *testing.T) {
 		}
 		if leftovers, _ := filepath.Glob(dest + ".bak-*"); len(leftovers) != 0 {
 			t.Fatalf("backup left behind on 304: %v", leftovers)
+		}
+	})
+
+	// M-5: an oversized file is refused and the old file is left
+	// intact, with no temporary or backup file left behind.
+	t.Run("oversized body refused", func(t *testing.T) {
+		orig := geofileDownloadMaxBytes
+		geofileDownloadMaxBytes = 1024
+		t.Cleanup(func() { geofileDownloadMaxBytes = orig })
+		ts := serve(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(bytes.Repeat([]byte("x"), 2048))
+		})
+		defer ts.Close()
+		dest := filepath.Join(t.TempDir(), "geoip.dat")
+		if err := os.WriteFile(dest, oldContent, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := downloadGeofile(ts.URL, dest); err == nil {
+			t.Fatal("oversized body should return an error")
+		} else if !strings.Contains(err.Error(), "too large") {
+			t.Fatalf("error %v, want a size-limit error", err)
+		}
+		if got, err := os.ReadFile(dest); err != nil || !bytes.Equal(got, oldContent) {
+			t.Fatalf("old file lost or changed on oversized download: %q, %v", got, err)
+		}
+		if leftovers, _ := filepath.Glob(dest + ".tmp-*"); len(leftovers) != 0 {
+			t.Fatalf("temporary file left behind on oversized download: %v", leftovers)
+		}
+	})
+
+	// M-5: a stalled server must fail with the download timeout
+	// instead of hanging the update forever.
+	t.Run("stalled server times out", func(t *testing.T) {
+		orig := geofileDownloadTimeout
+		geofileDownloadTimeout = 100 * time.Millisecond
+		t.Cleanup(func() { geofileDownloadTimeout = orig })
+		ts := serve(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(2 * time.Second)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(newContent)
+		})
+		defer ts.Close()
+		dest := filepath.Join(t.TempDir(), "geoip.dat")
+		if err := os.WriteFile(dest, oldContent, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		if _, _, err := downloadGeofile(ts.URL, dest); err == nil {
+			t.Fatal("stalled download should return an error")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("download took %v, want it bounded by the timeout", elapsed)
+		}
+		if got, err := os.ReadFile(dest); err != nil || !bytes.Equal(got, oldContent) {
+			t.Fatalf("old file lost or changed on stalled download: %q, %v", got, err)
 		}
 	})
 }
@@ -333,6 +394,102 @@ func TestStageRollbackCommitBinary(t *testing.T) {
 		}
 		if _, err := os.Stat(target); !os.IsNotExist(err) {
 			t.Fatal("new binary still present after rollback without a backup")
+		}
+	})
+}
+
+// TestDownloadXRayFromURL (M-4): the Xray release download must be
+// bounded (timeout, size cap, GitHub-only redirects) and the zip must
+// be refused when its .dgst hash file is missing or mismatching.
+func TestDownloadXRayFromURL(t *testing.T) {
+	zipBytes := []byte("fake-xray-zip-content")
+	zipHash := sha256.Sum256(zipBytes)
+	dgst := fmt.Sprintf("SHA256(Xray-test.zip) = %s\n", hex.EncodeToString(zipHash[:]))
+
+	serve := func(t *testing.T, zipBody []byte, dgstBody string, dgstStatus int, redirectTo string) *httptest.Server {
+		t.Helper()
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if redirectTo != "" {
+				http.Redirect(w, r, redirectTo, http.StatusFound)
+				return
+			}
+			switch {
+			case strings.HasSuffix(r.URL.Path, ".dgst"):
+				w.WriteHeader(dgstStatus)
+				_, _ = w.Write([]byte(dgstBody))
+			default:
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(zipBody)
+			}
+		}))
+	}
+
+	t.Run("success with matching dgst", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		ts := serve(t, zipBytes, dgst, http.StatusOK, "")
+		defer ts.Close()
+		got, err := downloadXRayFromURL(ts.URL+"/Xray-test.zip", "Xray-test.zip")
+		if err != nil {
+			t.Fatalf("downloadXRayFromURL: %v", err)
+		}
+		if got != "Xray-test.zip" {
+			t.Fatalf("got file %q", got)
+		}
+		if content, err := os.ReadFile("Xray-test.zip"); err != nil {
+			t.Fatal(err)
+		} else if !bytes.Equal(content, zipBytes) {
+			t.Fatal("downloaded zip content differs")
+		}
+	})
+
+	t.Run("missing dgst refused", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		ts := serve(t, zipBytes, "", http.StatusNotFound, "")
+		defer ts.Close()
+		if _, err := downloadXRayFromURL(ts.URL+"/Xray-test.zip", "Xray-test.zip"); err == nil {
+			t.Fatal("download accepted without a .dgst file")
+		} else if !strings.Contains(err.Error(), ".dgst") {
+			t.Fatalf("error %v, want a .dgst error", err)
+		}
+		if _, err := os.Stat("Xray-test.zip"); !os.IsNotExist(err) {
+			t.Fatal("unverified zip was left on disk")
+		}
+	})
+
+	t.Run("mismatching hash refused", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		badDgst := fmt.Sprintf("SHA256(Xray-test.zip) = %s\n", strings.Repeat("0", 64))
+		ts := serve(t, zipBytes, badDgst, http.StatusOK, "")
+		defer ts.Close()
+		if _, err := downloadXRayFromURL(ts.URL+"/Xray-test.zip", "Xray-test.zip"); err == nil {
+			t.Fatal("download accepted with a mismatching hash")
+		} else if !strings.Contains(err.Error(), "mismatch") {
+			t.Fatalf("error %v, want a mismatch error", err)
+		}
+	})
+
+	t.Run("oversized zip refused", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		orig := xrayZipMaxBytes
+		xrayZipMaxBytes = 1024
+		t.Cleanup(func() { xrayZipMaxBytes = orig })
+		ts := serve(t, bytes.Repeat([]byte("x"), 2048), dgst, http.StatusOK, "")
+		defer ts.Close()
+		if _, err := downloadXRayFromURL(ts.URL+"/Xray-test.zip", "Xray-test.zip"); err == nil {
+			t.Fatal("download accepted an oversized zip")
+		} else if !strings.Contains(err.Error(), "exceeds the maximum") {
+			t.Fatalf("error %v, want a size-limit error", err)
+		}
+	})
+
+	t.Run("redirect to disallowed host refused", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		ts := serve(t, zipBytes, dgst, http.StatusOK, "http://example.com/Xray-test.zip")
+		defer ts.Close()
+		if _, err := downloadXRayFromURL(ts.URL+"/Xray-test.zip", "Xray-test.zip"); err == nil {
+			t.Fatal("download followed a redirect to a disallowed host")
+		} else if !strings.Contains(err.Error(), "disallowed host") {
+			t.Fatalf("error %v, want a disallowed-host error", err)
 		}
 	})
 }

@@ -670,13 +670,50 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 
 	fileName := fmt.Sprintf("Xray-%s-%s.zip", osName, arch)
 	url := fmt.Sprintf("https://github.com/XTLS/Xray-core/releases/download/%s/%s", version, fileName)
-	resp, err := http.Get(url)
+	return downloadXRayFromURL(url, fileName)
+}
+
+// xrayDownloadTimeout bounds a whole Xray release download (M-4). The
+// zip is ~20-30 MiB; five minutes is ample on a slow link while a
+// stalled connection can no longer hang the update (and, through
+// updateMu, geo updates and imports) forever. It is a var so tests
+// can shorten it.
+var xrayDownloadTimeout = 5 * time.Minute
+
+// xrayZipMaxBytes caps a downloaded Xray release zip (M-4). It is a var
+// so tests can lower it.
+var xrayZipMaxBytes int64 = 500 << 20
+
+// xrayDownloadClient builds the HTTP client for Xray release downloads
+// (M-4): a total timeout, at most 10 redirects, and redirects only to
+// GitHub hosts — a compromised or misbehaving mirror must not pull the
+// update from an arbitrary host.
+func xrayDownloadClient() *http.Client {
+	return &http.Client{
+		Timeout: xrayDownloadTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("too many redirects downloading xray")
+			}
+			switch req.URL.Hostname() {
+			case "github.com", "objects.githubusercontent.com":
+				return nil
+			default:
+				return fmt.Errorf("xray download redirected to disallowed host %q", req.URL.Hostname())
+			}
+		},
+	}
+}
+
+func downloadXRayFromURL(url, fileName string) (string, error) {
+	client := xrayDownloadClient()
+	resp, err := client.Get(url)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to download xray %s: %s", version, resp.Status)
+		return "", fmt.Errorf("failed to download xray: %s", resp.Status)
 	}
 
 	os.Remove(fileName)
@@ -686,18 +723,25 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 	}
 	defer file.Close()
 
-	_, err = io.Copy(file, resp.Body)
+	// M-4: cap the download; a response larger than the cap is refused
+	// instead of being written to disk unbounded. Copying one byte past
+	// the limit makes the overflow detectable.
+	written, err := io.Copy(file, io.LimitReader(resp.Body, xrayZipMaxBytes+1))
 	if err != nil {
 		return "", err
 	}
+	if written > xrayZipMaxBytes {
+		file.Close()
+		os.Remove(fileName)
+		return "", fmt.Errorf("xray zip exceeds the maximum allowed size of %d bytes", xrayZipMaxBytes)
+	}
 	file.Close()
 
-	// M4 (best effort): Xray-core publishes a .dgst file with the release
-	// hashes. If it is available, verify the SHA256 of the downloaded zip
-	// and refuse a mismatching file. If no .dgst is published for this
-	// release, log a warning and continue (there is no stable .sha256 file
-	// to enforce against).
-	if err := verifyXrayZipSHA256(url, fileName); err != nil {
+	// M-4: a .dgst file is published with every Xray-core release. If
+	// it cannot be fetched or carries no entry for this zip, the zip is
+	// refused instead of being used unverified (previously this only
+	// logged a warning and continued).
+	if err := verifyXrayZipSHA256(client, url, fileName); err != nil {
 		os.Remove(fileName)
 		return "", err
 	}
@@ -707,30 +751,27 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 
 // verifyXrayZipSHA256 fetches url+".dgst" (the hash file published with an
 // Xray-core release) and compares the SHA256 entry for the zip file with the
-// hash of the downloaded file. A missing .dgst or a missing entry is only a
-// warning; a present-but-mismatching hash is an error.
-func verifyXrayZipSHA256(url, zipPath string) error {
-	resp, err := http.Get(url + ".dgst")
+// hash of the downloaded file. A missing .dgst, a missing entry, or a
+// mismatching hash is an error: an unverified zip is refused.
+func verifyXrayZipSHA256(client *http.Client, url, zipPath string) error {
+	resp, err := client.Get(url + ".dgst")
 	if err != nil {
-		logger.Warning("failed to fetch xray .dgst, skipping sha256 verification:", err)
-		return nil
+		return fmt.Errorf("failed to fetch xray .dgst: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		logger.Warning("xray .dgst not available, skipping sha256 verification")
-		return nil
+		return fmt.Errorf("xray .dgst not available: %s", resp.Status)
 	}
-	dgstBody, err := io.ReadAll(resp.Body)
+	// The .dgst is a small text file; cap the read.
+	dgstBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		logger.Warning("failed to read xray .dgst:", err)
-		return nil
+		return fmt.Errorf("failed to read xray .dgst: %w", err)
 	}
 	base := filepath.Base(zipPath)
 	re := regexp.MustCompile(`(?i)SHA256\s*\(` + regexp.QuoteMeta(base) + `\)\s*=\s*([0-9a-fA-F]{64})`)
 	matches := re.FindSubmatch(dgstBody)
 	if len(matches) < 2 {
-		logger.Warning("no SHA256 entry for", base, "in xray .dgst, skipping verification")
-		return nil
+		return fmt.Errorf("no SHA256 entry for %s in xray .dgst, refusing unverified zip", base)
 	}
 	f, err := os.Open(zipPath)
 	if err != nil {
@@ -1174,6 +1215,13 @@ var updateMu sync.Mutex
 // leave the panel on a half-swapped database.
 var importMu sync.Mutex
 
+// ImportDBMaxSize caps an imported database file (M-3). A real x-ui.db
+// is a few megabytes; 512 MiB leaves ample room while a multi-gigabyte
+// upload can no longer fill the disk before any validation runs. It is
+// a var so tests can lower it, and the controller enforces the same
+// limit with MaxBytesReader before parsing the multipart form.
+var ImportDBMaxSize int64 = 512 << 20
+
 func (s *ServerService) ImportDB(file multipart.File) error {
 	// Imports are serialised: two concurrent imports would
 	// interleave the file swap (live db -> fallback, temp -> live)
@@ -1230,9 +1278,15 @@ func (s *ServerService) ImportDB(file multipart.File) error {
 		}
 	}()
 
-	// Save uploaded file to temporary file
-	if _, err = io.Copy(tempFile, file); err != nil {
+	// Save uploaded file to temporary file, capped (M-3): the limit is
+	// enforced before any validation reads the file. Copying one byte
+	// past the limit makes the overflow detectable.
+	written, err := io.Copy(tempFile, io.LimitReader(file, ImportDBMaxSize+1))
+	if err != nil {
 		return common.NewErrorf("Error saving db: %v", err)
+	}
+	if written > ImportDBMaxSize {
+		return common.NewErrorf("Database file exceeds the maximum allowed size of %d bytes", ImportDBMaxSize)
 	}
 
 	// Close temp file before opening via sqlite
@@ -1455,6 +1509,16 @@ func (s *ServerService) IsValidGeofileName(filename string) bool {
 	return matched
 }
 
+// geofileDownloadTimeout bounds a built-in Geo file download (M-5);
+// the same 10-minute bound CustomGeo uses. It is a var so tests
+// can shorten it.
+var geofileDownloadTimeout = 10 * time.Minute
+
+// geofileDownloadMaxBytes caps a built-in Geo file download (M-5),
+// reusing CustomGeo's 100 MiB default; real .dat files are a few MiB.
+// It is a var so tests can lower it.
+var geofileDownloadMaxBytes int64 = defaultGeoMaxFileSizeMB * 1024 * 1024
+
 // downloadGeofile downloads one geofile to destPath. The download
 // goes to a temporary file in the same directory and is renamed into
 // place only after the full body is received: a 404, a network
@@ -1476,7 +1540,7 @@ func downloadGeofile(url, destPath string) (replaced bool, backupPath string, er
 		}
 	}
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: geofileDownloadTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return false, "", common.NewErrorf("Failed to download Geofile from %s: %v", url, err)
@@ -1514,6 +1578,13 @@ func downloadGeofile(url, destPath string) (replaced bool, backupPath string, er
 		return false, "", common.NewErrorf("Failed to download Geofile from %s: received status code %d", url, resp.StatusCode)
 	}
 
+	// M-5: refuse an oversized file before downloading it; the
+	// LimitReader below is the hard limit for chunked responses
+	// that carry no Content-Length.
+	if resp.ContentLength > geofileDownloadMaxBytes {
+		return false, "", common.NewErrorf("Failed to download Geofile from %s: file too large: Content-Length %d exceeds limit %d", url, resp.ContentLength, geofileDownloadMaxBytes)
+	}
+
 	// The temporary file name is unique per download so a
 	// concurrent update cannot overwrite another one's download.
 	tmpPath := destPath + ".tmp-" + random.Seq(8)
@@ -1521,7 +1592,10 @@ func downloadGeofile(url, destPath string) (replaced bool, backupPath string, er
 	if err != nil {
 		return false, "", common.NewErrorf("Failed to create Geofile %s: %v", destPath, err)
 	}
-	_, err = io.Copy(file, resp.Body)
+	// M-5: cap the body; a response larger than the cap is refused
+	// instead of being written to disk unbounded. Copying one byte
+	// past the limit makes the overflow detectable.
+	written, err := io.Copy(file, io.LimitReader(resp.Body, geofileDownloadMaxBytes+1))
 	closeErr := file.Close()
 	if err != nil {
 		_ = os.Remove(tmpPath)
@@ -1530,6 +1604,10 @@ func downloadGeofile(url, destPath string) (replaced bool, backupPath string, er
 	if closeErr != nil {
 		_ = os.Remove(tmpPath)
 		return false, "", common.NewErrorf("Failed to save Geofile %s: %v", destPath, closeErr)
+	}
+	if written > geofileDownloadMaxBytes {
+		_ = os.Remove(tmpPath)
+		return false, "", common.NewErrorf("Failed to save Geofile %s: file too large: exceeds limit %d bytes", destPath, geofileDownloadMaxBytes)
 	}
 	// Back up the old file before the rename so the caller can roll
 	// the replacement back when the update fails later (another file

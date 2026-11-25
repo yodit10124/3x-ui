@@ -116,16 +116,9 @@ func (s *UserService) UpdateUser(id int, username string, password string) (stri
 		return "", err
 	}
 
-	twoFactorEnable, err := s.settingService.GetTwoFactorEnable()
-	if err != nil {
-		return "", err
-	}
-
-	if twoFactorEnable {
-		s.settingService.SetTwoFactorEnable(false)
-		s.settingService.SetTwoFactorToken("")
-	}
-
+	// M-2: changing the password must NOT silently disable two-factor
+	// authentication. 2FA stays exactly as it was; disabling it is a
+	// separate, explicit action (CLI reset path in main.go).
 	if err := db.Model(model.User{}).
 		Where("id = ?", id).
 		Updates(map[string]any{"username": username, "password": hashedPassword}).

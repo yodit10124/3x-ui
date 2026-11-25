@@ -64,3 +64,48 @@ func TestUpdateFirstUserRevokesSessions(t *testing.T) {
 		t.Fatal("password was not changed to the new one")
 	}
 }
+
+// TestUpdateUserKeepsTwoFactorEnabled (M-2): a web password change must
+// not silently disable two-factor authentication or clear its token.
+func TestUpdateUserKeepsTwoFactorEnabled(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "x-ui.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("InitDB: %v", err)
+	}
+	t.Cleanup(func() { database.CloseDB() })
+
+	us := &UserService{}
+	if err := us.UpdateFirstUser("admin", "admin"); err != nil {
+		t.Fatalf("create first user: %v", err)
+	}
+	user, err := us.GetFirstUser()
+	if err != nil {
+		t.Fatalf("read first user: %v", err)
+	}
+
+	ss := &SettingService{}
+	if err := ss.SetTwoFactorEnable(true); err != nil {
+		t.Fatalf("enable 2FA: %v", err)
+	}
+	if err := ss.SetTwoFactorToken("test-2fa-token"); err != nil {
+		t.Fatalf("set 2FA token: %v", err)
+	}
+
+	if _, err := us.UpdateUser(user.Id, "admin", "newpassword"); err != nil {
+		t.Fatalf("UpdateUser: %v", err)
+	}
+	enabled, err := ss.GetTwoFactorEnable()
+	if err != nil {
+		t.Fatalf("read 2FA enable: %v", err)
+	}
+	if !enabled {
+		t.Fatal("2FA was disabled by a password change, want it kept enabled")
+	}
+	token, err := ss.GetTwoFactorToken()
+	if err != nil {
+		t.Fatalf("read 2FA token: %v", err)
+	}
+	if token != "test-2fa-token" {
+		t.Fatalf("2FA token %q after password change, want %q", token, "test-2fa-token")
+	}
+}

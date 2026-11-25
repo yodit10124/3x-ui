@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -564,5 +565,37 @@ func TestImportDBConcurrentImports(t *testing.T) {
 	}
 	if admin.Username != "import-a" && admin.Username != "import-b" {
 		t.Fatalf("live db holds unexpected username %q after concurrent imports", admin.Username)
+	}
+}
+
+// TestImportDBRejectsOversizedFile (M-3): an upload larger than
+// ImportDBMaxSize must be rejected instead of being written to disk
+// unbounded before any validation runs.
+func TestImportDBRejectsOversizedFile(t *testing.T) {
+	setupImportTestEnv(t, false)
+
+	orig := ImportDBMaxSize
+	ImportDBMaxSize = 1024
+	t.Cleanup(func() { ImportDBMaxSize = orig })
+
+	// Valid SQLite header but over the lowered cap: it must fail on
+	// size, not sail past the format check into validation.
+	path := filepath.Join(t.TempDir(), "big.db")
+	content := make([]byte, 2048)
+	copy(content, "SQLite format 3\x00")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	err = (&ServerService{}).ImportDB(f)
+	if err == nil {
+		t.Fatal("ImportDB accepted a file over the size limit")
+	}
+	if !strings.Contains(err.Error(), "exceeds the maximum") {
+		t.Fatalf("ImportDB error %v, want a size-limit error", err)
 	}
 }
