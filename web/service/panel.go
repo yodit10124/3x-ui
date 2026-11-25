@@ -66,10 +66,12 @@ func (s *PanelService) GetUpdateInfo() (*PanelUpdateInfo, error) {
 // H-6: the updater script is never executed straight from the network. It is
 // downloaded with the Go HTTP client, SHA256-verified against the
 // operator-supplied XUI_UPDATE_SHA256, and only then executed from a local
-// temp file. There is no official checksum file for update.sh (it is a
-// rolling script fetched from the main branch, not a release asset), so the
-// expected hash must come from the operator; when it is missing or does not
-// match, the update is refused instead of warning and continuing.
+// temp file. update.sh is fetched from the installed release tag (an
+// immutable ref, never the rolling main branch) and there is no official
+// checksum file for it, so the expected hash must come from the operator
+// (pinned by install.sh at install time and re-pinned by update.sh after
+// every successful update); when it is missing or does not match, the
+// update is refused instead of warning and continuing.
 func (s *PanelService) StartUpdate() error {
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("panel web update is supported only on Linux installations")
@@ -142,8 +144,31 @@ func (s *PanelService) StartUpdate() error {
 	return nil
 }
 
-// updateScriptURL is the only source of the updater script.
-const updateScriptURL = "https://raw.githubusercontent.com/yodit10124/3x-ui/main/update.sh"
+// updateScriptBase is the raw.githubusercontent.com prefix for the updater
+// script. update.sh is fetched from the installed release tag (an immutable
+// ref), never from the rolling main branch, so the SHA256 pinned at install
+// time stays valid until the panel is updated to a newer release.
+const updateScriptBase = "https://raw.githubusercontent.com/yodit10124/3x-ui"
+
+// updateScriptURLForVersion returns the URL of update.sh at the given
+// installed version's release tag ("v" + version). The version must be
+// non-empty and contain only [0-9A-Za-z._-]; anything else (a path
+// separator, "..", whitespace, a URL scheme) is rejected so no crafted
+// version string can produce an arbitrary download URL. A leading "v" in
+// the version is normalized, not doubled.
+func updateScriptURLForVersion(version string) (string, error) {
+	version = strings.TrimSpace(version)
+	version = strings.TrimPrefix(version, "v")
+	if version == "" {
+		return "", fmt.Errorf("panel update refused: installed version is empty, cannot resolve the updater URL")
+	}
+	for _, c := range version {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '.' || c == '_' || c == '-') {
+			return "", fmt.Errorf("panel update refused: installed version %q contains an invalid character, cannot resolve the updater URL", version)
+		}
+	}
+	return updateScriptBase + "/v" + version + "/update.sh", nil
+}
 
 // updateScriptMaxBytes caps the downloaded updater script. update.sh is a
 // small shell script; anything larger is rejected instead of written to disk.
@@ -159,9 +184,15 @@ const updateDownloadTimeout = 30 * time.Second
 // it once the updater has run; on any error the file is removed here and no
 // path is returned, so unverified content is never executed.
 func downloadVerifiedUpdateScript() (string, error) {
+	// Resolve the updater URL from the installed release tag first; a
+	// bad version refuses the update before anything is downloaded.
+	updateScriptURL, err := updateScriptURLForVersion(config.GetVersion())
+	if err != nil {
+		return "", err
+	}
 	expectedHex := strings.TrimSpace(os.Getenv("XUI_UPDATE_SHA256"))
 	if expectedHex == "" {
-		return "", fmt.Errorf("panel update refused: XUI_UPDATE_SHA256 is not set; set it to the SHA256 of %s before updating (compute it with: curl -fsSL %s | sha256sum)", updateScriptURL, updateScriptURL)
+		return "", fmt.Errorf("panel update refused: XUI_UPDATE_SHA256 is not set; set it to the SHA256 of update.sh at the installed release tag (%s) before updating (compute it with: curl -fsSL %s | sha256sum)", updateScriptURL, updateScriptURL)
 	}
 	expected, err := hex.DecodeString(expectedHex)
 	if err != nil || len(expected) != sha256.Size {
@@ -192,7 +223,7 @@ func downloadVerifiedUpdateScript() (string, error) {
 
 	sum := sha256.Sum256(body)
 	if subtle.ConstantTimeCompare(sum[:], expected) != 1 {
-		return "", fmt.Errorf("panel update refused: SHA256 mismatch for the downloaded updater script")
+		return "", fmt.Errorf("panel update refused: SHA256 mismatch for the downloaded updater script; the pinned hash does not match update.sh at the installed release tag (%s), re-run install.sh or recompute the hash for the installed version", updateScriptURL)
 	}
 
 	// os.CreateTemp creates the file with 0600 and a random, unpredictable

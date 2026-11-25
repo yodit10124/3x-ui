@@ -992,6 +992,50 @@ config_after_update() {
     fi
 }
 
+# Re-pin the SHA256 of update.sh for the newly installed release tag so the
+# next panel web update verifies against this version's update.sh. The tag
+# is immutable, so the pinned hash never goes stale. Runs only on the
+# success path (called after config_after_update in update_x-ui); a failure
+# only warns -- the update itself already succeeded, and the next panel
+# update will be refused with a SHA256 mismatch telling the operator to
+# re-run install.sh. No-op on Alpine (no systemd drop-in).
+config_update_sha256() {
+    if [[ "${release}" == "alpine" ]]; then
+        return 0
+    fi
+    if [[ -z "${tag_version}" ]] || [[ ! "${tag_version}" =~ ^v[0-9A-Za-z._-]+$ ]]; then
+        echo -e "${yellow}Warning: no valid release tag known, skipping update.sh SHA256 re-pin; panel web update will stay unavailable until XUI_UPDATE_SHA256 is set manually.${plain}"
+        return 0
+    fi
+    local update_url="https://raw.githubusercontent.com/yodit10124/3x-ui/${tag_version}/update.sh"
+    local dropin_dir="${xui_service}/x-ui.service.d"
+    local dropin_file="${dropin_dir}/update-sha256.conf"
+    local tmp_script update_sha256
+
+    tmp_script=$(mktemp) || {
+        echo -e "${yellow}Warning: could not create a temp file to re-pin update.sh SHA256; panel web update will stay unavailable until XUI_UPDATE_SHA256 is set manually.${plain}"
+        return 0
+    }
+    if ! ${curl_bin:-curl} -fsSL --max-time 30 "${update_url}" -o "${tmp_script}"; then
+        echo -e "${yellow}Warning: could not download update.sh to re-pin its SHA256; panel web update will stay unavailable until XUI_UPDATE_SHA256 is set manually.${plain}"
+        rm -f "${tmp_script}"
+        return 0
+    fi
+    update_sha256=$(sha256sum "${tmp_script}" | awk '{print $1}')
+    rm -f "${tmp_script}"
+    if [[ ! "${update_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo -e "${yellow}Warning: could not compute a valid SHA256 for update.sh; panel web update will stay unavailable until XUI_UPDATE_SHA256 is set manually.${plain}"
+        return 0
+    fi
+    mkdir -p "${dropin_dir}"
+    printf '[Service]\nEnvironment=XUI_UPDATE_SHA256=%s\n' "${update_sha256}" > "${dropin_file}"
+    if ! systemctl daemon-reload > /dev/null 2>&1; then
+        echo -e "${yellow}Warning: re-pinned update.sh SHA256 but systemctl daemon-reload failed; the new pin takes effect after the next daemon-reload.${plain}"
+        return 0
+    fi
+    echo -e "${green}Re-pinned update.sh SHA256 for panel web update (${tag_version}): ${update_sha256}${plain}"
+}
+
 update_x-ui() {
     cd ${xui_folder%/x-ui}/
 
@@ -1183,6 +1227,10 @@ update_x-ui() {
     fi
 
     config_after_update
+
+    # Re-pin update.sh SHA256 for the newly installed release tag so the
+    # next panel web update verifies against this version's updater.
+    config_update_sha256
 
     echo -e "${green}x-ui ${tag_version}${plain} updating finished, it is running now..."
     echo -e ""

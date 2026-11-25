@@ -1011,6 +1011,46 @@ config_after_install() {
     ${xui_folder}/x-ui migrate
 }
 
+# Pin the SHA256 of update.sh so the panel can be updated from the web UI
+# without manually setting XUI_UPDATE_SHA256. The hash is pinned for the
+# update.sh at the installed release tag (tag_version, e.g. v2.9.4-c6): a
+# tag is immutable, so the pinned hash never goes stale. The panel
+# downloads the updater from the same tag URL and verifies it against
+# this value, so the drop-in must be written before the service is
+# (re)started. After every successful panel update, update.sh re-pins the
+# hash for the newly installed tag. A failed download only warns; the
+# install still succeeds and the panel update stays unavailable until the
+# variable is set.
+config_update_sha256() {
+    if [[ -z "${tag_version}" ]] || [[ ! "${tag_version}" =~ ^v[0-9A-Za-z._-]+$ ]]; then
+        echo -e "${yellow}Warning: no valid release tag known, skipping update.sh SHA256 pin; panel web update will stay unavailable until XUI_UPDATE_SHA256 is set manually.${plain}"
+        return 0
+    fi
+    local update_url="https://raw.githubusercontent.com/yodit10124/3x-ui/${tag_version}/update.sh"
+    local dropin_dir="${xui_service}/x-ui.service.d"
+    local dropin_file="${dropin_dir}/update-sha256.conf"
+    local tmp_script update_sha256
+
+    tmp_script=$(mktemp) || {
+        echo -e "${yellow}Warning: could not create a temp file to pin update.sh SHA256; panel web update will stay unavailable until XUI_UPDATE_SHA256 is set manually.${plain}"
+        return 0
+    }
+    if ! curl -fsSL --max-time 30 "${update_url}" -o "${tmp_script}"; then
+        echo -e "${yellow}Warning: could not download update.sh to pin its SHA256; panel web update will stay unavailable until XUI_UPDATE_SHA256 is set manually.${plain}"
+        rm -f "${tmp_script}"
+        return 0
+    fi
+    update_sha256=$(sha256sum "${tmp_script}" | awk '{print $1}')
+    rm -f "${tmp_script}"
+    if [[ ! "${update_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo -e "${yellow}Warning: could not compute a valid SHA256 for update.sh; panel web update will stay unavailable until XUI_UPDATE_SHA256 is set manually.${plain}"
+        return 0
+    fi
+    mkdir -p "${dropin_dir}"
+    printf '[Service]\nEnvironment=XUI_UPDATE_SHA256=%s\n' "${update_sha256}" > "${dropin_file}"
+    echo -e "${green}Pinned update.sh SHA256 for panel web update (${tag_version}): ${update_sha256}${plain}"
+}
+
 install_x-ui() {
     cd ${xui_folder%/x-ui}/
 
@@ -1181,6 +1221,7 @@ install_x-ui() {
             echo -e "${green}Setting up systemd unit...${plain}"
             chown root:root ${xui_service}/x-ui.service > /dev/null 2>&1
             chmod 644 ${xui_service}/x-ui.service > /dev/null 2>&1
+            config_update_sha256
             systemctl daemon-reload
             systemctl enable x-ui
             systemctl start x-ui

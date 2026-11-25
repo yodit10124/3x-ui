@@ -39,3 +39,51 @@ func TestShellQuote(t *testing.T) {
 		t.Fatalf("unexpected quote result with single quote: %s", got)
 	}
 }
+
+// The panel updater is fetched from the installed release tag, never from
+// the rolling main branch, so the SHA256 pinned at install time stays
+// valid. A bad version must refuse the update instead of producing an
+// arbitrary download URL.
+func TestUpdateScriptURLForVersion(t *testing.T) {
+	url, err := updateScriptURLForVersion("2.9.4-c6")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "https://raw.githubusercontent.com/yodit10124/3x-ui/v2.9.4-c6/update.sh"
+	if url != want {
+		t.Fatalf("got %q, want %q", url, want)
+	}
+
+	// A leading "v" is normalized, not doubled.
+	url, err = updateScriptURLForVersion("v2.9.4-c6")
+	if err != nil {
+		t.Fatalf("unexpected error for v-prefixed version: %v", err)
+	}
+	if url != want {
+		t.Fatalf("got %q, want %q", url, want)
+	}
+
+	// Surrounding whitespace is trimmed.
+	url, err = updateScriptURLForVersion("  2.9.4-c6\n")
+	if err != nil {
+		t.Fatalf("unexpected error for padded version: %v", err)
+	}
+	if url != want {
+		t.Fatalf("got %q, want %q", url, want)
+	}
+
+	for _, bad := range []string{
+		"",
+		"   ",
+		"2.9.4/c6",
+		"../etc/passwd",
+		"2.9.4 c6",
+		"https://evil.example/x",
+		"2.9.4-c6\nx",
+		"2.9.4-c6?x=1",
+	} {
+		if _, err := updateScriptURLForVersion(bad); err == nil {
+			t.Fatalf("version %q should have been rejected", bad)
+		}
+	}
+}
