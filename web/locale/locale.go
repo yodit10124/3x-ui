@@ -64,6 +64,13 @@ func createTemplateData(params []string, separator ...string) map[string]any {
 	templateData := make(map[string]any)
 	for _, param := range params {
 		parts := strings.SplitN(param, sep, 2)
+		if len(parts) != 2 {
+			// A parameter without the separator cannot name a
+			// template key; skip it instead of panicking on
+			// parts[1]. (A single-"=" typo in a login-fail
+			// notification used to crash here.)
+			continue
+		}
 		templateData[parts[0]] = parts[1]
 	}
 

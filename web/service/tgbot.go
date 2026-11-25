@@ -180,6 +180,82 @@ func deleteAddClientSession(chatID, userID int64) {
 	delete(addClientSessions, addClientSessionKey{chatID: chatID, userID: userID})
 }
 
+// userShareRequestTTL bounds how long an issued "select a Telegram
+// user" keyboard stays answerable (M-10).
+const userShareRequestTTL = 30 * time.Minute
+
+// pendingUserShare records one outstanding "select a Telegram user"
+// keyboard: which admin, in which chat, may answer it, and for which
+// client (M-10).
+type pendingUserShare struct {
+	chatID    int64
+	userID    int64
+	trafficID int
+	expiresAt time.Time
+}
+
+var (
+	userShareMu       sync.Mutex
+	userShareRequests = map[int32]pendingUserShare{}
+)
+
+// issueUserShareRequest mints a random, unguessable RequestID for a
+// "select TG user" keyboard and records who may answer it (M-10).
+// The RequestID used to be the sequential traffic row id, and the
+// handler only checked that the sender was an admin, so any admin in
+// a group chat could answer another admin's keyboard and bind any
+// Telegram user to any client.
+func issueUserShareRequest(chatID, userID int64, trafficID int) int32 {
+	for {
+		n, err := rand.Int(rand.Reader, big.NewInt(1<<31-1))
+		if err != nil {
+			continue
+		}
+		id := int32(n.Int64()) + 1 // never 0
+		userShareMu.Lock()
+		if _, taken := userShareRequests[id]; !taken {
+			if len(userShareRequests) >= 512 {
+				now := time.Now()
+				for oldID, old := range userShareRequests {
+					if now.After(old.expiresAt) {
+						delete(userShareRequests, oldID)
+					}
+				}
+			}
+			userShareRequests[id] = pendingUserShare{
+				chatID:    chatID,
+				userID:    userID,
+				trafficID: trafficID,
+				expiresAt: time.Now().Add(userShareRequestTTL),
+			}
+			userShareMu.Unlock()
+			return id
+		}
+		userShareMu.Unlock()
+	}
+}
+
+// consumeUserShareRequest validates an echoed UsersShared RequestID:
+// it must have been issued for this chat and this admin, and must
+// not be expired (M-10). A valid entry is consumed (one-shot) and
+// its traffic ID is returned; anything else is refused.
+func consumeUserShareRequest(requestID int32, chatID, userID int64) (int, bool) {
+	userShareMu.Lock()
+	defer userShareMu.Unlock()
+	entry, ok := userShareRequests[requestID]
+	if !ok {
+		return 0, false
+	}
+	delete(userShareRequests, requestID)
+	if time.Now().After(entry.expiresAt) {
+		return 0, false
+	}
+	if entry.chatID != chatID || entry.userID != userID {
+		return 0, false
+	}
+	return entry.trafficID, true
+}
+
 // clearAddClientInputState clears the awaiting-input step of the session
 // for (chatID, userID), keeping the collected client data. It is used when
 // a command, a button press or the close-keyboard action cancels text
@@ -238,16 +314,153 @@ type Tgbot struct {
 	serverService  ServerService
 	xrayService    XrayService
 	lastStatus     *Status
+	// limiter caps how fast one (chat, user) can drive the bot (M-8).
+	// Nil on a zero-value Tgbot falls back to the shared default.
+	limiter *tgbotRateLimiter
 }
 
 // NewTgbot creates a new Tgbot instance.
 func (t *Tgbot) NewTgbot() *Tgbot {
-	return new(Tgbot)
+	return &Tgbot{limiter: newTgbotRateLimiter(tgbotRateLimitBurst, tgbotRateLimitRefill)}
+}
+
+// tgbotRateLimitBurst is how many commands/callbacks one (chat, user)
+// may fire at once; tgbotRateLimitRefill is how fast the bucket
+// refills afterwards (M-8). A human admin never notices the cap; a
+// flooder is held to about one command per second. They are vars so
+// tests can disable the refill.
+var (
+	tgbotRateLimitBurst  = 10
+	tgbotRateLimitRefill = time.Second
+)
+
+// tgbotRateLimiter is a per-(chat, user) token bucket (M-8). Without
+// it, any Telegram user who knows the bot's username can flood it
+// with /usage or client_traffic commands, each triggering DB scans
+// and Telegram sends, and the worker-pool goroutines pile up
+// unbounded behind the semaphore.
+type tgbotRateLimiter struct {
+	mu      sync.Mutex
+	buckets map[tgbotRateLimitKey]*tgbotTokenBucket
+	burst   int
+	refill  time.Duration
+}
+
+type tgbotRateLimitKey struct {
+	chatID int64
+	userID int64
+}
+
+type tgbotTokenBucket struct {
+	tokens   float64
+	lastSeen time.Time
+}
+
+func newTgbotRateLimiter(burst int, refill time.Duration) *tgbotRateLimiter {
+	return &tgbotRateLimiter{
+		buckets: map[tgbotRateLimitKey]*tgbotTokenBucket{},
+		burst:   burst,
+		refill:  refill,
+	}
+}
+
+// Allow consumes one token for (chatID, userID) and reports whether
+// the command may run. Buckets idle for over 10 minutes are dropped
+// when the map grows, so the table cannot grow without bound.
+func (l *tgbotRateLimiter) Allow(chatID, userID int64) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	key := tgbotRateLimitKey{chatID: chatID, userID: userID}
+	b, ok := l.buckets[key]
+	if !ok {
+		if len(l.buckets) >= 512 {
+			for k, old := range l.buckets {
+				if now.Sub(old.lastSeen) > 10*time.Minute {
+					delete(l.buckets, k)
+				}
+			}
+		}
+		b = &tgbotTokenBucket{tokens: float64(l.burst), lastSeen: now}
+		l.buckets[key] = b
+	}
+	b.tokens += now.Sub(b.lastSeen).Seconds() / l.refill.Seconds()
+	if b.tokens > float64(l.burst) {
+		b.tokens = float64(l.burst)
+	}
+	b.lastSeen = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+// defaultTgbotLimiter backs zero-value Tgbot instances, which carry
+// a nil limiter.
+var defaultTgbotLimiter = newTgbotRateLimiter(tgbotRateLimitBurst, tgbotRateLimitRefill)
+
+// tgbotRetryAfterPattern extracts the delay from a Telegram 429
+// error ("Too Many Requests: retry after 35").
+var tgbotRetryAfterPattern = regexp.MustCompile(`(?i)retry after (\d+)`)
+
+// tgbotRetryAfter reports the delay Telegram asks for after a 429
+// (M-8), or false when the error is not a rate limit. A missing
+// number falls back to 2s; a requested delay is capped at 60s so a
+// bogus value cannot stall the sender for long.
+func tgbotRetryAfter(err error) (time.Duration, bool) {
+	lower := strings.ToLower(err.Error())
+	if !strings.Contains(lower, "429") && !strings.Contains(lower, "too many requests") && !strings.Contains(lower, "retry after") {
+		return 0, false
+	}
+	if m := tgbotRetryAfterPattern.FindStringSubmatch(err.Error()); len(m) == 2 {
+		if secs, convErr := strconv.Atoi(m[1]); convErr == nil && secs > 0 {
+			if secs > 60 {
+				secs = 60
+			}
+			return time.Duration(secs) * time.Second, true
+		}
+	}
+	return 2 * time.Second, true
+}
+
+// allowTgbotCommand reports whether one command/callback/message from
+// (chatID, userID) may run now (M-8). Over-limit input is dropped
+// silently: answering it would itself be a Telegram send, which is
+// what the limit exists to prevent.
+func (t *Tgbot) allowTgbotCommand(chatID, userID int64) bool {
+	lim := t.limiter
+	if lim == nil {
+		lim = defaultTgbotLimiter
+	}
+	return lim.Allow(chatID, userID)
 }
 
 // I18nBot retrieves a localized message for the bot interface.
+// All template parameter values are HTML-escaped before
+// substitution (M-6): bot messages are sent with ParseMode HTML, so
+// a user-controlled value such as a client comment, email, or
+// inbound remark could otherwise inject markup (e.g. a phishing
+// link) into a message read by another admin or client. The
+// template text itself keeps its own <b>/<code> formatting; only
+// interpolated values are escaped.
 func (t *Tgbot) I18nBot(name string, params ...string) string {
-	return locale.I18n(locale.Bot, name, params...)
+	return locale.I18n(locale.Bot, name, escapeI18nBotParams(params)...)
+}
+
+// escapeI18nBotParams HTML-escapes the value part of each
+// "Key==value" template parameter, leaving the key untouched.
+// Parameters without the separator pass through unchanged.
+func escapeI18nBotParams(params []string) []string {
+	escaped := make([]string, len(params))
+	for i, param := range params {
+		if key, value, ok := strings.Cut(param, "=="); ok {
+			escaped[i] = key + "==" + html.EscapeString(value)
+		} else {
+			escaped[i] = param
+		}
+	}
+	return escaped
 }
 
 // GetHashStorage returns the hash storage instance for callback queries.
@@ -620,6 +833,12 @@ func (t *Tgbot) newBotHandler(bot *telego.Bot, updates <-chan telego.Update) (*t
 	}, th.TextEqual(t.I18nBot("tgbot.buttons.closeKeyboard")))
 
 	h.HandleMessage(func(ctx *th.Context, message telego.Message) error {
+		// M-8: drop over-limit commands before spawning a worker
+		// goroutine for them; otherwise a flooder piles up
+		// unbounded goroutines behind the worker pool.
+		if !t.allowTgbotCommand(message.Chat.ID, message.From.ID) {
+			return nil
+		}
 		// Use goroutine with worker pool for concurrent command processing
 		go func() {
 			// The handler middleware cannot see into this goroutine:
@@ -645,6 +864,10 @@ func (t *Tgbot) newBotHandler(bot *telego.Bot, updates <-chan telego.Update) (*t
 	}, th.AnyCommand())
 
 	h.HandleCallbackQuery(func(ctx *th.Context, query telego.CallbackQuery) error {
+		// M-8: same per-(chat, user) limit as commands.
+		if !t.allowTgbotCommand(query.Message.GetChat().ID, query.From.ID) {
+			return nil
+		}
 		// Use goroutine with worker pool for concurrent callback processing
 		go func() {
 			defer func() {
@@ -685,13 +908,27 @@ func (t *Tgbot) handleAddClientInput(message *telego.Message) {
 	if message.From != nil {
 		userID = message.From.ID
 	}
+	// M-8: plain messages share the per-(chat, user) bucket with
+	// commands and callbacks.
+	if !t.allowTgbotCommand(chatId, userID) {
+		return
+	}
 	sess := getAddClientSession(chatId, userID)
 	if sess == nil || sess.state == "" {
 		if message.UsersShared != nil {
 			if checkAdmin(userID) {
+				// M-10: the echoed RequestID must be one this bot
+				// issued to this admin in this chat, for one client.
+				// An unknown, expired, or another admin's request is
+				// refused instead of binding whatever traffic id it names.
+				trafficID, ok := consumeUserShareRequest(int32(message.UsersShared.RequestID), chatId, userID)
+				if !ok {
+					t.SendMsgToTgbot(chatId, t.I18nBot("tgbot.messages.selectUserFailed"), tu.ReplyKeyboardRemove())
+					return
+				}
 				for _, sharedUser := range message.UsersShared.Users {
 					userID := sharedUser.UserID
-					needRestart, err := t.inboundService.SetClientTelegramUserID(message.UsersShared.RequestID, userID)
+					needRestart, err := t.inboundService.SetClientTelegramUserID(trafficID, userID)
 					if needRestart {
 						t.xrayService.SetToNeedRestart()
 					}
@@ -861,7 +1098,7 @@ func (t *Tgbot) answerCommand(message *telego.Message, chatId int64, isAdmin boo
 		msg += t.I18nBot("tgbot.commands.help")
 		msg += t.I18nBot("tgbot.commands.pleaseChoose")
 	case "start":
-		msg += t.I18nBot("tgbot.commands.start", "Firstname=="+html.EscapeString(message.From.FirstName))
+		msg += t.I18nBot("tgbot.commands.start", "Firstname=="+message.From.FirstName)
 		if isAdmin {
 			msg += t.I18nBot("tgbot.commands.welcome", "Hostname=="+hostname)
 		}
@@ -983,10 +1220,10 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 				t.searchClientIps(chatId, email, callbackQuery.Message.GetMessageID())
 			case "tgid_refresh":
 				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.TGIdRefreshSuccess", "Email=="+email))
-				t.clientTelegramUserInfo(chatId, email, callbackQuery.Message.GetMessageID())
+				t.clientTelegramUserInfo(chatId, email, 0, callbackQuery.Message.GetMessageID())
 			case "tgid_cancel":
 				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.canceled", "Email=="+email))
-				t.clientTelegramUserInfo(chatId, email, callbackQuery.Message.GetMessageID())
+				t.clientTelegramUserInfo(chatId, email, 0, callbackQuery.Message.GetMessageID())
 			case "reset_traffic":
 				inlineKeyboard := tu.InlineKeyboard(
 					tu.InlineKeyboardRow(
@@ -1660,7 +1897,7 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 				t.searchClientIps(chatId, email)
 			case "tg_user":
 				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.getUserInfo", "Email=="+email))
-				t.clientTelegramUserInfo(chatId, email)
+				t.clientTelegramUserInfo(chatId, email, callbackQuery.From.ID)
 			case "tgid_remove":
 				inlineKeyboard := tu.InlineKeyboard(
 					tu.InlineKeyboardRow(
@@ -1683,7 +1920,7 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 				}
 				if err == nil {
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.removedTGUserSuccess", "Email=="+email))
-					t.clientTelegramUserInfo(chatId, email, callbackQuery.Message.GetMessageID())
+					t.clientTelegramUserInfo(chatId, email, 0, callbackQuery.Message.GetMessageID())
 				} else {
 					t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.errorOperation"))
 				}
@@ -2227,79 +2464,86 @@ func (t *Tgbot) BuildInboundClientDataMessage(sess *addClientSession, inbound_re
 	return message, nil
 }
 
+// tgbotClientJSON is the per-protocol client object emitted by
+// BuildJSONForProtocol. It is marshaled with encoding/json (M-7):
+// building the JSON with Sprintf let a quote in an admin-supplied
+// value break out of its field and override later fields (notably
+// id/flow/tgId). Fields absent for a protocol are omitted, so the
+// emitted object keeps exactly the old per-protocol field set.
+type tgbotClientJSON struct {
+	ID         string `json:"id,omitempty"`
+	Security   string `json:"security,omitempty"`
+	Flow       string `json:"flow,omitempty"`
+	Password   string `json:"password,omitempty"`
+	Method     string `json:"method,omitempty"`
+	Email      string `json:"email"`
+	LimitIP    int    `json:"limitIp"`
+	TotalGB    int64  `json:"totalGB"`
+	ExpiryTime int64  `json:"expiryTime"`
+	Enable     bool   `json:"enable"`
+	TgID       string `json:"tgId"`
+	Comment    string `json:"comment"`
+	Reset      int    `json:"reset"`
+}
+
+// tgbotClientSettings wraps one client the way AddInboundClient
+// expects it: {"clients": [...]}.
+type tgbotClientSettings struct {
+	Clients []tgbotClientJSON `json:"clients"`
+}
+
+// tgbotEmailPattern accepts either a plain email address or a plain
+// token label (the add-client flow's default email is an 8-character
+// random token, not an address). It rejects quotes, commas, colons,
+// whitespace, and control characters, so a value can never smuggle
+// extra JSON fields even before marshaling.
+var tgbotEmailPattern = regexp.MustCompile(`^(?:[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Za-z0-9._\-]+)$`)
+
 // BuildJSONForProtocol builds a JSON string for the given protocol with client data.
 func (t *Tgbot) BuildJSONForProtocol(sess *addClientSession, protocol model.Protocol) (string, error) {
-	var jsonString string
+	// M-7: the client id must be a real UUID and the email a plain
+	// address or token label; a crafted value used to break out of
+	// its JSON string and override later fields.
+	if protocol == model.VMESS || protocol == model.VLESS {
+		if _, err := uuid.Parse(sess.id); err != nil {
+			return "", fmt.Errorf("invalid client id %q: not a UUID", sess.id)
+		}
+	}
+	if !tgbotEmailPattern.MatchString(sess.email) {
+		return "", fmt.Errorf("invalid client email %q", sess.email)
+	}
 
+	client := tgbotClientJSON{
+		Email:      sess.email,
+		LimitIP:    sess.limitIP,
+		TotalGB:    sess.totalGB,
+		ExpiryTime: sess.expiryTime,
+		Enable:     sess.enable,
+		TgID:       sess.tgID,
+		Comment:    sess.comment,
+		Reset:      sess.reset,
+	}
 	switch protocol {
 	case model.VMESS:
-		jsonString = fmt.Sprintf(`{
-            "clients": [{
-                "id": "%s",
-                "security": "%s",
-                "email": "%s",
-                "limitIp": %d,
-                "totalGB": %d,
-                "expiryTime": %d,
-                "enable": %t,
-                "tgId": "%s",
-                "comment": "%s",
-                "reset": %d
-            }]
-        }`, sess.id, sess.security, sess.email, sess.limitIP, sess.totalGB, sess.expiryTime, sess.enable, sess.tgID, sess.comment, sess.reset)
-
+		client.ID = sess.id
+		client.Security = sess.security
 	case model.VLESS:
-		jsonString = fmt.Sprintf(`{
-            "clients": [{
-                "id": "%s",
-                "flow": "%s",
-                "email": "%s",
-                "limitIp": %d,
-                "totalGB": %d,
-                "expiryTime": %d,
-                "enable": %t,
-                "tgId": "%s",
-                "comment": "%s",
-                "reset": %d
-            }]
-        }`, sess.id, sess.flow, sess.email, sess.limitIP, sess.totalGB, sess.expiryTime, sess.enable, sess.tgID, sess.comment, sess.reset)
-
+		client.ID = sess.id
+		client.Flow = sess.flow
 	case model.Trojan:
-		jsonString = fmt.Sprintf(`{
-            "clients": [{
-                "password": "%s",
-                "email": "%s",
-                "limitIp": %d,
-                "totalGB": %d,
-                "expiryTime": %d,
-                "enable": %t,
-                "tgId": "%s",
-                "comment": "%s",
-                "reset": %d
-            }]
-        }`, sess.trPassword, sess.email, sess.limitIP, sess.totalGB, sess.expiryTime, sess.enable, sess.tgID, sess.comment, sess.reset)
-
+		client.Password = sess.trPassword
 	case model.Shadowsocks:
-		jsonString = fmt.Sprintf(`{
-            "clients": [{
-                "method": "%s",
-                "password": "%s",
-                "email": "%s",
-                "limitIp": %d,
-                "totalGB": %d,
-                "expiryTime": %d,
-                "enable": %t,
-                "tgId": "%s",
-                "comment": "%s",
-                "reset": %d
-            }]
-        }`, sess.method, sess.shPassword, sess.email, sess.limitIP, sess.totalGB, sess.expiryTime, sess.enable, sess.tgID, sess.comment, sess.reset)
-
+		client.Method = sess.method
+		client.Password = sess.shPassword
 	default:
 		return "", errors.New("unknown protocol")
 	}
 
-	return jsonString, nil
+	out, err := json.Marshal(tgbotClientSettings{Clients: []tgbotClientJSON{client}})
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 // SubmitAddClient submits the client addition request to the inbound service.
@@ -2480,6 +2724,17 @@ func (t *Tgbot) SendMsgToTgbot(chatId int64, msg string, replyMarkup ...telego.R
 
 			// Check if error is a connection error
 			errStr := err.Error()
+
+			// M-8: a 429 is Telegram telling us to slow down, not a
+			// connection error to burn retries on: honor the
+			// requested delay (capped) and retry.
+			if delay, ok := tgbotRetryAfter(err); ok && attempt < maxRetries-1 {
+				logger.Warningf("Telegram rate limit sending message (attempt %d/%d), retrying in %v: %v",
+					attempt+1, maxRetries, delay, err)
+				time.Sleep(delay)
+				continue
+			}
+
 			isConnectionError := strings.Contains(errStr, "connection") ||
 				strings.Contains(errStr, "timeout") ||
 				strings.Contains(errStr, "closed")
@@ -2648,13 +2903,36 @@ func (t *Tgbot) prepareServerUsageInfo() string {
 	return info
 }
 
+// loginNotifyDedupWindow coalesces repeat login notifications for
+// the same (username, IP, status) (M-8). Without it, every failed
+// login — an attacker can force one per request — becomes a Telegram
+// message to the admins.
+const loginNotifyDedupWindow = time.Minute
+
+type loginNotifyKey struct {
+	username string
+	ip       string
+	status   LoginStatus
+}
+
+var (
+	loginNotifyMu      sync.Mutex
+	loginNotifyEntries = map[loginNotifyKey]time.Time{}
+)
+
 // UserLoginNotify sends a notification about user login attempts to admins.
-func (t *Tgbot) UserLoginNotify(username string, password string, ip string, time string, status LoginStatus) {
+//
+// M-8: the send runs in its own goroutine, so a slow or hanging
+// Telegram API never holds the login request (the call site is the
+// login handler). Repeat notifications for the same (username, IP,
+// status) inside loginNotifyDedupWindow are coalesced to one: the
+// first sends, the rest are dropped.
+func (t *Tgbot) UserLoginNotify(username string, password string, ip string, timeStr string, status LoginStatus) {
 	if !t.IsRunning() {
 		return
 	}
 
-	if username == "" || ip == "" || time == "" {
+	if username == "" || ip == "" || timeStr == "" {
 		logger.Warning("UserLoginNotify failed, invalid info!")
 		return
 	}
@@ -2664,6 +2942,21 @@ func (t *Tgbot) UserLoginNotify(username string, password string, ip string, tim
 		return
 	}
 
+	loginNotifyMu.Lock()
+	key := loginNotifyKey{username: username, ip: ip, status: status}
+	if last, ok := loginNotifyEntries[key]; ok && time.Since(last) < loginNotifyDedupWindow {
+		loginNotifyMu.Unlock()
+		return
+	}
+	loginNotifyEntries[key] = time.Now()
+	loginNotifyMu.Unlock()
+
+	go t.sendLoginNotify(username, password, ip, timeStr, status)
+}
+
+// sendLoginNotify builds and sends one login notification. It runs in
+// its own goroutine; see UserLoginNotify.
+func (t *Tgbot) sendLoginNotify(username string, password string, ip string, timeStr string, status LoginStatus) {
 	msg := ""
 	switch status {
 	case LoginSuccess:
@@ -2675,11 +2968,11 @@ func (t *Tgbot) UserLoginNotify(username string, password string, ip string, tim
 		// H5: the password argument is accepted for API compatibility but
 		// never included in the notification - it must not leave the panel.
 		_ = password
-		msg += t.I18nBot("tgbot.messages.password", "Password=<redacted>")
+		msg += t.I18nBot("tgbot.messages.password", "Password==<redacted>")
 	}
 	msg += t.I18nBot("tgbot.messages.username", "Username=="+username)
 	msg += t.I18nBot("tgbot.messages.ip", "IP=="+ip)
-	msg += t.I18nBot("tgbot.messages.time", "Time=="+time)
+	msg += t.I18nBot("tgbot.messages.time", "Time=="+timeStr)
 	t.SendMsgToTgbotAdmins(msg)
 }
 
@@ -3033,7 +3326,11 @@ func (t *Tgbot) searchClientIps(chatId int64, email string, messageID ...int) {
 }
 
 // clientTelegramUserInfo retrieves and sends Telegram user info for the client.
-func (t *Tgbot) clientTelegramUserInfo(chatId int64, email string, messageID ...int) {
+// requesterID is the admin who opened this view; it is recorded with
+// the issued "select TG user" keyboard (M-10) so only that admin in
+// this chat may answer it. Callers on the edit path (messageID set)
+// pass 0: no keyboard is issued there.
+func (t *Tgbot) clientTelegramUserInfo(chatId int64, email string, requesterID int64, messageID ...int) {
 	traffic, client, err := t.inboundService.GetClientByEmail(email)
 	if err != nil {
 		logger.Warning(err)
@@ -3069,8 +3366,11 @@ func (t *Tgbot) clientTelegramUserInfo(chatId int64, email string, messageID ...
 		t.editMessageTgBot(chatId, messageID[0], output, inlineKeyboard)
 	} else {
 		t.SendMsgToTgbot(chatId, output, inlineKeyboard)
+		// M-10: the keyboard's RequestID is a random value bound to
+		// this admin, chat, and client — never the sequential
+		// traffic row id.
 		requestUser := telego.KeyboardButtonRequestUsers{
-			RequestID: int32(traffic.Id),
+			RequestID: issueUserShareRequest(chatId, requesterID, traffic.Id),
 			UserIsBot: new(bool),
 		}
 		keyboard := tu.Keyboard(
@@ -3452,6 +3752,11 @@ func (t *Tgbot) onlineClients(chatId int64, messageID ...int) {
 
 // sendBackup sends a backup of the database and configuration files.
 func (t *Tgbot) sendBackup(chatId int64) {
+	// M-9: like every other direct bot.Send* helper, refuse to run
+	// when the bot is not up; without this a nil bot panics.
+	if bot == nil || !isRunning.Load() {
+		return
+	}
 	// The backup contains the full database and config: only send it to an
 	// admin chat. In a private chat the chat ID equals the admin user ID,
 	// so this also refuses to post a backup into a group chat.
@@ -3511,6 +3816,10 @@ func (t *Tgbot) sendBackup(chatId int64) {
 
 // sendBanLogs sends the ban logs to the specified chat.
 func (t *Tgbot) sendBanLogs(chatId int64, dt bool) {
+	// M-9: same nil-bot guard as sendBackup.
+	if bot == nil || !isRunning.Load() {
+		return
+	}
 	if dt {
 		output := t.I18nBot("tgbot.messages.datetime", "DateTime=="+time.Now().Format("2006-01-02 15:04:05"))
 		t.SendMsgToTgbot(chatId, output)

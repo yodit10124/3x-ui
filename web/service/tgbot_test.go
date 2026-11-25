@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -12,16 +13,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mhsanaei/3x-ui/v2/config"
 	"github.com/mhsanaei/3x-ui/v2/database"
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/logger"
 	"github.com/mhsanaei/3x-ui/v2/web/global"
+	"github.com/mhsanaei/3x-ui/v2/web/locale"
 	"github.com/mhsanaei/3x-ui/v2/xray"
 
 	"github.com/google/uuid"
 	"github.com/mymmrac/telego"
 	th "github.com/mymmrac/telego/telegohandler"
+	"github.com/nicksnyder/go-i18n/v2/i18n"
 	"github.com/op/go-logging"
+	"github.com/pelletier/go-toml/v2"
+	"golang.org/x/text/language"
 )
 
 const (
@@ -460,6 +466,7 @@ func TestHandleAddClientInputRevokedAdmin(t *testing.T) {
 	setupTgbotTestDB(t)
 	api := setupFakeTgbot(t)
 	tb := (&Tgbot{}).NewTgbot()
+
 	setAdminIds([]int64{tgbotTestAdminID})
 	t.Cleanup(func() { setAdminIds(nil) })
 
@@ -887,5 +894,545 @@ func TestTgbotGetUsageWithNilXrayProcess(t *testing.T) {
 			t.Fatal("get_usage callback with nil Xray process was never answered")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// setupTgbotTestLocale loads the real English bot translations into
+// the global bot localizer for one test, restoring the previous
+// localizer afterwards. Tests run sequentially in this package, so
+// the global swap is safe.
+func setupTgbotTestLocale(t *testing.T) {
+	t.Helper()
+	bundle := i18n.NewBundle(language.MustParse("en-US"))
+	bundle.RegisterUnmarshalFunc("toml", toml.Unmarshal)
+	data, err := os.ReadFile("../translation/translate.en_US.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bundle.ParseMessageFileBytes(data, "translate.en_US.toml"); err != nil {
+		t.Fatal(err)
+	}
+	old := locale.LocalizerBot
+	locale.LocalizerBot = i18n.NewLocalizer(bundle, "en-US")
+	t.Cleanup(func() { locale.LocalizerBot = old })
+}
+
+// TestEscapeI18nBotParams (M-6): template parameter values are
+// HTML-escaped, keys are not, and parameters without the separator
+// pass through unchanged.
+func TestEscapeI18nBotParams(t *testing.T) {
+	got := escapeI18nBotParams([]string{
+		`ClientComment==<a href="https://evil.example/phish">click</a>`,
+		`Email==a@b.com`,
+		`NoSeparator`,
+	})
+	if want := `ClientComment==&lt;a href=&#34;https://evil.example/phish&#34;&gt;click&lt;/a&gt;`; got[0] != want {
+		t.Fatalf("got %q, want %q", got[0], want)
+	}
+	if got[1] != `Email==a@b.com` {
+		t.Fatalf("plain value changed: %q", got[1])
+	}
+	if got[2] != `NoSeparator` {
+		t.Fatalf("separator-less parameter changed: %q", got[2])
+	}
+}
+
+// TestBuildInboundClientDataMessageEscapesHTML (M-6): a phishing
+// anchor planted in a client comment must reach the Telegram
+// message escaped, not as a live link. The audit's PoC comment was
+// `<a href="https://evil.example/phish">点击领取流量</a>`.
+func TestBuildInboundClientDataMessageEscapesHTML(t *testing.T) {
+	setupTgbotTestLocale(t)
+	tb := (&Tgbot{}).NewTgbot()
+	sess := &addClientSession{
+		id:         "11111111-1111-1111-1111-111111111111",
+		email:      "victim@example.com",
+		comment:    `<a href="https://evil.example/phish">click here for free traffic</a>`,
+		totalGB:    0,
+		expiryTime: 0,
+		enable:     true,
+	}
+	msg, err := tb.BuildInboundClientDataMessage(sess, "vless-in", model.VLESS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(msg, `<a href="https://evil.example/phish">`) {
+		t.Fatalf("message contains a live phishing anchor: %q", msg)
+	}
+	if !strings.Contains(msg, "&lt;a href=") {
+		t.Fatalf("comment was not HTML-escaped in the message: %q", msg)
+	}
+	if !strings.Contains(msg, "victim@example.com") {
+		t.Fatalf("email missing from the message: %q", msg)
+	}
+}
+
+// TestI18nBotEscapesErrorMessage (M-6): an error string echoed into
+// the error_add_client template is escaped too, so a crafted error
+// cannot inject markup either.
+func TestI18nBotEscapesErrorMessage(t *testing.T) {
+	setupTgbotTestLocale(t)
+	tb := (&Tgbot{}).NewTgbot()
+	msg := tb.I18nBot("tgbot.messages.error_add_client", "error=="+`<b>boom</b>`)
+	if strings.Contains(msg, "<b>boom</b>") {
+		t.Fatalf("error text not escaped: %q", msg)
+	}
+	if !strings.Contains(msg, "&lt;b&gt;boom&lt;/b&gt;") {
+		t.Fatalf("escaped error text missing: %q", msg)
+	}
+}
+
+// TestBuildJSONForProtocolInjectionBlocked (M-7): the audit's PoC
+// email `a@b.com","id":"99999999-...","flow":"xtls-rprx-vision`
+// used to override the client's id and flow through Sprintf. It must
+// now be rejected by the email check, and even a quote-bearing value
+// in an unvalidated field (comment) must survive only as data.
+func TestBuildJSONForProtocolInjectionBlocked(t *testing.T) {
+	tb := (&Tgbot{}).NewTgbot()
+	base := &addClientSession{
+		id:         "11111111-1111-1111-1111-111111111111",
+		flow:       "xtls-rprx-vision",
+		email:      "victim@example.com",
+		limitIP:    0,
+		totalGB:    0,
+		expiryTime: 0,
+		enable:     true,
+		tgID:       "123",
+		comment:    "plain",
+		reset:      0,
+		security:   "auto",
+	}
+
+	// The audit's PoC email is rejected outright.
+	poc := *base
+	poc.email = `a@b.com","id":"99999999-9999-9999-9999-999999999999","flow":"xtls-rprx-vision`
+	if _, err := tb.BuildJSONForProtocol(&poc, model.VLESS); err == nil {
+		t.Fatal("PoC email was accepted, want it rejected")
+	}
+
+	// A non-UUID id is rejected for VMESS/VLESS.
+	badID := *base
+	badID.id = "not-a-uuid"
+	if _, err := tb.BuildJSONForProtocol(&badID, model.VLESS); err == nil {
+		t.Fatal("non-UUID id was accepted, want it rejected")
+	}
+
+	// The default email is an 8-character random token, not an
+	// address; it must still be accepted.
+	tokenEmail := *base
+	tokenEmail.email = "a1b2c3d4"
+	if _, err := tb.BuildJSONForProtocol(&tokenEmail, model.VLESS); err != nil {
+		t.Fatalf("default-style token email rejected: %v", err)
+	}
+
+	// A quote-bearing comment must round-trip as data: parsing the
+	// output JSON must yield the original id, flow, tgId, and the
+	// comment verbatim, with no injected fields.
+	inject := *base
+	inject.comment = `x","id":"99999999-9999-9999-9999-999999999999","flow":"none","tgId":"666`
+	out, err := tb.BuildJSONForProtocol(&inject, model.VLESS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Clients []struct {
+			ID      string `json:"id"`
+			Flow    string `json:"flow"`
+			Email   string `json:"email"`
+			TgID    string `json:"tgId"`
+			Comment string `json:"comment"`
+		} `json:"clients"`
+	}
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(parsed.Clients) != 1 {
+		t.Fatalf("want exactly one client, got %d: %s", len(parsed.Clients), out)
+	}
+	got := parsed.Clients[0]
+	if got.ID != base.id || got.Flow != base.flow || got.TgID != base.tgID {
+		t.Fatalf("injected fields leaked through: %+v", got)
+	}
+	if got.Comment != inject.comment {
+		t.Fatalf("comment mismatch: got %q, want %q", got.Comment, inject.comment)
+	}
+}
+
+// TestBuildJSONForProtocolShapes (M-7): each protocol emits exactly
+// its old field set, with the same JSON types, so AddInboundClient
+// keeps parsing the settings the same way.
+func TestBuildJSONForProtocolShapes(t *testing.T) {
+	tb := (&Tgbot{}).NewTgbot()
+	sess := &addClientSession{
+		id:         "11111111-1111-1111-1111-111111111111",
+		flow:       "xtls-rprx-vision",
+		email:      "victim@example.com",
+		limitIP:    2,
+		totalGB:    1073741824,
+		expiryTime: 1735689600000,
+		enable:     true,
+		tgID:       "123",
+		comment:    `quote " backslash \ newline` + "\n",
+		reset:      0,
+		security:   "auto",
+		trPassword: `p"ass`,
+		shPassword: `s"pass`,
+		method:     "aes-256-gcm",
+	}
+	cases := []struct {
+		protocol model.Protocol
+		fields   []string
+		absent   []string
+	}{
+		{model.VMESS, []string{`"id"`, `"security"`, `"email"`}, []string{`"flow"`, `"password"`, `"method"`}},
+		{model.VLESS, []string{`"id"`, `"flow"`, `"email"`}, []string{`"security"`, `"password"`, `"method"`}},
+		{model.Trojan, []string{`"password"`, `"email"`}, []string{`"id"`, `"flow"`, `"security"`, `"method"`}},
+		{model.Shadowsocks, []string{`"method"`, `"password"`, `"email"`}, []string{`"id"`, `"flow"`, `"security"`}},
+	}
+	for _, tc := range cases {
+		out, err := tb.BuildJSONForProtocol(sess, tc.protocol)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.protocol, err)
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+			t.Fatalf("%s: output is not valid JSON: %v\n%s", tc.protocol, err, out)
+		}
+		clients, ok := parsed["clients"].([]any)
+		if !ok || len(clients) != 1 {
+			t.Fatalf("%s: want one client: %s", tc.protocol, out)
+		}
+		client, ok := clients[0].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: client is not an object: %s", tc.protocol, out)
+		}
+		for _, f := range tc.fields {
+			if _, ok := client[strings.Trim(f, `"`)]; !ok {
+				t.Fatalf("%s: missing field %s: %s", tc.protocol, f, out)
+			}
+		}
+		for _, f := range tc.absent {
+			if _, ok := client[strings.Trim(f, `"`)]; ok {
+				t.Fatalf("%s: unexpected field %s: %s", tc.protocol, f, out)
+			}
+		}
+		// Numeric and boolean types must stay JSON numbers/bools.
+		if _, ok := client["limitIp"].(float64); !ok {
+			t.Fatalf("%s: limitIp is not a number: %s", tc.protocol, out)
+		}
+		if _, ok := client["enable"].(bool); !ok {
+			t.Fatalf("%s: enable is not a bool: %s", tc.protocol, out)
+		}
+	}
+}
+
+// TestTgbotRateLimiter (M-8): a per-(chat, user) token bucket
+// allows the burst, then denies until it refills, and tracks users
+// independently.
+func TestTgbotRateLimiter(t *testing.T) {
+	lim := newTgbotRateLimiter(3, 50*time.Millisecond)
+	for i := 0; i < 3; i++ {
+		if !lim.Allow(1, 100) {
+			t.Fatalf("allow %d: want true", i)
+		}
+	}
+	if lim.Allow(1, 100) {
+		t.Fatal("4th call in the burst was allowed, want denied")
+	}
+	// Another user and another chat are unaffected.
+	if !lim.Allow(1, 200) {
+		t.Fatal("different user was denied, want allowed")
+	}
+	if !lim.Allow(2, 100) {
+		t.Fatal("different chat was denied, want allowed")
+	}
+	time.Sleep(120 * time.Millisecond)
+	if !lim.Allow(1, 100) {
+		t.Fatal("call after refill was denied, want allowed")
+	}
+}
+
+// TestTgbotRateLimiterDropsFlood (M-8): firing 15 /id commands at
+// once from one user must produce exactly the burst (10) of answers;
+// the rest are dropped before any worker goroutine is spawned.
+func TestTgbotRateLimiterDropsFlood(t *testing.T) {
+	setupTgbotTestDB(t)
+	api := setupFakeTgbot(t)
+
+	// Disable the refill for this test: the handler loop can take
+	// over a second to dispatch the flood, and a refilled token
+	// would legitimately admit an 11th command. Set before NewTgbot
+	// so the new limiter picks it up.
+	origRefill := tgbotRateLimitRefill
+	tgbotRateLimitRefill = time.Hour
+	t.Cleanup(func() { tgbotRateLimitRefill = origRefill })
+	tb := (&Tgbot{}).NewTgbot()
+
+	// The worker pool is normally created by Start(); the handler
+	// test drives newBotHandler directly, so create it here.
+	oldPool := messageWorkerPool
+	messageWorkerPool = make(chan struct{}, 10)
+	t.Cleanup(func() { messageWorkerPool = oldPool })
+
+	updates := make(chan telego.Update, 32)
+	h, err := tb.newBotHandler(bot, updates)
+	if err != nil {
+		t.Fatalf("newBotHandler: %v", err)
+	}
+	go func() { _ = h.Start() }()
+	t.Cleanup(func() { _ = h.Stop() })
+
+	for i := 0; i < 15; i++ {
+		updates <- telego.Update{UpdateID: i + 1, Message: &telego.Message{
+			MessageID: i + 1,
+			From:      &telego.User{ID: tgbotTestUserID},
+			Chat:      telego.Chat{ID: tgbotTestChatID},
+			Text:      "/id",
+		}}
+	}
+
+	// Under -race the whole path (DB setup, handler dispatch, fake
+	// API round-trips) runs several times slower, so the deadline
+	// is generous; the assertion below is still exact.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if api.sendCount() >= tgbotRateLimitBurst {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d answers arrived, want %d", api.sendCount(), tgbotRateLimitBurst)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Let any straggler finish, then the count must be exactly the
+	// burst: the 5 over-limit commands were dropped, not queued.
+	time.Sleep(2 * time.Second)
+	if got := api.sendCount(); got != tgbotRateLimitBurst {
+		t.Fatalf("sendCount = %d, want exactly the burst of %d", got, tgbotRateLimitBurst)
+	}
+}
+
+// TestUserLoginNotifyDedup (M-8): three identical failed-login
+// notifications in a row produce a single Telegram message; a
+// different IP is a different key and does notify.
+func TestUserLoginNotifyDedup(t *testing.T) {
+	setupTgbotTestDB(t)
+	api := setupFakeTgbot(t)
+	setAdminIds([]int64{tgbotTestAdminID})
+	t.Cleanup(func() { setAdminIds(nil) })
+	tb := (&Tgbot{}).NewTgbot()
+
+	// The setting defaults to true in the test database.
+	if enabled, err := tb.settingService.GetTgBotLoginNotify(); err != nil || !enabled {
+		t.Fatalf("login notify not enabled in test DB: %v %v", enabled, err)
+	}
+
+	waitForSends := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if api.sendCount() >= want {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("sendCount = %d, want at least %d", api.sendCount(), want)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	username := "flood-user-m8"
+	tb.UserLoginNotify(username, "***", "203.0.113.9", "2026-11-25 17:00:00", LoginFail)
+	tb.UserLoginNotify(username, "***", "203.0.113.9", "2026-11-25 17:00:01", LoginFail)
+	tb.UserLoginNotify(username, "***", "203.0.113.9", "2026-11-25 17:00:02", LoginFail)
+	waitForSends(1)
+	time.Sleep(500 * time.Millisecond)
+	if got := api.sendCount(); got != 1 {
+		t.Fatalf("sendCount = %d after three identical notifies, want 1", got)
+	}
+
+	tb.UserLoginNotify(username, "***", "198.51.100.7", "2026-11-25 17:00:03", LoginFail)
+	waitForSends(2)
+}
+
+// TestTgbotRetryAfter (M-8): a 429 error yields the requested delay
+// (capped), other errors are not rate limits.
+func TestTgbotRetryAfter(t *testing.T) {
+	if d, ok := tgbotRetryAfter(fmt.Errorf("telegram: 429 Too Many Requests: retry after 35")); !ok || d != 35*time.Second {
+		t.Fatalf("429 with retry after 35: got (%v, %v), want (35s, true)", d, ok)
+	}
+	if d, ok := tgbotRetryAfter(fmt.Errorf("telegram: 429 Too Many Requests: retry after 600")); !ok || d != 60*time.Second {
+		t.Fatalf("429 with retry after 600: got (%v, %v), want (60s, true)", d, ok)
+	}
+	if _, ok := tgbotRetryAfter(fmt.Errorf("connection reset by peer")); ok {
+		t.Fatal("connection error reported as a rate limit")
+	}
+}
+
+// TestSendBackupAndBanLogsNilBot (M-9): with the bot stopped (bot
+// nil), sendBackup and sendBanLogs must return without panicking.
+// Real files are planted at the paths they open, so without the
+// guard the calls would reach bot.SendDocument on the nil bot.
+func TestSendBackupAndBanLogsNilBot(t *testing.T) {
+	setupTgbotTestDB(t)
+	// No setupFakeTgbot: bot stays nil and isRunning stays false.
+	setAdminIds([]int64{tgbotTestAdminID})
+	t.Cleanup(func() { setAdminIds(nil) })
+	if bot != nil || isRunning.Load() {
+		t.Fatal("test setup: bot must be nil and stopped")
+	}
+
+	dir := t.TempDir()
+	t.Setenv("XUI_DB_FOLDER", dir)
+	t.Setenv("XUI_BIN_FOLDER", dir)
+	t.Setenv("XUI_LOG_FOLDER", dir)
+	plant := func(path, content string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plant(config.GetDBPath(), "fake-db")
+	plant(xray.GetConfigPath(), "{}")
+	plant(xray.GetIPLimitBannedLogPath(), "banned log line\n")
+	plant(xray.GetIPLimitBannedPrevLogPath(), "previous banned log line\n")
+
+	tb := (&Tgbot{}).NewTgbot()
+	// Must return, not panic on the nil bot.
+	tb.sendBackup(tgbotTestAdminID)
+	tb.sendBanLogs(tgbotTestAdminID, true)
+	tb.sendBanLogs(tgbotTestAdminID, false)
+}
+
+// resetUserShareRequests clears the pending "select user" registry
+// for one test. Tests run sequentially in this package.
+func resetUserShareRequests(t *testing.T) {
+	t.Helper()
+	userShareMu.Lock()
+	userShareRequests = map[int32]pendingUserShare{}
+	userShareMu.Unlock()
+}
+
+// TestUserShareRequestRegistry (M-10): an issued request id is
+// consumable once, by its own admin in its own chat only; anything
+// else is refused, and issued ids are random, not sequential.
+func TestUserShareRequestRegistry(t *testing.T) {
+	resetUserShareRequests(t)
+
+	id := issueUserShareRequest(tgbotTestChatID, tgbotTestAdminID, 7)
+	if id == 0 {
+		t.Fatal("issued a zero request id")
+	}
+	if _, ok := consumeUserShareRequest(id, tgbotTestChatID+1, tgbotTestAdminID); ok {
+		t.Fatal("request consumed from a different chat")
+	}
+	id2 := issueUserShareRequest(tgbotTestChatID, tgbotTestAdminID, 7)
+	if _, ok := consumeUserShareRequest(id2, tgbotTestChatID, tgbotTestAdminID+1); ok {
+		t.Fatal("request consumed by a different admin")
+	}
+	id3 := issueUserShareRequest(tgbotTestChatID, tgbotTestAdminID, 7)
+	if trafficID, ok := consumeUserShareRequest(id3, tgbotTestChatID, tgbotTestAdminID); !ok || trafficID != 7 {
+		t.Fatalf("legit consume failed: (%d, %v)", trafficID, ok)
+	}
+	if _, ok := consumeUserShareRequest(id3, tgbotTestChatID, tgbotTestAdminID); ok {
+		t.Fatal("replayed request id was accepted")
+	}
+	if _, ok := consumeUserShareRequest(123456789, tgbotTestChatID, tgbotTestAdminID); ok {
+		t.Fatal("unknown request id was accepted")
+	}
+	a := issueUserShareRequest(tgbotTestChatID, tgbotTestAdminID, 1)
+	b := issueUserShareRequest(tgbotTestChatID, tgbotTestAdminID, 2)
+	if a == b {
+		t.Fatal("two issued request ids collide")
+	}
+}
+
+// TestHandleUsersSharedRequiresIssuedRequest (M-10): the audit's
+// attack — another admin answers with the predictable traffic row id
+// — must not bind anything; only the admin the keyboard was issued
+// to, with the issued random id, may bind.
+func TestHandleUsersSharedRequiresIssuedRequest(t *testing.T) {
+	setupTgbotTestDB(t)
+	setupFakeTgbot(t)
+	setAdminIds([]int64{tgbotTestAdminID, 222})
+	t.Cleanup(func() { setAdminIds(nil) })
+	tb := (&Tgbot{}).NewTgbot()
+	resetUserShareRequests(t)
+
+	// The legit bind reaches UpdateInboundClient, which calls
+	// p.GetAPIPort(): start a fake Xray process (a sleeping script,
+	// as the import tests do) so p is non-nil. API calls against it
+	// fail harmlessly and only set needRestart.
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XUI_BIN_FOLDER", binDir)
+	script := "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then echo \"Xray 99.0-test (test)\"; exit 0; fi\nexec sleep 60\n"
+	if err := os.WriteFile(filepath.Join(binDir, xray.GetBinaryName()), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = (&XrayService{}).StopXray() })
+	if err := (&XrayService{}).RestartXray(true); err != nil {
+		t.Fatalf("RestartXray: %v", err)
+	}
+
+	traffic, _, err := tb.inboundService.GetClientByEmail("victim@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trafficID := int(traffic.Id)
+
+	tgIDOf := func() int64 {
+		t.Helper()
+		_, client, err := tb.inboundService.GetClientByEmail("victim@example.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return client.TgID
+	}
+	if got := tgIDOf(); got != 0 {
+		t.Fatalf("initial tgId = %d, want 0", got)
+	}
+
+	share := func(fromID int64, requestID int, sharedUserID int64) {
+		t.Helper()
+		tb.handleAddClientInput(&telego.Message{
+			MessageID: 1,
+			From:      &telego.User{ID: fromID},
+			Chat:      telego.Chat{ID: tgbotTestChatID},
+			UsersShared: &telego.UsersShared{
+				RequestID: requestID,
+				Users:     []telego.SharedUser{{UserID: sharedUserID}},
+			},
+		})
+	}
+
+	// (a) The old attack: admin 222 answers with the predictable
+	// traffic row id, no keyboard ever issued.
+	share(222, trafficID, 777)
+	if got := tgIDOf(); got != 0 {
+		t.Fatalf("tgId = %d after unissued request, want 0 (unbound)", got)
+	}
+
+	// (b) A keyboard issued to admin 111, answered by admin 222.
+	issued := issueUserShareRequest(tgbotTestChatID, tgbotTestAdminID, trafficID)
+	share(222, int(issued), 777)
+	if got := tgIDOf(); got != 0 {
+		t.Fatalf("tgId = %d after another admin answered, want 0 (unbound)", got)
+	}
+
+	// (c) The same keyboard answered by its owner binds the user.
+	issued2 := issueUserShareRequest(tgbotTestChatID, tgbotTestAdminID, trafficID)
+	share(tgbotTestAdminID, int(issued2), 777)
+	if got := tgIDOf(); got != 777 {
+		t.Fatalf("tgId = %d after the owner's answer, want 777", got)
+	}
+
+	// (d) Replaying the same request id does not re-bind (here to a
+	// different user).
+	share(tgbotTestAdminID, int(issued2), 888)
+	if got := tgIDOf(); got != 777 {
+		t.Fatalf("tgId = %d after replay, want 777 (unchanged)", got)
 	}
 }

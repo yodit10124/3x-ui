@@ -171,7 +171,7 @@ func (a *IndexController) login(c *gin.Context) {
 			notifyPass = fmt.Sprintf("*** (%s)", translatedError)
 		}
 
-		a.tgbot.UserLoginNotify(safeUser, notifyPass, getRemoteIp(c), timeStr, 0)
+		a.tgbot.UserLoginNotify(form.Username, notifyPass, getRemoteIp(c), timeStr, 0)
 		pureJsonMsg(c, http.StatusOK, false, I18nWeb(c, "pages.login.toasts.wrongUsernameOrPassword"))
 		return
 	}
@@ -182,7 +182,7 @@ func (a *IndexController) login(c *gin.Context) {
 	if form.Username == "admin" && form.Password == "admin" {
 		logger.Warning("SECURITY: the panel is still using the default admin/admin credentials - change them immediately in Settings")
 	}
-	a.tgbot.UserLoginNotify(safeUser, ``, getRemoteIp(c), timeStr, 1)
+	a.tgbot.UserLoginNotify(form.Username, ``, getRemoteIp(c), timeStr, 1)
 
 	if err := session.SetLoginUser(c, user); err != nil {
 		logger.Warning("Unable to save session:", err)
